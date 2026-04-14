@@ -1,3 +1,46 @@
+## Pre-Stage-3 smoke test
+
+Two scratch scripts were added to de-risk the Stage 2 refactor before any
+plugin scaffolding lands.
+
+- **`scripts/login.ts`** (`npm run login`) — opens a headful persistent
+  Chromium context against `process.env.KOWALSKI_PROFILE_DIR` (default
+  `~/.kowalski/browser`), navigates to instagram.com, and waits for the user
+  to close the window. Cookies persist into the profile dir so subsequent
+  headless runs are already logged in. The launch logic is exported as
+  `runLogin(profileDir)` so Stage 3 can lift it almost verbatim into the
+  plugin's `login` tool — only the timeout + caller plumbing should differ.
+  The args / userAgent / viewport are duplicated from
+  `BrowserManager.launch()` on purpose; consolidation is a Stage 3 decision
+  once the plugin's launch surface is settled.
+
+- **`scripts/test-run.ts`** (`npm run test:run`) — exercises the full
+  `createKowalskiSession()` → `BrowserManager.bindSession` →
+  `RunManager.startRun({ phases: ['stories'] })` flow against the profile
+  produced by `login`. Subscribes to every event the session emits (`frame`,
+  `screencastEnded`, `loginScreencastReady`, `loginSuccess`, `run-started`,
+  `run-phase`, `analysis-ready`, `analysis-error`, `run-complete`) and prints
+  the returned `RunResult` summary plus the on-disk path of the analysis
+  record under `session.outputDir`. Skips with a clear message when
+  `ANTHROPIC_API_KEY` or `KOWALSKI_PROFILE_DIR` is missing.
+
+- **Profile dir convention.** `KOWALSKI_PROFILE_DIR` (default
+  `~/.kowalski/browser`) is the durable location the headful login writes to
+  and the headless run reads from. Note that `createKowalskiSession()`
+  defaults `browserProfileDir` under `os.tmpdir()`, which is wrong for any
+  real run (wipes on reboot). The smoke test passes `browserProfileDir`
+  explicitly. In Stage 3 this same env-var convention should map to a
+  `browserProfileDir` field on the plugin's `configSchema`, with the same
+  `~/.kowalski/browser` default.
+
+- **No service code was modified.** TSC + lint stay clean. The two scripts
+  were not actually executed end-to-end in the environment that produced
+  this commit (no `ANTHROPIC_API_KEY` and no logged-in profile available).
+  Any bugs the smoke test surfaces on first real run should be appended to a
+  `### Bugs found while smoke-testing` subsection here as the fix lands.
+
+---
+
 ## Stage 2 — Done
 
 ### Services edited
