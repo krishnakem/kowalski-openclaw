@@ -1,5 +1,7 @@
 # Kowalski
 
+> **Refactor in progress.** This repo is being reshaped into an OpenClaw plugin. The Electron shell, React UI, and IPC layer have been removed; only the core Playwright + Claude pipeline under `src/main/services/` remains. The README below still describes the original desktop app — treat it as reference for what the core does, not for how to run it today. See [REFACTOR_NOTES.md](REFACTOR_NOTES.md) for the audit of remaining Electron couplings that need to be broken before the plugin can stand up.
+
 An AI-powered desktop app that automatically browses your Instagram stories and feed, then composes a curated daily digest — so you stay in the loop without the endless scroll.
 
 Kowalski runs a real Chromium browser via Playwright, drives it with Claude vision agents that "see" the page through screenshots and act with human-like mouse and scroll, and then synthesises everything it captured into a single readable editorial.
