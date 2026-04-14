@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "lint": "eslint .",
+    "login": "npx tsx scripts/login.ts",
     "test:digest": "npx tsx scripts/test-digest.ts",
     "test:extract": "npx tsx scripts/test-extract.ts"
   },
