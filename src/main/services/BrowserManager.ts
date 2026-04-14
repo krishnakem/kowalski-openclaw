@@ -1,20 +1,11 @@
-import { app, BrowserWindow } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { chromium, BrowserContext, Page, CDPSession } from 'playwright';
-
-// In a packaged app, point Playwright at the Chromium we bundle under
-// Contents/Resources/playwright-browsers. Must run before chromium.launch*()
-// so Playwright's browser-path resolution picks it up. No-op in dev.
-function configurePackagedBrowserPath(): void {
-    if (app.isPackaged && !process.env.PLAYWRIGHT_BROWSERS_PATH) {
-        process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(process.resourcesPath, 'playwright-browsers');
-    }
-}
 import { ChromiumVersionHelper } from './ChromiumVersionHelper.js';
 import { SessionValidationResult } from '../../types/instagram.js';
 import { KOWALSKI_VIEWPORT } from '../../shared/viewportConfig.js';
 import { InputForwarder, type InputEventPayload } from './InputForwarder.js';
+import type { KowalskiSession } from '../../core/KowalskiSession.js';
 
 // GPU profiles for WebGL fingerprint randomization
 // Using common GPU configurations to avoid statistical anomalies
@@ -32,15 +23,17 @@ const GPU_PROFILES = [
 export class BrowserManager {
     private static instance: BrowserManager;
     private browserContext: BrowserContext | null = null;
-    private mainWindow: BrowserWindow | null = null;
+    // Kept as a singleton to minimize caller churn; bindSession is called once
+    // per run by RunManager (or any plugin entrypoint) before launch/start*.
+    private session: KowalskiSession | null = null;
     private cdpSession: CDPSession | null = null;
     private inputForwarder: InputForwarder = new InputForwarder();
     private loginActive: boolean = false;
 
     private constructor() { }
 
-    public setMainWindow(window: BrowserWindow | null): void {
-        this.mainWindow = window;
+    public bindSession(session: KowalskiSession | null): void {
+        this.session = session;
     }
 
     public static getInstance(): BrowserManager {
@@ -48,6 +41,13 @@ export class BrowserManager {
             BrowserManager.instance = new BrowserManager();
         }
         return BrowserManager.instance;
+    }
+
+    private requireSession(): KowalskiSession {
+        if (!this.session) {
+            throw new Error('BrowserManager: no session bound (call bindSession first)');
+        }
+        return this.session;
     }
 
     /**
@@ -62,10 +62,8 @@ export class BrowserManager {
         }
 
         try {
-            configurePackagedBrowserPath();
-
-            const userDataPath = app.getPath('userData');
-            const persistentContextPath = path.join(userDataPath, 'kowalski_browser');
+            const session = this.requireSession();
+            const persistentContextPath = session.browserProfileDir;
 
             console.log(`🚀 BrowserManager: Launching headless Persistent Context at: ${persistentContextPath}`);
 
@@ -75,22 +73,13 @@ export class BrowserManager {
             const scrapingViewport = { width: KOWALSKI_VIEWPORT.width, height: KOWALSKI_VIEWPORT.height };
             console.log(`📐 BrowserManager: Viewport ${KOWALSKI_VIEWPORT.width}x${KOWALSKI_VIEWPORT.height}`);
 
-            // Custom executable path for stealth browser.
-            // In packaged mode we rely on Playwright's default discovery via
-            // PLAYWRIGHT_BROWSERS_PATH (set at module load) — it finds the
-            // canonical "Google Chrome for Testing.app" we bundle under
-            // Contents/Resources/playwright-browsers.
-            let executablePath = '';
-            if (!app.isPackaged) {
-                const customExecutablePath = ChromiumVersionHelper.getCustomExecutablePath();
-                if (fs.existsSync(customExecutablePath)) {
-                    console.log('🕵️‍♀️ BrowserManager: Using Custom Stealth Browser:', customExecutablePath);
-                    executablePath = customExecutablePath;
-                } else {
-                    console.warn('⚠️ BrowserManager: Custom browser not found, using Playwright default.');
-                }
+            // If the host supplied an explicit executable path, use it; otherwise
+            // let Playwright pick its own default Chromium.
+            const executablePath = session.browser?.executablePath ?? '';
+            if (executablePath) {
+                console.log('🕵️‍♀️ BrowserManager: Using host-supplied executable:', executablePath);
             } else {
-                console.log('📦 BrowserManager: Packaged mode — using Playwright default via PLAYWRIGHT_BROWSERS_PATH');
+                console.log('📦 BrowserManager: Using Playwright default Chromium');
             }
 
             const systemTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -215,11 +204,11 @@ export class BrowserManager {
                 console.warn('📐 Could not verify viewport:', viewportErr);
             }
 
-            // 2.5 MIGRATION: Sync Session from Onboarding (session.json) -> Persistent Context
-            // The user logs in via the Electron Webview (Onboarding), which saves to "session.json".
-            // We need to inject those cookies into this new Persistent Context so they are shared.
+            // Legacy cookie-injection path from the Electron onboarding flow.
+            // Plugin hosts can drop a session.json alongside the browser profile
+            // to pre-seed cookies; otherwise this is a no-op.
             try {
-                const sessionPath = path.join(userDataPath, 'session.json');
+                const sessionPath = path.join(session.browserProfileDir, 'session.json');
                 if (fs.existsSync(sessionPath)) {
                     console.log('🍪 BrowserManager: Found session.json from Onboarding. Injecting cookies...');
                     const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf-8'));
@@ -277,9 +266,7 @@ export class BrowserManager {
             cdp.on('Page.screencastFrame', (params: any) => {
                 // Ack FIRST so Chromium never stalls waiting during a slow IPC moment
                 cdp.send('Page.screencastFrameAck', { sessionId: params.sessionId }).catch(() => {});
-                if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-                    this.mainWindow.webContents.send('kowalski:frame', params.data);
-                }
+                this.session?.events.emit('frame', params.data);
             });
 
             await cdp.send('Page.startScreencast', {
@@ -313,10 +300,8 @@ export class BrowserManager {
             this.cdpSession = null;
         }
 
-        // Notify the renderer that the screencast has ended
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-            this.mainWindow.webContents.send('kowalski:screencastEnded');
-        }
+        // Notify listeners that the screencast has ended
+        this.session?.events.emit('screencastEnded');
     }
 
     /**
@@ -365,10 +350,7 @@ export class BrowserManager {
             this.inputForwarder.attach(this.cdpSession);
         }
 
-        // Notify renderer that frames are flowing
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-            this.mainWindow.webContents.send('kowalski:loginScreencastReady');
-        }
+        this.session?.events.emit('loginScreencastReady');
 
         // Begin polling for login success in the background
         this.pollForLoginSuccess(page);
@@ -412,9 +394,7 @@ export class BrowserManager {
                     const isLoggedIn = await this.checkLoginStateViaCDP(page);
                     if (isLoggedIn) {
                         console.log('✅ Login screencast: Instagram login confirmed');
-                        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-                            this.mainWindow.webContents.send('kowalski:loginSuccess');
-                        }
+                        this.session?.events.emit('loginSuccess');
                         await this.stopLoginScreencast();
                         return;
                     }
@@ -455,8 +435,7 @@ export class BrowserManager {
 
         // 2. Delete Folder
         try {
-            const userDataPath = app.getPath('userData');
-            const persistentContextPath = path.join(userDataPath, 'kowalski_browser');
+            const persistentContextPath = this.requireSession().browserProfileDir;
 
             if (fs.existsSync(persistentContextPath)) {
                 fs.rmSync(persistentContextPath, { recursive: true, force: true });

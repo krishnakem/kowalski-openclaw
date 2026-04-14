@@ -10,7 +10,6 @@
  */
 
 import { BrowserContext, Page } from 'playwright';
-import { app } from 'electron';
 import { GhostMouse } from './GhostMouse.js';
 import { HumanScroll } from './HumanScroll.js';
 import { UsageService } from './UsageService.js';
@@ -38,15 +37,21 @@ export class Kowalski {
     private screenshotCollector!: ScreenshotCollector;
     private page!: Page;
 
-    private sessionMemory: SessionMemory = new SessionMemory();
+    private sessionMemory: SessionMemory;
     private activeAgent: BaseVisionAgent | null = null;
     private stopped: boolean = false;
 
-    constructor(context: BrowserContext, apiKey: string, debugMode: boolean = false) {
+    constructor(
+        context: BrowserContext,
+        apiKey: string,
+        debugMode: boolean = false,
+        sessionMemoryPath: string
+    ) {
         this.context = context;
         this.apiKey = apiKey;
         this.usageService = UsageService.getInstance();
         this.debugMode = debugMode;
+        this.sessionMemory = new SessionMemory(sessionMemoryPath);
     }
 
     /** Stop the active browsing agent externally (e.g. Cmd+Shift+K). */
@@ -108,8 +113,9 @@ export class Kowalski {
             maxCaptures: estimatedMaxCaptures,
             jpegQuality: 85,
             minScrollDelta: Math.round((this.page.viewportSize()?.height || 1920) * 0.10),
-            // Debug-only screenshot/log dump to ~/Downloads/kowalski-debug — disabled.
-            // saveToDirectory: path.join(app.getPath('downloads'), 'kowalski-debug')
+            // TODO(plugin): debug-only screenshot/log dump — disabled. If re-enabled,
+            // point at a session-scoped dir (e.g. path.join(scratchDir, 'debug')).
+            // saveToDirectory: undefined
         });
 
         let totalRawScreenshots = 0;

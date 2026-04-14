@@ -1,6 +1,6 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
-import { app } from 'electron';
 
 /**
  * Production-safe helper for detecting Chromium version and generating User-Agent.
@@ -41,7 +41,6 @@ export class ChromiumVersionHelper {
     private static tryReadBrowsersJson(): string | null {
         try {
             // require() works with asar - no need for fs.readFileSync
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
             const browsersJson = require('playwright-core/browsers.json');
             const chromiumEntry = browsersJson.browsers?.find(
                 (b: { name: string }) => b.name === 'chromium'
@@ -63,7 +62,7 @@ export class ChromiumVersionHelper {
      */
     private static tryDetectFromCache(): string | null {
         try {
-            const userHome = app.getPath('home');
+            const userHome = os.homedir();
             const cacheDir = this.getPlaywrightCacheDir(userHome);
 
             if (!fs.existsSync(cacheDir)) return null;
@@ -115,12 +114,8 @@ export class ChromiumVersionHelper {
 
     /**
      * Gets the Playwright cache directory for the current platform.
-     * In a packaged app, Chromium is bundled under Contents/Resources/playwright-browsers.
      */
     private static getPlaywrightCacheDir(userHome: string): string {
-        if (app.isPackaged) {
-            return path.join(process.resourcesPath, 'playwright-browsers');
-        }
         if (process.platform === 'darwin') {
             return path.join(userHome, 'Library/Caches/ms-playwright');
         } else if (process.platform === 'win32') {
@@ -138,7 +133,7 @@ export class ChromiumVersionHelper {
         if (this.cachedRevision) return this.cachedRevision;
 
         try {
-            const userHome = app.getPath('home');
+            const userHome = os.homedir();
             const cacheDir = this.getPlaywrightCacheDir(userHome);
 
             if (!fs.existsSync(cacheDir)) {
@@ -189,7 +184,7 @@ export class ChromiumVersionHelper {
      * Dynamically uses the latest installed revision
      */
     static getCustomExecutablePath(): string {
-        const userHome = app.getPath('home');
+        const userHome = os.homedir();
         const revision = this.getLatestRevision();
         const cacheDir = this.getPlaywrightCacheDir(userHome);
 

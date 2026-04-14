@@ -1,3 +1,5 @@
+import fs from 'fs/promises';
+import path from 'path';
 
 interface UsageData {
     currentMonthSpend: number;
@@ -30,20 +32,40 @@ export class UsageService {
         return UsageService.instance;
     }
 
-    private storeUnavailable = false;
+    private storeUnavailable = true;
+    private storePath: string | null = null;
 
-    // Helper to dynamically load electron-store (ESM).
-    // Returns null when running outside an Electron app context (e.g. dev test scripts);
-    // callers must tolerate a null store and skip persistence.
-    private async getStore(): Promise<any> {
-        if (this.storeUnavailable) return null;
+    /**
+     * Bind the usage store to a scratch directory. Writes `usage.json` under
+     * that directory. Callers that never configure the service stay in
+     * graceful-degradation mode (no persistence).
+     */
+    public configure(scratchDir: string): void {
+        this.storePath = path.join(scratchDir, 'usage.json');
+        this.storeUnavailable = false;
+    }
+
+    private async readUsage(): Promise<UsageData | null> {
+        if (this.storeUnavailable || !this.storePath) return null;
         try {
-            const { default: Store } = await import('electron-store');
-            return new Store();
+            const raw = await fs.readFile(this.storePath, 'utf-8');
+            return JSON.parse(raw) as UsageData;
+        } catch (err: any) {
+            if (err?.code === 'ENOENT') return null;
+            this.storeUnavailable = true;
+            console.warn('💰 UsageService: usage file unreadable, persistence disabled', err);
+            return null;
+        }
+    }
+
+    private async writeUsage(data: UsageData): Promise<void> {
+        if (this.storeUnavailable || !this.storePath) return;
+        try {
+            await fs.mkdir(path.dirname(this.storePath), { recursive: true });
+            await fs.writeFile(this.storePath, JSON.stringify(data, null, 2));
         } catch (err) {
             this.storeUnavailable = true;
-            console.warn('💰 UsageService: electron-store unavailable, persistence disabled', err);
-            return null;
+            console.warn('💰 UsageService: usage file not writable, persistence disabled', err);
         }
     }
 
@@ -52,16 +74,14 @@ export class UsageService {
      * Performs monthly reset check on startup.
      */
     public async initialize(): Promise<void> {
-        const store = await this.getStore();
-        if (!store) return;
-        const usage = store.get('usageData') as UsageData;
+        if (this.storeUnavailable) return;
+        const usage = await this.readUsage();
 
         if (!usage) {
-            const initial: UsageData = {
+            await this.writeUsage({
                 currentMonthSpend: 0.00,
                 lastResetDate: new Date().toISOString()
-            };
-            store.set('usageData', initial);
+            });
             return;
         }
 
@@ -72,10 +92,8 @@ export class UsageService {
      * Resets spending if we have entered a new month relative to lastResetDate.
      */
     public async checkMonthlyReset(): Promise<void> {
-        const store = await this.getStore();
-        if (!store) return;
-        const usage = store.get('usageData') as UsageData;
-        if (!usage) return; // Should be handled by initialize
+        const usage = await this.readUsage();
+        if (!usage) return;
 
         const lastDate = new Date(usage.lastResetDate);
         const now = new Date();
@@ -83,11 +101,10 @@ export class UsageService {
         // Check if Month or Year is different
         if (lastDate.getMonth() !== now.getMonth() || lastDate.getFullYear() !== now.getFullYear()) {
             console.log('🗓️ Monthly Usage Reset Triggered.');
-            const resetData: UsageData = {
+            await this.writeUsage({
                 currentMonthSpend: 0.00,
                 lastResetDate: now.toISOString()
-            };
-            store.set('usageData', resetData);
+            });
         }
     }
 
@@ -142,12 +159,11 @@ export class UsageService {
             (cached * MODEL_RATES.CACHED_INPUT_TOKEN) +
             (output * MODEL_RATES.OUTPUT_TOKEN);
 
-        const store = await this.getStore();
-        if (!store) {
-            console.log(`💰 Usage Added: $${cost.toFixed(6)} (not persisted — no electron context)`);
+        if (this.storeUnavailable) {
+            console.log(`💰 Usage Added: $${cost.toFixed(6)} (not persisted — store not configured)`);
             return cost;
         }
-        const currentData = store.get('usageData') as UsageData;
+        const currentData = await this.readUsage();
 
         // Safety initialization if missing
         const currentSpend = currentData?.currentMonthSpend || 0;
@@ -155,7 +171,7 @@ export class UsageService {
 
         const newSpend = currentSpend + cost;
 
-        store.set('usageData', {
+        await this.writeUsage({
             currentMonthSpend: newSpend,
             lastResetDate: lastReset
         });

@@ -37,9 +37,9 @@
 //    later stage.
 //
 // 3. Secure key storage
-//    - SecureKeyManager.getInstance().setKey / getKey / getKeyStatus
-//    Backed by Electron safeStorage today. Needs to become a pluggable
-//    KeyProvider the OpenClaw host supplies (env var, OS keychain, etc.).
+//    Stage 2: SecureKeyManager has been deleted. Callers now read the API
+//    key off `session.anthropicApiKey`. The host supplies it (env var,
+//    keychain, OpenClaw secret store — host's choice).
 //
 // 4. Usage accounting
 //    - UsageService.getInstance().initialize()

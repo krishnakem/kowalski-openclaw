@@ -1,3 +1,38 @@
+## Stage 2 — Done
+
+### Services edited
+- **New:** `src/core/KowalskiSession.ts` — interface + `createKowalskiSession()` factory that mkdir's scratch/output/browser profile dirs (defaulting to `os.tmpdir() + uuid`), spins up a fresh `EventEmitter`, and wires an `AbortController`. Returns `{ session, controller }`.
+- `src/main/services/BrowserManager.ts` — dropped `electron` import, replaced `setMainWindow` with `bindSession(session)` (kept as a singleton — minimum-diff). `mainWindow.webContents.send(...)` → `session.events.emit(...)` for `frame` / `screencastEnded` / `loginScreencastReady` / `loginSuccess`. `app.getPath('userData') + 'kowalski_browser'` → `session.browserProfileDir`. The `app.isPackaged` / `process.resourcesPath` branch is gone; if `session.browser?.executablePath` is set it's used, otherwise Playwright picks its own default.
+- `src/main/services/ChromiumVersionHelper.ts` — `app.getPath('home')` → `os.homedir()`, packaged-resources branch deleted.
+- `src/main/services/SessionMemory.ts` — constructor now takes `memoryFilePath: string`. The only caller is `Kowalski`, which now receives the path from `RunManager` (derived from `session.scratchDir`).
+- `src/main/services/SecureKeyManager.ts` — **deleted.** RunManager (the sole caller) now reads the key off `session.anthropicApiKey`.
+- `src/main/services/UsageService.ts` — dropped the dynamic `electron-store` import. Added `configure(scratchDir)` which sets the JSON-file path (`usage.json`) and flips out of graceful-degradation mode. The singleton surface is unchanged, so every existing `UsageService.getInstance()` caller (Extractor, DigestGeneration, ImageTagger, ContentVision, AnalysisGenerator, Kowalski) stays untouched.
+- `src/main/services/RunManager.ts` — dropped `electron` import. Kept as a singleton with a `bindSession(session)` method. All ten `mainWindow.webContents.send(...)` sites are now `session.events.emit(...)` — event names (`run-started`, `run-phase`, `analysis-ready`, `analysis-error`, `run-complete`) unchanged. `settings` now come from `session.runConfig`; `analyses` / `lastAnalysisDate` / `analysisStatus` are no longer persisted — `startRun()` now returns a `RunResult` object (`{ record, metadata, lastAnalysisDate, analysisStatus, counts }`) and the host is responsible for durable storage. Scratch paths moved to `session.scratchDir + '/kowalski-runs'`; analysis records moved to `session.outputDir + '/analysis_records'`.
+- `src/main/services/Kowalski.ts` — dropped the dead `electron` import. Constructor now takes a 4th arg `sessionMemoryPath` which is forwarded to `new SessionMemory(...)`. The commented-out debug screenshot block is still commented and now carries a TODO pointing at `session.scratchDir`.
+- `src/main/main.ts` — kept as the Stage 1 breadcrumb. Updated only the "Secure key storage" TODO block to reflect that `SecureKeyManager` is gone and callers now read `session.anthropicApiKey`.
+- `scripts/test-digest.ts`, `scripts/test-extract.ts` — rewritten to construct a session via `createKowalskiSession()`, thread `session.anthropicApiKey` through Extractor / DigestGeneration, and call `UsageService.getInstance().configure(session.scratchDir)` so usage persistence works end-to-end in the dev scripts. Both scripts now **skip** (exit 0 with a message) when `ANTHROPIC_API_KEY` is unset or when no target/run-dir is supplied, so `npm run test:extract` completes cleanly in CI without a key.
+
+### Deviations from the Stage 1 sketch
+- **`runConfig` is required (its inner fields still optional).** The sketch made the whole object optional; RunManager reads `settings.userName`, `settings.location`, `settings.phases`, and (new) `settings.maxDurationMs` unconditionally, so making the object required is one fewer `?.` chain at every call site.
+- **Added `isPackaged?: boolean`** to the session as an escape hatch. The Stage 1 sketch dropped all `app.isPackaged` branches; none of them survived Stage 2 refactoring (ChromiumVersionHelper no longer branches on packaged vs. not), but the flag is plumbed through for future hosts that may want to nudge cache lookup without editing the helper. Unused today — kept to avoid reopening the interface later.
+- **`browser.useCustomStealthBrowser` (sketched L66 of Stage 1) was not added.** BrowserManager now simply uses `session.browser?.executablePath` if set, else Playwright's default. The Electron stealth-browser branch went away cleanly.
+- **No `KeyProvider` interface.** The Stage 1 SecureKeyManager notes listed two options; we took option 1 (delete it, read `session.anthropicApiKey` directly). If a plugin host later needs async key resolution (e.g. OpenClaw secret store fetched lazily), this can be revisited.
+- **UsageService stayed a singleton with a `configure()` method** instead of becoming per-session. The sketch suggested taking a `UsageStore` interface in the constructor; adopting that would have forced edits to six services (Extractor, DigestGeneration, ImageTagger, ContentVision, AnalysisGenerator, Kowalski) that all call `UsageService.getInstance()`. Kept the singleton as the minimum-diff path.
+- **RunManager and BrowserManager stayed singletons with `bindSession()`**, for the same reason (their `getInstance()` calls are baked into Kowalski and main.ts's breadcrumb). Per-session instances are a later refactor if the plugin wants concurrent runs.
+
+### Scope deviations
+- **`eslint.config.js` was re-added** at the repo root. Stage 1 deleted it alongside the React UI (it depended on `eslint-plugin-react-hooks` / `react-refresh`), but `npm run lint` is a verification step for Stage 2. The new config is a minimal flat config for the core library only — no React plugins. This is outside the Stage 2 file-scope in the brief; flagging here.
+- **`package.json` untouched.** The `uuid` and `@types/uuid` deps were already present.
+- **Legacy `session.json` cookie-injection path in BrowserManager** was kept behaviourally but repointed inside `session.browserProfileDir`. It was an Electron onboarding artifact; leaving the code rather than ripping it out keeps the diff small, and plugin hosts that don't drop a `session.json` get a no-op.
+
+### Verification
+- `npx tsc --noEmit` — zero errors. (Stage 1's 11 errors all gone.)
+- `npm run lint` — passes.
+- `npm run test:extract` — completes (skip path, no API key in the local env).
+- `src/main/main.ts` kept as a breadcrumb, not deleted. Stage 3 will re-wire orchestration from the plugin entrypoint.
+
+---
+
 # Refactor Notes — Stage 1 (Electron strip + seam audit)
 
 This document is the output of Stage 1 of the Kowalski → OpenClaw-plugin

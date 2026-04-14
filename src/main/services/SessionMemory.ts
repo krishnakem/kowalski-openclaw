@@ -7,13 +7,12 @@
  * - Which phases are most productive
  * - Where stagnation commonly occurs
  *
- * Storage: {userData}/session_memory/summaries.json
+ * Storage: caller-supplied file path (typically under session.scratchDir).
  * Uses atomic write pattern (write temp → rename) for safety.
  *
  * Cost: $0 (no API calls, file I/O only)
  */
 
-import { app } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import { SessionSummary } from '../../types/session-memory.js';
@@ -25,9 +24,8 @@ export class SessionMemory {
     private storagePath: string;
     private summaries: SessionSummary[] = [];
 
-    constructor() {
-        const userDataPath = app.getPath('userData');
-        this.storagePath = path.join(userDataPath, 'session_memory', 'summaries.json');
+    constructor(memoryFilePath: string) {
+        this.storagePath = memoryFilePath;
     }
 
     /**

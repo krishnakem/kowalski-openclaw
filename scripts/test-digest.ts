@@ -11,30 +11,35 @@
  *   ANTHROPIC_API_KEY=sk-ant-... npx tsx scripts/test-digest.ts <run-dir>
  *   ANTHROPIC_API_KEY=sk-ant-... npx tsx scripts/test-digest.ts <run-dir> --re-extract
  *
- *   <run-dir> is a directory under ~/Downloads/kowalski-debug/ — e.g.
- *   ~/Downloads/kowalski-debug/run_2026-04-13_19-05-24
+ *   <run-dir> is a directory containing raw/stories/ and/or raw/feed/ JPEGs.
+ *   In Stage 2 this is typically {session.scratchDir}/kowalski-runs/run_*.
+ *
+ * Fixture assumption: this script does not create screenshots — it only consumes them.
+ * Point it at a directory populated by a previous RunManager.startRun() invocation.
  */
 
 import fs from 'fs';
 import path from 'path';
 import { DigestGeneration } from '../src/main/services/DigestGeneration.js';
 import { Extractor } from '../src/main/services/Extractor.js';
+import { UsageService } from '../src/main/services/UsageService.js';
+import { createKowalskiSession } from '../src/core/KowalskiSession.js';
 import { CapturedPost, ExtractionBlock } from '../src/types/instagram.js';
 
 async function main() {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+        console.log('⏭  SKIPPED: ANTHROPIC_API_KEY env var not set');
+        return;
+    }
+
     const args = process.argv.slice(2);
     const reExtract = args.includes('--re-extract');
     const runDir = args.find(a => !a.startsWith('--'));
 
     if (!runDir) {
-        console.error('Usage: tsx scripts/test-digest.ts <run-dir> [--re-extract]');
-        process.exit(1);
-    }
-
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) {
-        console.error('ANTHROPIC_API_KEY env var required');
-        process.exit(1);
+        console.log('⏭  SKIPPED: no run directory provided. Usage: tsx scripts/test-digest.ts <run-dir> [--re-extract]');
+        return;
     }
 
     if (!fs.existsSync(runDir)) {
@@ -42,18 +47,19 @@ async function main() {
         process.exit(1);
     }
 
+    const { session } = createKowalskiSession({ anthropicApiKey: apiKey });
+    UsageService.getInstance().configure(session.scratchDir);
+
     const rawStoriesDir = path.join(runDir, 'raw', 'stories');
     const rawFeedDir = path.join(runDir, 'raw', 'feed');
 
     if (reExtract) {
         console.log('🧠 Re-extraction requested — running Extractor on raw screenshots...');
-        // Drop the navigator's done.marker check by writing one ourselves so the
-        // extractor exits after sweeping all existing files.
         for (const dir of [rawStoriesDir, rawFeedDir]) {
             if (!fs.existsSync(dir)) continue;
             const marker = path.join(dir, 'done.marker');
             if (!fs.existsSync(marker)) fs.writeFileSync(marker, JSON.stringify({ source: 'test-digest', ts: Date.now() }));
-            const extractor = new Extractor(dir, apiKey);
+            const extractor = new Extractor(dir, session.anthropicApiKey);
             const stats = await extractor.start();
             console.log(`   ${path.basename(dir)}: ${stats.extracted} extracted, ${stats.skipped} skipped, ${stats.failed} failed`);
         }
@@ -72,10 +78,10 @@ async function main() {
     const withExtraction = captures.filter(c => c.extraction).length;
     console.log(`📦 Loaded ${captures.length} screenshots (${withExtraction} with extractions)`);
 
-    const digestGen = new DigestGeneration(apiKey);
+    const digestGen = new DigestGeneration(session.anthropicApiKey);
     const analysis = await digestGen.generateDigest(captures, {
-        userName: 'TestUser',
-        location: ''
+        userName: session.runConfig.userName ?? 'TestUser',
+        location: session.runConfig.location ?? ''
     });
 
     const outJson = path.join(runDir, 'digest.json');

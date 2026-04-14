@@ -5,23 +5,28 @@
  *
  * Usage:
  *   ANTHROPIC_API_KEY=sk-ant-... npx tsx scripts/test-extract.ts <path-to-jpg-or-dir>
+ *
+ * Fixture assumption: the target must be an existing .jpg file or a directory
+ * containing .jpg files. The script does not capture screenshots itself.
  */
 
 import fs from 'fs';
 import path from 'path';
 import { Extractor } from '../src/main/services/Extractor.js';
+import { UsageService } from '../src/main/services/UsageService.js';
+import { createKowalskiSession } from '../src/core/KowalskiSession.js';
 
 async function main() {
-    const target = process.argv[2];
-    if (!target) {
-        console.error('Usage: tsx scripts/test-extract.ts <path-to-jpg-or-dir>');
-        process.exit(1);
-    }
-
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
-        console.error('ANTHROPIC_API_KEY env var required');
-        process.exit(1);
+        console.log('⏭  SKIPPED: ANTHROPIC_API_KEY env var not set');
+        return;
+    }
+
+    const target = process.argv[2];
+    if (!target) {
+        console.log('⏭  SKIPPED: no target provided. Usage: tsx scripts/test-extract.ts <path-to-jpg-or-dir>');
+        return;
     }
 
     if (!fs.existsSync(target)) {
@@ -29,11 +34,13 @@ async function main() {
         process.exit(1);
     }
 
+    const { session } = createKowalskiSession({ anthropicApiKey: apiKey });
+    UsageService.getInstance().configure(session.scratchDir);
+
     const stat = fs.statSync(target);
     let dir: string;
 
     if (stat.isFile()) {
-        // Run extractor on a temp dir containing only this image.
         if (!target.endsWith('.jpg')) {
             console.error('Single-file mode requires a .jpg path');
             process.exit(1);
@@ -41,12 +48,11 @@ async function main() {
         const sourceDir = path.dirname(target);
         const filename = path.basename(target);
 
-        // Write a done.marker so the extractor exits after this file.
         const marker = path.join(sourceDir, 'done.marker');
         const markerExisted = fs.existsSync(marker);
         if (!markerExisted) fs.writeFileSync(marker, JSON.stringify({ source: 'test-extract', ts: Date.now() }));
 
-        const extractor = new ExtractorSingle(sourceDir, apiKey, filename);
+        const extractor = new ExtractorSingle(sourceDir, session.anthropicApiKey, filename);
         await extractor.start();
         if (!markerExisted) fs.unlinkSync(marker);
 
@@ -60,7 +66,7 @@ async function main() {
     const marker = path.join(dir, 'done.marker');
     const markerExisted = fs.existsSync(marker);
     if (!markerExisted) fs.writeFileSync(marker, JSON.stringify({ source: 'test-extract', ts: Date.now() }));
-    const extractor = new Extractor(dir, apiKey);
+    const extractor = new Extractor(dir, session.anthropicApiKey);
     const stats = await extractor.start();
     if (!markerExisted) fs.unlinkSync(marker);
     console.log(`\n${stats.extracted} extracted, ${stats.skipped} skipped, ${stats.failed} failed`);
@@ -74,7 +80,6 @@ class ExtractorSingle extends Extractor {
         this.targetFile = targetFile;
     }
     async start() {
-        // Mark every other file as already-processed so the loop only touches our target.
         const dir = (this as any).rawDir as string;
         const others = fs.readdirSync(dir).filter(f => f.endsWith('.jpg') && f !== this.targetFile);
         for (const o of others) (this as any).processed.add(o);

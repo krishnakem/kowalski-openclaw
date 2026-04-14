@@ -1,4 +1,3 @@
-import { app, BrowserWindow } from 'electron';
 import fs from 'fs';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
@@ -6,18 +5,44 @@ import { BrowserManager } from './BrowserManager.js';
 import { Kowalski } from './Kowalski.js';
 import { DigestGeneration } from './DigestGeneration.js';
 import { Extractor } from './Extractor.js';
-import { SecureKeyManager } from './SecureKeyManager.js';
 import { isOnline, isNetworkError, startOfflineWatchdog, OFFLINE_ERROR, CREDITS_DEPLETED_ERROR } from './NetworkMonitor.js';
 import { ExtractionBlock } from '../../types/instagram.js';
-
-const __filename = decodeURIComponent(new URL(import.meta.url).pathname);
-const __dirname = path.dirname(__filename);
+import type { KowalskiSession } from '../../core/KowalskiSession.js';
 
 type RunStatus = 'idle' | 'running';
 
+// RunManager is kept as a singleton (minimum-diff with Stage 1 call sites);
+// bindSession is called once before startRun. The host is responsible for
+// durable storage of the returned AnalysisRecord — nothing is persisted to a
+// shared store anymore.
+export interface AnalysisRecord {
+    id: string;
+    data: any;
+    leadStoryPreview: string;
+}
+
+export interface RunResultMetadata {
+    id: string;
+    data: {
+        date: string | Date;
+        title: string;
+        scheduledTime?: string;
+        location?: string;
+    };
+    leadStoryPreview: string;
+}
+
+export interface RunResult {
+    record: AnalysisRecord;
+    metadata: RunResultMetadata;
+    lastAnalysisDate: string;
+    analysisStatus: 'ready';
+    counts: { extracted: number; skipped: number; failed: number };
+}
+
 export class RunManager {
     private static instance: RunManager;
-    private mainWindow: BrowserWindow | null = null;
+    private session: KowalskiSession | null = null;
     private status: RunStatus = 'idle';
 
     // Active run state (for stop support)
@@ -40,12 +65,25 @@ export class RunManager {
         return RunManager.instance;
     }
 
-    public setMainWindow(window: BrowserWindow | null) {
-        this.mainWindow = window;
+    public bindSession(session: KowalskiSession | null): void {
+        this.session = session;
+    }
+
+    private requireSession(): KowalskiSession {
+        if (!this.session) {
+            throw new Error('RunManager: no session bound (call bindSession first)');
+        }
+        return this.session;
     }
 
     public getStatus(): RunStatus {
         return this.status;
+    }
+
+    private emit(name: string, payload?: any): void {
+        if (!this.session) return;
+        if (payload === undefined) this.session.events.emit(name);
+        else this.session.events.emit(name, payload);
     }
 
     /**
@@ -60,17 +98,11 @@ export class RunManager {
         if (this.offlineDetected) return;
         console.log('🌐 Offline detected — aborting run');
         this.offlineDetected = true;
-        // Emit the failed-screen event immediately. If we waited for the run
-        // to unwind first, the browser close would fire `screencast:onEnded`
-        // and AgentActiveScreen would briefly flip to "Generating digest"
-        // before the error arrived.
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-            this.mainWindow.webContents.send('analysis-error', {
-                message: 'Network connection lost',
-                kind: 'offline',
-                canRetry: true
-            });
-        }
+        this.emit('analysis-error', {
+            message: 'Network connection lost',
+            kind: 'offline',
+            canRetry: true
+        });
         this.runAbortController?.abort();
         if (this.activeScraper) this.activeScraper.stop();
         for (const e of this.activeExtractors) e.stop();
@@ -105,16 +137,17 @@ export class RunManager {
         }
     }
 
-    public async startRun(options?: { phases?: ('stories' | 'feed')[] }): Promise<void> {
+    public async startRun(options?: { phases?: ('stories' | 'feed')[] }): Promise<RunResult | null> {
         if (this.status === 'running') {
             console.log('⚠️ Run already in progress');
-            return;
+            return null;
         }
 
+        const session = this.requireSession();
         this.status = 'running';
         this.offlineDetected = false;
         this.runAbortController = new AbortController();
-        const phases = options?.phases ?? ['stories', 'feed'];
+        const phases = options?.phases ?? session.runConfig.phases ?? ['stories', 'feed'];
         console.log(`🚀 Run started (phases: ${phases.join(', ')})`);
 
         // Background watchdog: probes Anthropic every 2s and trips notifyOffline
@@ -125,31 +158,27 @@ export class RunManager {
             this.notifyOffline();
         });
 
-        const MAX_DURATION_MS = 90 * 60 * 1000;
+        const MAX_DURATION_MS = session.runConfig.maxDurationMs ?? 90 * 60 * 1000;
         const browserManager = BrowserManager.getInstance();
+        browserManager.bindSession(session);
         let context = null;
 
-        // Notify UI that run started
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-            this.mainWindow.webContents.send('run-started', {
-                durationMs: MAX_DURATION_MS,
-                startTime: Date.now()
-            });
-        }
+        this.emit('run-started', {
+            durationMs: MAX_DURATION_MS,
+            startTime: Date.now()
+        });
 
         try {
-            // 1. Get store & settings
-            const { default: Store } = await import('electron-store');
-            const store: any = new Store();
-            const settings = store.get('settings') || {};
+            // 1. Settings come from the session config (the host owns durable storage).
+            const settings = session.runConfig;
 
-            // 2. Get API Key
-            const apiKey = await SecureKeyManager.getInstance().getKey();
+            // 2. API key comes from the session.
+            const apiKey = session.anthropicApiKey;
             if (!apiKey) {
                 console.error('🚀 Run: NO API KEY');
                 this.emitError('API key not found.');
                 this.finishRun();
-                return;
+                return null;
             }
 
             // 2a. Pre-flight: confirm we can reach Anthropic before spending minutes
@@ -172,11 +201,9 @@ export class RunManager {
                 throw new Error(sessionCheck.reason || 'SESSION_EXPIRED');
             }
 
-            // 5. Set up directories
-            // Raw screenshots + sidecars live in userData (extractor watches them).
-            // Previously under ~/Downloads/kowalski-debug; moved out so runs don't
-            // accumulate files in the user's Downloads folder.
-            const screenshotsDir = path.join(app.getPath('userData'), 'kowalski-runs');
+            // 5. Set up directories. Raw screenshots + sidecars live under
+            // session.scratchDir (extractor watches them).
+            const screenshotsDir = path.join(session.scratchDir, 'kowalski-runs');
             const runStart = new Date();
             const pad = (n: number) => n.toString().padStart(2, '0');
             const dateTime = `${runStart.getFullYear()}-${pad(runStart.getMonth() + 1)}-${pad(runStart.getDate())}_${pad(runStart.getHours())}-${pad(runStart.getMinutes())}-${pad(runStart.getSeconds())}`;
@@ -197,22 +224,25 @@ export class RunManager {
 
             // 7. Browse Instagram
             console.log('🚀 Browsing Instagram...');
-            const scraper = new Kowalski(context, apiKey, false);
+            const scraper = new Kowalski(
+                context,
+                apiKey,
+                false,
+                path.join(session.scratchDir, 'session_memory', 'summaries.json')
+            );
             this.activeScraper = scraper;
-            const session = await scraper.browseAndCapture(
+            const browseSession = await scraper.browseAndCapture(
                 MAX_DURATION_MS / 60000,
                 {
                     rawDir: path.join(sessionDir, 'raw'),
                     phases,
                     onPhaseChange: (phase, info) => {
-                        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-                            this.mainWindow.webContents.send('run-phase', { phase, ...(info ?? {}) });
-                        }
+                        this.emit('run-phase', { phase, ...(info ?? {}) });
                     }
                 }
             );
             this.activeScraper = null;
-            console.log(`🚀 Browsing complete: ${session.rawScreenshotCount} raw screenshots`);
+            console.log(`🚀 Browsing complete: ${browseSession.rawScreenshotCount} raw screenshots`);
 
             // Bail out early if the watchdog tripped during browsing. We must
             // not proceed to digest generation when the user has no network —
@@ -291,10 +321,9 @@ export class RunManager {
                 location: settings.location || ''
             }, this.runAbortController.signal);
 
-            // 12. Save images to disk
+            // 12. Save images to disk (under session.outputDir — host owns retention).
             const recordId = uuidv4();
-            const userDataPath = app.getPath('userData');
-            const recordDir = path.join(userDataPath, 'analysis_records');
+            const recordDir = path.join(session.outputDir, 'analysis_records');
             const imagesDir = path.join(recordDir, recordId, 'images');
             await fs.promises.mkdir(imagesDir, { recursive: true });
 
@@ -327,7 +356,7 @@ export class RunManager {
             await fs.promises.rename(tempPath, recordPath);
             console.log(`🚀 Saved digest to disk: ${recordPath}`);
 
-            // 14. Save metadata to store
+            // 14. Compose metadata record. Not persisted here — returned to caller.
             const metadataRecord = {
                 id: newRecord.id,
                 data: {
@@ -339,23 +368,26 @@ export class RunManager {
                 leadStoryPreview: newRecord.leadStoryPreview
             };
 
-            const currentAnalyses = store.get('analyses') || [];
-            store.set('analyses', [metadataRecord, ...currentAnalyses]);
-
-            // 15. Update status to ready
             const now = new Date();
-            store.set('settings', {
-                ...store.get('settings'),
-                lastAnalysisDate: now.toISOString(),
-                analysisStatus: 'ready'
-            });
-
-            // 16. Notify UI
-            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-                this.mainWindow.webContents.send('analysis-ready', metadataRecord);
-            }
+            this.emit('analysis-ready', metadataRecord);
 
             console.log(`🚀 Run complete! Extracted: ${totalExtracted}, Skipped: ${totalSkipped}, Failed: ${totalFailed}`);
+
+            // The host is responsible for durable storage of `record` +
+            // `metadata`. RunManager used to write both to electron-store; now
+            // it returns them and the host decides.
+            this.finishRun();
+            return {
+                record: newRecord,
+                metadata: metadataRecord,
+                lastAnalysisDate: now.toISOString(),
+                analysisStatus: 'ready',
+                counts: {
+                    extracted: totalExtracted,
+                    skipped: totalSkipped,
+                    failed: totalFailed
+                }
+            };
 
         } catch (error: any) {
             console.error('🚀 Run failed:', error.message);
@@ -384,16 +416,15 @@ export class RunManager {
         }
 
         this.finishRun();
+        return null;
     }
 
     private emitError(message: string, kind: 'offline' | 'credits' | 'general' = 'general') {
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-            this.mainWindow.webContents.send('analysis-error', {
-                message,
-                kind,
-                canRetry: true
-            });
-        }
+        this.emit('analysis-error', {
+            message,
+            kind,
+            canRetry: true
+        });
     }
 
     private finishRun() {
@@ -403,8 +434,6 @@ export class RunManager {
             this.stopOfflineWatchdog();
             this.stopOfflineWatchdog = null;
         }
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-            this.mainWindow.webContents.send('run-complete', {});
-        }
+        this.emit('run-complete', {});
     }
 }
