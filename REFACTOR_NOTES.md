@@ -1,3 +1,91 @@
+## Stage 7 — Post-testing polish
+
+Two asks surfaced after the first end-to-end digest run against a
+live account:
+
+### 7.1 Credentials flow via TUI, not env vars
+
+The Stage 6 agentic login originally required `IG_USERNAME` /
+`IG_PASSWORD` env vars at gateway launch. User pushback: the
+canonical path should be the agent prompting for creds in the TUI
+on first login. Rewired:
+
+- `login` tool now accepts optional `username` / `password` / `force_headful` params.
+- Resolution order: params → session-cached creds (from a prior login call) → env vars → return `pending_credentials`.
+- New `pending_credentials` tool response tells the agent to ask the
+  user in the TUI, then call `login` again with the params.
+- `force_headful: true` remains as an explicit escape for users who
+  don't want to type their password into chat.
+- Creds are cached on `KowalskiSession.runConfig` so
+  `submit_verification_code` reuses them across 2FA round trips
+  without asking twice.
+- SKILL.md updated: new step 3.a1, new credentials note, new failure-mode
+  row. Old "never ask the user for their IG credentials" Don't is gone.
+
+### 7.2 PDF digest to ~/Downloads
+
+User asked for a text-only PDF of every digest, saved to their
+Downloads folder. Implemented:
+
+- New helper [src/plugin/digest-pdf.ts](src/plugin/digest-pdf.ts)
+  renders the digest's `markdown` field (or legacy `sections`) into
+  a paginated A4 PDF via PDFKit. Hand-rolled mini-markdown renderer
+  (h1/h2/h3, bullets, bold/italic/code) — no browser, no extra deps
+  beyond PDFKit.
+- `run_digest` calls it right before returning. Output path shows up
+  as a new `- pdf:` line in the digest text header.
+- Best-effort: PDF write failures are logged as warnings and surface
+  as `- pdf: (failed to write — <msg>)` in the header, but never fail
+  the digest itself.
+- Save location defaults to `$HOME/Downloads`; overridable via
+  `pluginConfig.downloadsDir` (add to `PluginConfig` interface).
+- Aborted runs get an `ABORTED` banner at the top of the PDF with the
+  `abortReason` from the record metadata.
+- New dev dep: `@types/pdfkit`. New runtime dep: `pdfkit` (~150kB,
+  pure JS, no native bindings).
+
+### 7.3 `reset_all` — full factory reset
+
+User asked for a wipe-everything command. New `reset_all` tool:
+
+- Dry-run by default — returns a preview of exactly what will be
+  deleted unless `confirm: true` is passed. Prevents accidental
+  wipes from a mis-triggered agent.
+- Aborts all in-memory sessions + writes STOP_REQUESTED marker so
+  any in-flight run tears down before the filesystem wipe.
+- Closes all pending-login Chromium contexts.
+- `rm -rf` + recreate empty on browserProfileDir, scratchDir,
+  outputDir. Everything else (plugin config, Downloads PDFs) is
+  left alone.
+
+Tool count is now 9 (added `reset_all` between `reset_memory` and
+`stop_run`). SKILL.md gained a "Wipe everything" section explaining
+the dry-run-then-confirm pattern and reminding the agent to ask
+before calling with `confirm: true`.
+
+### 7.4 `stop_run` serialization bug (upstream, not fixed in plugin)
+
+Confirmed during live test: `stop_run` queues behind the in-flight
+`run_digest` because OpenClaw serializes all plugin tool dispatch.
+Result: user says "stop the run" in chat, tool call never reaches
+the plugin, run continues to completion.
+
+Not fixable plugin-side. Mitigations shipped:
+
+- SKILL.md documents the one-liner workaround for when the tool hangs:
+  `touch ~/.kowalski/scratch/STOP_REQUESTED`. RunManager polls for
+  this marker every ~3s inside its own phase loop, independent of
+  tool dispatch, so it fires reliably even mid-run.
+- Upstream: file a bug on OpenClaw requesting either (a) a non-
+  serializing tool tier for control-plane tools like `stop_run`, or
+  (b) per-session serialization so a second TUI can stop the first
+  session's run.
+
+(Earlier iteration of 7.4 bundled a `kowalski-stop` CLI via
+`package.json#bin`. Removed to keep the install surface to just
+"install the OpenClaw plugin" — the `touch` workaround is already
+zero-install for anyone with a shell.)
+
 ## Stage 6 — Agentic self-login
 
 Stage 6 is the point of the project: replace the "user types into a
