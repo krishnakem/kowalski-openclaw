@@ -1,0 +1,42 @@
+{
+    "id": "kowalski-openclaw",
+    "name": "Kowalski",
+    "description": "Browses your Instagram stories and feed and returns a markdown digest.",
+    "version": "0.1.0",
+    "kind": "capability",
+    "main": "./src/plugin/index.ts",
+    "configSchema": {
+        "type": "object",
+        "properties": {
+            "anthropicApiKey": {
+                "type": "string",
+                "description": "Anthropic API key used for Claude calls (navigator, extractor, digest generator)."
+            },
+            "browserProfileDir": {
+                "type": "string",
+                "description": "Path to the persistent Playwright user-data directory. Used by both the login flow (headful) and run flow (headless). Leading ~ is expanded to the user's home directory at plugin-register time.",
+                "default": "~/.kowalski/browser"
+            },
+            "scratchDir": {
+                "type": "string",
+                "description": "Ephemeral per-run working directory (raw frames, extraction sidecars, session memory). Safe to wipe between runs. Leading ~ is expanded at plugin-register time.",
+                "default": "~/.kowalski/scratch"
+            },
+            "outputDir": {
+                "type": "string",
+                "description": "Durable output directory where finished analysis records land under analysis_records/<id>.json. Leading ~ is expanded at plugin-register time.",
+                "default": "~/.kowalski/output"
+            },
+            "userName": {
+                "type": "string",
+                "description": "User's name — surfaced to the agents as context when they personalize the digest."
+            },
+            "location": {
+                "type": "string",
+                "description": "User's location (city / region) — surfaced to the agents as context."
+            }
+        },
+        "required": ["anthropicApiKey"],
+        "additionalProperties": false
+    }
+}

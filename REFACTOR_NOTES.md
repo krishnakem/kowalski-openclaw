@@ -1,3 +1,147 @@
+## Stage 3 — Done
+
+The OpenClaw plugin shell lands in this stage. Six tools are registered,
+the plugin module compiles and passes a fake-register smoke test, and the
+user-config → plugin-config → `KowalskiSession` pipeline is wired end-to-end.
+No service code under `src/main/services/` was modified.
+
+### SDK import strategy — no `definePluginEntry`
+
+Short version: `@openclaw/plugin-sdk` is not on npm. The SDK lives in the
+`openclaw/openclaw` monorepo under `src/plugin-sdk/` but is marked
+`"private": true` and has no published `latest` tag. The `openclaw` npm
+package that does exist is the gateway/CLI app, not a library to depend on.
+
+Rather than `@ts-expect-error`-ing an unresolvable import, the plugin
+follows the pattern used by the reference MemOS-Cloud plugin
+(`github.com/MemTensor/MemOS-Cloud-OpenClaw-Plugin`): a plain default
+export of `{ id, name, description, kind, register }` with no SDK import
+at all. The OpenClaw loader accepts this shape (`def.register ?? def.activate`,
+`src/plugins/loader.ts:635`) — it is not a concession, it is the
+idiomatic pattern the reference plugin itself uses.
+
+Type surfaces that normally live in `@mariozechner/pi-agent-core`
+(`AgentTool`, `AgentToolResult`) and `@openclaw/plugin-sdk`
+(`OpenClawPluginApi`, `OpenClawPluginToolOptions`) are re-declared locally
+inside [src/plugin/index.ts](src/plugin/index.ts) as `PluginTool`,
+`PluginApi`, and `AgentToolResult`. These are structurally compatible
+with what the SDK surfaces — the shapes come straight from the research
+into `api-builder.ts`, `types.ts:1887`, and `tool-types.ts:39`. At
+runtime the loader duck-types the plugin's default export against its
+own `OpenClawPluginDefinition` type, so there is no compile-time linkage
+to verify.
+
+If a future task wants to use `definePluginEntry` or TypeBox schemas for
+real, the user must symlink a local `openclaw/openclaw` checkout into
+`node_modules/@openclaw/plugin-sdk` (and install `@mariozechner/pi-agent-core`
++ `@sinclair/typebox` as peers). That is intentionally out of scope for
+Stage 3 — the plugin as shipped loads without any local SDK.
+
+### Tools registered
+
+All six in [src/plugin/index.ts](src/plugin/index.ts). JSDoc on each
+tool object describes inputs / outputs / when the agent should reach for it.
+
+- `start_session` — creates a `KowalskiSession`, binds the
+  BrowserManager + RunManager singletons, configures UsageService, and
+  probes the Instagram `sessionid` cookie. Returns a JSON text block
+  `{ session_id, logged_in, phases, message }`. `logged_in` is `true` /
+  `false` / `"unknown"`; on anything but `true` the message tells the
+  agent to call `login` next.
+- `login` — **`{ optional: true }`**. Lifts
+  [runLogin](src/plugin/login-flow.ts) from the pre-plugin smoke test
+  and wraps it with a 10-minute timeout.
+- `run_digest` — blocking. Re-binds the singletons to the target session
+  (defends against a different session having bound last) and calls
+  `RunManager.startRun({ phases })`. Returns a text block with a header
+  (record id, on-disk path, counts, lead story) plus the full
+  `record.data` as a fenced JSON block.
+- `get_session_status` — polls a bounded ring buffer (size 20) of the
+  session's `events` plus a `last_phase` field tracked from
+  `run-started` / `run-phase` / `run-complete`. The listener lives in
+  [src/plugin/session-registry.ts](src/plugin/session-registry.ts);
+  `frame` payloads are replaced with a stub so the buffer doesn't store
+  JPEG bytes.
+- `reset_memory` — deletes `<scratchDir>/session_memory/summaries.json`.
+  Global, not per-session, because `scratchDir` is pinned on
+  `pluginConfig` and shared across sessions. Idempotent.
+- `end_session` — aborts the controller, closes the Playwright context,
+  drops the entry from the registry.
+
+### One-blocking-tool decision for `run_digest`
+
+Chosen deliberately for v1. The prior research established OpenClaw has
+no tool-level timeout in the execution layer (research: `loader.ts` and
+`api-builder.ts` — no timeout wrapper around `tool.execute`). So a
+single blocking call that can take tens of minutes is expected to work.
+The agent can poll `get_session_status` in a separate call if it wants
+progress.
+
+Fallback plan if the HTTP / agent layer turns out to impose a timeout in
+practice (Stage 3.5): split into `capture_stories` + `capture_feed` (both
+returning a `job_handle`) + `generate_digest`, with `get_session_status`
+telling the agent when the upstream phase has finished. The
+`attachEventBuffer` listener already tracks `analysis-ready` and
+`run-complete`, which are the signal the agent would poll for. No
+service change would be needed — only the plugin tool surface.
+
+### Deviations from the brief
+
+- **`openclaw.compat` field omitted.** The brief asked for a `compat`
+  field matching the reference plugin. The reference plugin
+  ([package.json](https://github.com/MemTensor/MemOS-Cloud-OpenClaw-Plugin/blob/main/package.json))
+  does not set `compat` — its `openclaw` block only has `hooks` and
+  `extensions`. Kept `{ extensions: ["./src/plugin/index.ts"] }`. If a
+  future gateway version demands `compat`, add it then.
+- **`better-sqlite3` types via ambient `.d.ts`.** The package ships
+  without official types and the brief said no new deps. A minimal
+  read-only declaration lives at
+  [src/types/better-sqlite3.d.ts](src/types/better-sqlite3.d.ts) — only
+  covers `prepare / get / close`, which is all the cookie probe needs.
+- **`runLogin` moved into the plugin tree.** The implementation was
+  lifted from `scripts/login.ts` into
+  [src/plugin/login-flow.ts](src/plugin/login-flow.ts); the CLI script
+  is now a thin wrapper that re-exports and runs it. Reason:
+  `scripts/login.ts` is outside the tsc `rootDir`, so
+  `src/plugin/index.ts` could not import it directly. Both the plugin
+  tool and `npm run login` now share exactly one codepath.
+- **`parameters` schema is plain JSON Schema,** not TypeBox. The SDK
+  ultimately wants `TSchema` from `@sinclair/typebox`, but TypeBox is
+  not a dep and adding it violated the "no casual deps" constraint.
+  Runtime will accept the JSON Schema shape (TypeBox itself emits JSON
+  Schema under the hood); if the loader validates with `Value.Check`
+  it will complain, and the fix is one `Type.Unsafe<...>()` wrap per
+  tool at SDK-link time.
+- **Plugin kind = `capability`** (not `lifecycle` like the MemOS
+  reference). Capability is the kind that registers tools; lifecycle is
+  for hook/event plugins. If the loader rejects `capability`, the
+  alternatives are no `kind` field at all or `"agent-extension"` —
+  inspect the loader log on first real load.
+
+### Pointer to Stage 4 (SKILL.md)
+
+`skills/instagram-digest/SKILL.md` is the next stage's responsibility.
+The playbook needs to cover: (1) always call `start_session` first;
+(2) if `logged_in !== true`, call `login` and then `start_session` again;
+(3) `run_digest` blocks for tens of minutes — if you want progress,
+open a second tool call to `get_session_status` rather than waiting
+silently; (4) `reset_memory` is the "forget last week" tool; (5)
+`end_session` when the user is done.
+
+### Verification
+
+- `npx tsc --noEmit` — zero errors.
+- `npm run lint` — passes.
+- `npm run test:plugin` — passes. Smoke test asserts module shape,
+  register call, six tools in order with `login` marked `optional`,
+  valid `parameters` on every tool, and `start_session` returning a
+  proper `AgentToolResult` shape. It does NOT launch a browser, hit
+  Anthropic, or touch any real profile.
+- Actually loading the plugin into a live OpenClaw daemon is the next
+  task — deferred per the brief's "do not attempt" constraint.
+
+---
+
 ## Pre-Stage-3 smoke test
 
 Two scratch scripts were added to de-risk the Stage 2 refactor before any

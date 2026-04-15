@@ -8,7 +8,11 @@
     "login": "npx tsx scripts/login.ts",
     "test:digest": "npx tsx scripts/test-digest.ts",
     "test:extract": "npx tsx scripts/test-extract.ts",
-    "test:run": "npx tsx scripts/test-run.ts"
+    "test:run": "npx tsx scripts/test-run.ts",
+    "test:plugin": "npx tsx scripts/test-plugin.ts"
+  },
+  "openclaw": {
+    "extensions": ["./src/plugin/index.ts"]
   },
   "dependencies": {
     "@types/uuid": "^10.0.0",
