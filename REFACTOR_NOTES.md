@@ -1,3 +1,65 @@
+## Stage 5 — Login browser polish
+
+Cosmetic-only stage: strip the login Chromium's UI chrome so the
+headful window reads as a focused login dialog, not a full browser.
+Touches a single file, `src/plugin/login-flow.ts`. Plugin-surface
+behavior is unchanged.
+
+### What changed
+
+`chromium.launchPersistentContext(...)` now passes
+`--app=https://www.instagram.com/` alongside the existing stealth args,
+which puts Chromium into PWA mode: no tabs, no address bar, no
+bookmarks bar, no extensions menu — just the page content with OS
+title bar + close button. Because `--app` drives the initial
+navigation itself, the explicit `await page.goto('...')` call is
+dropped; the `page` handle is still read from `context.pages()[0]`
+for downstream code. Added quieting args:
+`--window-size=<vw>,<vh>` (needed because `--app` sizes the OS window
+independently of Playwright's `viewport`), `--disable-extensions`,
+`--disable-default-apps`, `--no-first-run`,
+`--no-default-browser-check`,
+`--disable-features=TranslateUI,Translate,AutofillServerCommunication,OptimizationHints`,
+`--disable-component-update`. All Stage 3.5 stealth flags
+(`--disable-blink-features=AutomationControlled`, `--no-sandbox` set,
+`--disable-infobars`, `--disable-dev-shm-usage`) are preserved. The
+cookie-polling auto-close loop is untouched — OS close still works
+as a manual abort.
+
+### Verification
+
+`npm run login` opened an `~1280×900` Instagram window with just a
+title bar and close button — no tabs, no URL bar, no menu strip. The
+existing persisted cookies were detected by the probe loop within
+~2s and the window auto-closed normally. Post-run
+`probeInstagramLogin('~/.kowalski/browser')` returned
+`{ logged_in: true, expiresAt: 1807766949651 }`, confirming the
+cookie-jar round-trip. `npx tsc --noEmit` and `npm run test:plugin`
+both clean.
+
+### Stealth note
+
+The `--app` launch did NOT trip an Instagram checkpoint or
+suspicious-activity screen — the session that Stage 3.5 persisted
+remained valid across the re-launch. The fallback path (drop
+`--app`, keep `page.goto(...)`, add `--disable-infobars`
+/ `--hide-scrollbars`, accept visible tabs) was not needed. If a
+future user reports a checkpoint on a fresh login under `--app` mode,
+back it out and use the fallback — the rest of the quieting args are
+safe either way.
+
+### Related — OpenClaw-side deployment
+
+Messaging channels (iMessage, Telegram, etc.) and scheduled daily
+digests are configured in OpenClaw itself, not in this repo — see
+OpenClaw's docs at `docs.openclaw.ai/plugin` for channel and cron
+setup. The Kowalski plugin exposes its tools the same way regardless
+of how the user reaches the agent (TUI, iMessage, scheduled cron
+message, etc.), so there is no Kowalski-side wiring for those
+surfaces.
+
+---
+
 ## Stage 4 — Skill playbook + polish
 
 Stage 4 is the capstone of the OpenClaw refactor. It delivers a skill
