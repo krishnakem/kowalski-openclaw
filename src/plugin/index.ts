@@ -971,7 +971,7 @@ export function register(api: PluginApi): () => void {
                 stories_cap_ms: STORIES_CAP_MS,
                 feed_cap_ms: FEED_CAP_MS,
                 message:
-                    'Digest started in the background. Tell the user the run is in flight (10–30 min typical, ~45 min worst case) and they can say "stop" any time — stop_run now dispatches instantly. Progress ⏱ ticks stream to the TUI log pane every 5 min. To fetch the final digest, call get_session_status; when digest_status is "completed" or "stopped" the response includes the full result.',
+                    'Digest started in the background. Tell the user the run is in flight (10–30 min typical, ~45 min worst case) and they can say "stop" any time — stop_run now dispatches instantly. Progress ⏱ ticks stream to the TUI log pane every 5 min. To fetch the final digest, call get_session_status; when digest_status is "completed" or "stopped" the response includes the full result AND auto-ends the session (`session_ended: true` in the same payload). Don\'t call end_session afterwards.',
             });
         },
     };
@@ -990,7 +990,7 @@ export function register(api: PluginApi): () => void {
     const getSessionStatus: PluginTool = {
         name: 'get_session_status',
         description:
-            'Return the latest run phase and last ~20 pipeline events for a session. Useful to check progress on a long-running run_digest call.',
+            'Return the latest run phase and last ~20 pipeline events for a session. Useful to check progress on a long-running run_digest call. NOTE: the call that first surfaces a terminal status (`digest_result` for completed/stopped, `digest_error` for failed) ALSO auto-ends the session — the response will include `session_ended: true` and subsequent polls will return `session_id not found`. Hand the digest back to the user immediately on that response.',
         parameters: {
             type: 'object',
             properties: {
@@ -1024,6 +1024,12 @@ export function register(api: PluginApi): () => void {
                 digest_status: digestStatus,
                 events: entry.events,
             };
+            // Auto-end the session once the agent has seen a terminal
+            // state. Gated on first-delivery so we don't tear down before
+            // the digest payload is handed back: completed/stopped end on
+            // the call that delivers `digest_result`; failed ends on the
+            // call that surfaces `digest_error`.
+            let shouldEnd = false;
             if (ad) {
                 payload.digest_started_at = new Date(ad.startedAt).toISOString();
                 if (ad.status === 'running') {
@@ -1031,6 +1037,10 @@ export function register(api: PluginApi): () => void {
                 }
                 if (ad.status === 'failed' && ad.errorMessage) {
                     payload.digest_error = ad.errorMessage;
+                    if (!ad.resultDelivered) {
+                        ad.resultDelivered = true;
+                        shouldEnd = true;
+                    }
                 }
                 // Deliver the result exactly once: after the agent has
                 // seen it, clear resultText so subsequent status polls
@@ -1040,9 +1050,23 @@ export function register(api: PluginApi): () => void {
                     payload.digest_result = ad.resultText;
                     if (!ad.resultDelivered) {
                         ad.resultDelivered = true;
+                        shouldEnd = true;
                     }
                 }
             }
+
+            if (shouldEnd) {
+                try { entry.controller.abort(); } catch { /* ignore */ }
+                try {
+                    const ctx = entry.session.browser?.context;
+                    if (ctx) await ctx.close();
+                } catch (err) {
+                    log.warn('get_session_status: auto-end browser close failed', err);
+                }
+                sessions.delete(sessionId);
+                payload.session_ended = true;
+            }
+
             return jsonTextResult(payload);
         },
     };
