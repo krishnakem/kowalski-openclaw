@@ -10,12 +10,17 @@
  */
 
 import { Page } from 'playwright';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { GhostMouse } from './GhostMouse.js';
 import { HumanScroll } from './HumanScroll.js';
 import { ScreenshotCollector } from './ScreenshotCollector.js';
 import { BaseVisionAgent, type BaseAgentConfig, type VisionAction } from './BaseVisionAgent.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
-import storiesInstructions from '../prompts/stories-instructions.md';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const storiesInstructions = readFileSync(join(__dirname, '../prompts/stories-instructions.md'), 'utf8');
 
 export class StoriesAgent extends BaseVisionAgent {
     constructor(

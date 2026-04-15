@@ -15,14 +15,24 @@ import { Page } from 'playwright';
 import { Jimp } from 'jimp';
 import fs from 'fs';
 import path from 'path';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { GhostMouse } from './GhostMouse.js';
 import { HumanScroll } from './HumanScroll.js';
 import { ScreenshotCollector } from './ScreenshotCollector.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
 // CaptureSource import removed — no longer used (capture handled by filter agent)
-import navigatorPrompt from '../prompts/navigator-agent.md';
-import specialistPrompt from '../prompts/specialist-agent.md';
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const navigatorPrompt = readFileSync(join(__dirname, '../prompts/navigator-agent.md'), 'utf8');
+// specialist-agent.md was never committed to this repo and is no longer
+// retrievable from the predecessor repo — documented gap, not a bug.
+// See REFACTOR_NOTES.md › Bugs found while smoke-testing. Stage 3 must
+// either author a replacement prompt or remove the specialist handoff.
+const specialistPrompt = navigatorPrompt;
+console.warn('[Scroller] specialist-agent.md missing — falling back to navigator prompt. Specialist handoffs will use navigator behavior. See REFACTOR_NOTES.md.');
 
 // ---------------------------------------------------------------------------
 // Types

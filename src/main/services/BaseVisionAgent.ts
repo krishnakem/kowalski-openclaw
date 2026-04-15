@@ -12,12 +12,17 @@ import { Page } from 'playwright';
 import { Jimp } from 'jimp';
 import fs from 'fs';
 import path from 'path';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { GhostMouse } from './GhostMouse.js';
 import { HumanScroll } from './HumanScroll.js';
 import { ScreenshotCollector } from './ScreenshotCollector.js';
 import { isOnline, isNetworkError, isCreditsDepletedError, OFFLINE_ERROR, CREDITS_DEPLETED_ERROR } from './NetworkMonitor.js';
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
-import capabilitiesPrompt from '../prompts/capabilities.md';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const capabilitiesPrompt = readFileSync(join(__dirname, '../prompts/capabilities.md'), 'utf8');
 
 // ---------------------------------------------------------------------------
 // Types

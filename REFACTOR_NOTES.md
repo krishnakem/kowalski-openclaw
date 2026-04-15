@@ -39,6 +39,61 @@ plugin scaffolding lands.
   Any bugs the smoke test surfaces on first real run should be appended to a
   `### Bugs found while smoke-testing` subsection here as the fix lands.
 
+### Bugs found while smoke-testing
+
+- **`.md` imports failed under tsx/Node ESM.** First run of
+  `npm run test:run` crashed at module-load with
+  `TypeError [ERR_UNKNOWN_FILE_EXTENSION]: Unknown file extension ".md"`
+  for `src/main/prompts/capabilities.md`. Five services were pulling
+  prompt text via `import foo from '../prompts/foo.md'` — a pattern that
+  worked under the old Vite build (raw-text loader) but that Node's ESM
+  loader and tsx both reject. Fix: replace each import with a runtime
+  `readFileSync` read resolved relative to the source file's location
+  via `fileURLToPath(import.meta.url)` + `dirname` + `join`. Works
+  regardless of CWD and survives the Google Drive path with spaces. No
+  tsx plugin, no build step, no new deps. Edited:
+  `BaseVisionAgent.ts`, `FeedAgent.ts`, `StoriesAgent.ts`, `Scroller.ts`
+  (the `navigator-agent.md` read). The `declare module '*.md'` shim at
+  `src/main/prompts/prompts.d.ts` is now obsolete and was deleted.
+
+- **`specialist-agent.md` is missing.** `Scroller.ts` imports
+  `specialistPrompt` from `../prompts/specialist-agent.md`, but the file
+  is not in `src/main/prompts/`. `git log --all --full-history --
+  '*specialist*'` returns zero hits; `git log --all -S
+  'specialist-agent'` only finds the initial commit `e98878a`, which
+  added the broken import without the file. It was also confirmed gone
+  from the predecessor repo, so the prompt content is not retrievable.
+  The import is not dead — [Scroller.ts:914](src/main/services/Scroller.ts#L914)
+  reads `specialistPrompt` whenever `activeModel === 'specialist'`, and
+  `activeModel` is flipped to `'specialist'` at
+  [Scroller.ts:353](src/main/services/Scroller.ts#L353) (capture handoff)
+  and again at [Scroller.ts:417](src/main/services/Scroller.ts#L417) /
+  via the rescue path. **Temporary workaround for Stage 2 smoke-testing:**
+  `specialistPrompt` is aliased to `navigatorPrompt` at module load with
+  a one-line `console.warn`; no branching logic in `getSystemPrompt` or
+  around `activeModel === 'specialist'` was changed. **TODO (Stage 3
+  or sooner):** either author a replacement specialist prompt or remove
+  the specialist handoff entirely from Scroller. This is flagged, not
+  resolved.
+
+- **Offline watchdog aborts on LLM auth errors (observed, not yet
+  diagnosed).** With the `.md` fix in place, `npm run test:run` against
+  a real profile but a placeholder `ANTHROPIC_API_KEY` got into the
+  stories loop, captured 703 frames via screencast, and then aborted
+  mid-run with:
+  ```
+  ⚠️ LLM API error (401): {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}...}
+  🌐 Offline watchdog: connectivity lost
+  🌐 Offline detected — aborting run
+  [analysis-error] { message: 'Network connection lost', kind: 'offline', canRetry: true }
+  ```
+  A 401 `authentication_error` is being surfaced to the user as
+  `Network connection lost`. Worth investigating whether
+  `NetworkMonitor.isNetworkError` / `isOnline` is misclassifying auth
+  failures, or whether the watchdog's independent connectivity probe
+  happened to fail in the same window. Not fixed in this commit —
+  scope was `.md` loading only.
+
 ---
 
 ## Stage 2 — Done

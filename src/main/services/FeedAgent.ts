@@ -10,12 +10,17 @@
  */
 
 import { Page } from 'playwright';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { GhostMouse } from './GhostMouse.js';
 import { HumanScroll } from './HumanScroll.js';
 import { ScreenshotCollector } from './ScreenshotCollector.js';
 import { BaseVisionAgent, type BaseAgentConfig, type VisionAction } from './BaseVisionAgent.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
-import feedInstructions from '../prompts/feed-instructions.md';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const feedInstructions = readFileSync(join(__dirname, '../prompts/feed-instructions.md'), 'utf8');
 
 export class FeedAgent extends BaseVisionAgent {
     private visitedPostIds: Set<string> = new Set();
