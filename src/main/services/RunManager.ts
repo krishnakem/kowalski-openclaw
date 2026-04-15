@@ -65,6 +65,11 @@ export class RunManager {
     // the start of each run.
     private abortReason: 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop' | null = null;
 
+    // Stop-marker file poller. Callers (notably the stop_run tool) drop an
+    // empty file at `${scratchDir}/STOP_REQUESTED` and we pick it up at the
+    // next poll, fire a cooperative stop, and finalize with a partial digest.
+    private stopMarkerPoller: NodeJS.Timeout | null = null;
+
     private constructor() {}
 
     public static getInstance(): RunManager {
@@ -170,6 +175,21 @@ export class RunManager {
             console.log('🌐 Offline watchdog: connectivity lost');
             this.notifyOffline();
         });
+
+        // Stop-marker poller: the stop_run tool (or `touch` from a separate
+        // terminal) creates `${scratchDir}/STOP_REQUESTED`. Checking every
+        // 3 seconds keeps the "~30 seconds" user-facing promise slack even
+        // if the agent is mid-LLM-call. Remove any stale marker from a
+        // previous run before starting.
+        const stopMarker = path.join(session.scratchDir, 'STOP_REQUESTED');
+        try { fs.rmSync(stopMarker, { force: true }); } catch { /* best-effort */ }
+        this.stopMarkerPoller = setInterval(() => {
+            if (fs.existsSync(stopMarker)) {
+                console.log('🛑 Stop marker detected — requesting graceful stop');
+                if (!this.abortReason) this.abortReason = 'user-stop';
+                this.stopRun();
+            }
+        }, 3000);
 
         const MAX_DURATION_MS = session.runConfig.maxDurationMs ?? 90 * 60 * 1000;
         const browserManager = BrowserManager.getInstance();
@@ -359,16 +379,20 @@ export class RunManager {
                 });
             }
 
-            // 13. Save analysis JSON. When a phase hit its hard cap we still
-            // generate the digest from the partial captures (success path),
-            // but tag the record so downstream consumers know it was cut
-            // short. The run is not considered aborted — the digest is real.
+            // 13. Save analysis JSON. When a phase hit its hard cap (or the
+            // user requested a stop) we still generate the digest from the
+            // partial captures, but tag the record so downstream consumers
+            // know it was cut short. The run is not considered a failure —
+            // the digest is real.
             const timedOutPhases = browseSession.timedOutPhases ?? [];
-            const abortReason = timedOutPhases.includes('stories')
-                ? 'timeout-stories'
-                : timedOutPhases.includes('feed')
-                    ? 'timeout-feed'
-                    : undefined;
+            const abortReason: 'timeout-stories' | 'timeout-feed' | 'user-stop' | undefined =
+                this.abortReason === 'user-stop'
+                    ? 'user-stop'
+                    : timedOutPhases.includes('stories')
+                        ? 'timeout-stories'
+                        : timedOutPhases.includes('feed')
+                            ? 'timeout-feed'
+                            : undefined;
             const analysisWithImages = {
                 ...analysis,
                 images: imageMetadata,
@@ -555,6 +579,17 @@ export class RunManager {
         if (this.stopOfflineWatchdog) {
             this.stopOfflineWatchdog();
             this.stopOfflineWatchdog = null;
+        }
+        if (this.stopMarkerPoller) {
+            clearInterval(this.stopMarkerPoller);
+            this.stopMarkerPoller = null;
+        }
+        if (this.session) {
+            try {
+                fs.rmSync(path.join(this.session.scratchDir, 'STOP_REQUESTED'), { force: true });
+            } catch {
+                /* best-effort cleanup */
+            }
         }
         this.emit('run-complete', {});
     }

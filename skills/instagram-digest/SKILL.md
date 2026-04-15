@@ -10,8 +10,8 @@ Instagram home (stories + feed) and return a markdown digest. It is a
 blocking, multi-tool workflow that typically takes 10–30 minutes and costs
 $1–3 in Anthropic API spend (worst case: ~45 min, ~$3).
 
-The plugin exposes six tools: `start_session`, `login`, `run_digest`,
-`get_session_status`, `reset_memory`, `end_session`.
+The plugin exposes seven tools: `start_session`, `login`, `run_digest`,
+`get_session_status`, `reset_memory`, `stop_run`, `end_session`.
 
 ---
 
@@ -130,17 +130,32 @@ Returns the last phase plus the most recent ~20 pipeline events. Useful
 per session and the status call queues until the run completes, so don't
 expect live polling.
 
-### "Stop the run" / "Cancel the digest"
+### "Stop the run" / "Cancel the digest" / "I've seen enough"
 
-Known limitation: `end_session` does NOT currently interrupt a running
-`run_digest`. OpenClaw serializes tool calls per session, so an
-`end_session` call queues behind the active `run_digest` and won't take
-effect until the run has already finished. The only way to hard-stop
-an in-flight run today is for the user to **Ctrl-C the OpenClaw
-gateway process**. Any captures that had already been extracted will
-persist on disk under `~/.kowalski/scratch/kowalski-runs/`, and the
-partial-record writer will leave an `analysis_records/<id>.json` with
-`aborted: true` and an `abortReason` tag next time the plugin reloads.
+Call `stop_run` with the session_id. The run will finalize within ~30
+seconds and produce a partial digest with whatever was captured so far.
+The digest will have `aborted: true` and `abortReason: user-stop` in its
+metadata.
+
+```json
+{ "name": "stop_run", "arguments": { "session_id": "…" } }
+```
+
+**Power-user escape hatch.** Some OpenClaw versions strictly serialize
+all tool calls per-plugin, in which case `stop_run` queues behind
+`run_digest` and won't fire until the run ends. The same stop-marker can
+be created manually from a separate terminal:
+
+```bash
+touch ~/.kowalski/scratch/STOP_REQUESTED
+```
+
+The next phase checkpoint (within ~30 s) picks it up. Result is
+identical: graceful stop → finalize → partial digest.
+
+Note: `end_session` does NOT interrupt a running `run_digest` — it only
+takes effect after the run completes. Use `stop_run` (or the manual
+marker) for mid-run aborts.
 
 ---
 
@@ -175,6 +190,7 @@ abort upfront if the cost or time isn't acceptable.
 | `run_digest` error contains `"OFFLINE"` | Offline watchdog tripped (3 consecutive probe failures). Likely a transient network blip. | Suggest retrying. The partial record is still on disk under `analysis_records/<id>.json` with `aborted: true, abortReason: offline`. |
 | `run_digest` error mentions `"timed out"` / the header mentions `"Stories phase timed out after 15 minutes"` or `"Feed phase timed out after 30 minutes"` | A phase hit its hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
 | `run_digest` returns "another run already in progress" | The previous run is still holding the RunManager singleton. | Call `get_session_status` to see what's happening; if stale, call `end_session` on the old session and retry. |
+| `stop_run` returns successfully but the digest takes longer than 30 s to arrive | Normal — the stop marker is polled every ~3 s, and the agent needs to finish its current step. | Let it finalize. |
 
 ---
 

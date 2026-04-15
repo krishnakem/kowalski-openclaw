@@ -440,6 +440,61 @@ export function register(api: PluginApi): () => void {
     };
 
     // -----------------------------------------------------------------------
+    // Tool: stop_run
+    //
+    // Request a graceful stop of an in-flight run_digest by writing an empty
+    // marker file at `${scratchDir}/STOP_REQUESTED`. RunManager polls for
+    // this marker every ~3s and, when it appears, cooperatively stops the
+    // active agent and falls through to finalize. The resulting record is
+    // tagged with abortReason: 'user-stop'.
+    //
+    // The tool itself is a cheap filesystem write, so it can be invoked
+    // while run_digest is still blocking — some OpenClaw versions dispatch
+    // the second call concurrently. If the loader strictly serializes tool
+    // calls per-plugin, `touch ~/.kowalski/scratch/STOP_REQUESTED` from a
+    // separate terminal achieves the same effect.
+    //
+    // Input:  { session_id: string }
+    // Output: text block "Stop requested..."
+    // -----------------------------------------------------------------------
+    const stopRun: PluginTool = {
+        name: 'stop_run',
+        description:
+            'Request a graceful stop of an in-flight run_digest. Writes a stop marker that RunManager picks up at the next phase checkpoint (~30s). The run finalizes and produces a partial digest tagged aborted: true, abortReason: user-stop. Use this when the user says "stop the run" / "cancel the digest" / "I\'ve seen enough".',
+        parameters: {
+            type: 'object',
+            properties: {
+                session_id: {
+                    type: 'string',
+                    description: 'The id returned by start_session.',
+                },
+            },
+            required: ['session_id'],
+            additionalProperties: false,
+        },
+        execute: async (_callId, params) => {
+            const sessionId = params.session_id;
+            if (typeof sessionId !== 'string' || !sessionId) {
+                return textResult('stop_run: session_id is required.', true);
+            }
+            const entry = sessions.get(sessionId);
+            if (!entry) {
+                return textResult(`stop_run: session_id ${sessionId} not found.`, true);
+            }
+            const markerPath = path.join(entry.session.scratchDir, 'STOP_REQUESTED');
+            try {
+                fs.writeFileSync(markerPath, '');
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                return textResult(`stop_run: failed to write stop marker at ${markerPath}: ${msg}`, true);
+            }
+            return textResult(
+                'Stop requested. The run will finalize at the next phase checkpoint (within ~30 seconds) and produce a partial digest.'
+            );
+        },
+    };
+
+    // -----------------------------------------------------------------------
     // Tool: end_session
     //
     // Aborts the session's controller, closes any open Playwright context
@@ -496,13 +551,14 @@ export function register(api: PluginApi): () => void {
     api.registerTool(runDigest);
     api.registerTool(getSessionStatus);
     api.registerTool(resetMemory);
+    api.registerTool(stopRun);
     api.registerTool(endSession);
 
     log.info('Kowalski plugin registered', {
         browserProfileDir,
         scratchDir,
         outputDir,
-        tools: 6,
+        tools: 7,
     });
 
     return () => {

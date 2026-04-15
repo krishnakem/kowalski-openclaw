@@ -83,13 +83,14 @@ function main(): void {
     }
     console.log('✅ register(api) completed');
 
-    // (3) All six tools got registered, in order, with the right `optional` flag.
+    // (3) All seven tools got registered, in order, with the right `optional` flag.
     const expected = [
         { name: 'start_session', optional: undefined },
         { name: 'login', optional: undefined },
         { name: 'run_digest', optional: undefined },
         { name: 'get_session_status', optional: undefined },
         { name: 'reset_memory', optional: undefined },
+        { name: 'stop_run', optional: undefined },
         { name: 'end_session', optional: undefined },
     ];
     assert(
