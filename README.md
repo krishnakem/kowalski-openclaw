@@ -1,147 +1,305 @@
-# Kowalski
+# Kowalski — OpenClaw plugin
 
-> **Refactor in progress.** This repo is being reshaped into an OpenClaw plugin. The Electron shell, React UI, and IPC layer have been removed; only the core Playwright + Claude pipeline under `src/main/services/` remains. The README below still describes the original desktop app — treat it as reference for what the core does, not for how to run it today. See [REFACTOR_NOTES.md](REFACTOR_NOTES.md) for the audit of remaining Electron couplings that need to be broken before the plugin can stand up.
+Kowalski is an [OpenClaw](https://openclaw.ai) plugin that captures your Instagram stories + feed and returns a markdown digest. You ask your OpenClaw agent _"what's happening on my feed today?"_, it triggers this plugin, the plugin drives Chromium + Claude vision agents through your home page, and you get back a readable summary instead of having to scroll.
 
-An AI-powered desktop app that automatically browses your Instagram stories and feed, then composes a curated daily digest — so you stay in the loop without the endless scroll.
+The heavy lifting is all local — real Playwright-controlled Chromium against a real session cookie, vision-agent loops at every step (login, stories, feed), structured extraction per capture, and finally a text-only digest writer. No scraping, no undocumented APIs, just a browser driven by a model.
 
-Kowalski runs a real Chromium browser via Playwright, drives it with Claude vision agents that "see" the page through screenshots and act with human-like mouse and scroll, and then synthesises everything it captured into a single readable editorial.
+> **Status — refactor complete.** This repo started as a standalone Electron desktop app and was refactored through six stages into a pure OpenClaw plugin. The Electron shell / React UI / IPC layer are gone; only the Playwright + Claude pipeline remains, wired to an OpenClaw `register(api)` entrypoint. See [REFACTOR_NOTES.md](REFACTOR_NOTES.md) for the full stage-by-stage history, including architectural trade-offs and known risks.
 
-## How It Works
+---
 
-Kowalski is built around a three-agent pipeline. Each agent has a single job and they communicate through the filesystem rather than in-memory state, so a stuck or slow stage never blocks the others.
+## Table of contents
 
-1. **Navigator (Phase 1 + 2)** — A vision agent operates the browser. It runs in two phases:
-   - **Stories phase** ([StoriesAgent](src/main/services/StoriesAgent.ts)) — clicks through your unwatched stories and exits when the advance arrow disappears.
-   - **Feed phase** ([FeedAgent](src/main/services/FeedAgent.ts)) — scrolls the feed, opens posts and carousels, dismisses popups, and captures content until the time budget is spent.
-   Every meaningful frame is dumped as a JPEG into a `raw/` directory with a sidecar JSON describing what the agent thought it was looking at.
+- [What the plugin exposes](#what-the-plugin-exposes)
+- [Architecture](#architecture)
+- [Agentic login (Stage 6)](#agentic-login-stage-6)
+- [Installation into OpenClaw](#installation-into-openclaw)
+- [Configuration](#configuration)
+- [Project layout](#project-layout)
+- [Models and costs](#models-and-costs)
+- [Development](#development)
+- [Disclaimer](#disclaimer)
 
-2. **Extractor (Phase 2.5)** — [Extractor.ts](src/main/services/Extractor.ts) watches `raw/` and, for each new screenshot, calls a vision model **once** to pull out structured content (handle, caption, entities, narrative, usefulness score). The result is merged into the same sidecar JSON. Loading screens, ads, and duplicates are tagged `usefulness: "skip"` rather than deleted, so nothing is lost and you can audit what was culled.
+---
 
-3. **Digest writer (Phase 3)** — [DigestGeneration.ts](src/main/services/DigestGeneration.ts) consumes the sidecars as **text only** and composes a single markdown editorial column. Because all visual extraction happened upstream, this stage runs on a cheaper text model (Haiku by default).
+## What the plugin exposes
 
-The whole run is time-bounded (configurable, default 90 minutes max), and the agents use [GhostMouse](src/main/services/GhostMouse.ts) and [HumanScroll](src/main/services/HumanScroll.ts) plus a stealth-patched Chromium so the activity blends into normal browsing.
+The plugin registers **eight tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent which tools to call in which order for typical requests.
 
-## Gets Better The More You Run It
+| Tool | Purpose |
+| --- | --- |
+| `start_session` | Create a Kowalski session, probe whether the persistent browser profile is still logged in, return a `session_id` used by every other tool. |
+| `login` | Log into Instagram. If `IG_USERNAME` / `IG_PASSWORD` env vars are set, runs the agentic [LoginAgent](src/main/services/LoginAgent.ts) loop headlessly; otherwise opens a headful `--app` Chromium window. Can return `pending_2fa` or `pending_device_approval` payloads that the agent resolves via `submit_verification_code`. |
+| `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code and resumes the agent, or polls for device approval when `code: null`. |
+| `run_digest` | Single blocking call that runs stories + feed capture, extraction, and digest generation. Returns the digest markdown. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
+| `get_session_status` | Latest run phase + the last ~20 pipeline events. Useful between runs (OpenClaw typically serializes tool calls per session, so live polling during `run_digest` won't fire until the run returns). |
+| `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
+| `stop_run` | Write a stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
+| `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
-Kowalski keeps a lightweight memory of past sessions via [SessionMemory](src/main/services/SessionMemory.ts), stored at `{userData}/session_memory/summaries.json`. Each completed run adds a compact summary — which accounts produced the most useful captures, which phases were productive, where the agent stalled or recovered — and the most recent summaries are folded into the navigator's context on the next run.
+The canonical happy-path call chain for a digest ask: `start_session → login (if logged_in: false) → run_digest → end_session`.
 
-The practical effect:
+---
 
-- **Sharper capture decisions.** The agent learns which accounts tend to post signal vs. noise on your feed and spends more attention where it pays off.
-- **Fewer dead ends.** Patterns of getting stuck (particular popup types, layouts, carousel edge cases) surface as hints in subsequent runs, so recovery is faster.
-- **Tuned to your feed.** Because the memory is local to your machine, the agent specialises to *your* Instagram — the accounts you follow, the kinds of posts you care about, the rhythm of your usage.
+## Architecture
 
-Memory is capped at the last 20 sessions and costs nothing to maintain (it's pure file I/O, no LLM calls). You can reset it any time with **Cmd+Shift+R** or the Reset button in Settings.
+Kowalski is structured as a **four-stage pipeline of vision agents**, all sharing the same `BaseVisionAgent` abstract class (observe → label elements → ask Claude → execute action → repeat). Agents communicate through the filesystem, not in-memory state, so a slow or stuck stage never blocks another.
 
-## Tech Stack
+```
+        ┌──────────────────────────────────────────────────────────────────┐
+        │  OpenClaw agent (in chat)                                        │
+        │    ↓ calls tools                                                 │
+        │  src/plugin/index.ts  ──────────  registers 8 tools              │
+        └──────────────────────────┬───────────────────────────────────────┘
+                                   │ (session_id + runConfig)
+                                   ▼
+            ┌─────────────────────────────────────────────────┐
+            │  KowalskiSession  (src/core/KowalskiSession.ts) │
+            │    scratchDir, outputDir, browserProfileDir,    │
+            │    anthropicApiKey, runConfig, events, abort    │
+            └─────────────────────────────────────────────────┘
+                                   │
+        ┌──────────────────────────┼───────────────────────────────────────┐
+        │  Services (src/main/services/) — bound to the active session    │
+        │                                                                  │
+        │  LoginAgent      (Stage 6 — typed credentials, 2FA round-trip)  │
+        │      │                                                           │
+        │      ▼  on success, sessionid cookie persisted                   │
+        │  StoriesAgent    (Phase 1 — stories viewer, auto-pause)          │
+        │  FeedAgent       (Phase 2 — posts, carousels, popup dismissal)   │
+        │      │                                                           │
+        │      ▼  writes raw/*.jpg + sidecar JSON per meaningful frame     │
+        │  Extractor       (Phase 2.5 — one vision call per capture,       │
+        │                   merges structured extraction into sidecars)    │
+        │      │                                                           │
+        │      ▼  reads sidecars as text only                              │
+        │  DigestGeneration (Phase 3 — Haiku-by-default editorial)         │
+        │      │                                                           │
+        │      ▼                                                           │
+        │  AnalysisGenerator → analysis_records/<id>.json                  │
+        └──────────────────────────────────────────────────────────────────┘
+```
 
-- **Desktop shell** — Electron 39 with a custom main-process build pipeline ([scripts/build-electron.mjs](scripts/build-electron.mjs))
-- **Browser automation** — Playwright + `playwright-extra` + `puppeteer-extra-plugin-stealth`
-- **Frontend** — React 18, TypeScript, Vite, Tailwind CSS, shadcn/ui, Radix primitives, Framer Motion
-- **AI** — Claude API (Anthropic) — Sonnet 4.6 for navigation and vision, Haiku 4.5 for text-only digest synthesis
-- **Storage** — JSON records on disk for the digest archive, `electron-store` for settings and indexing, `safeStorage`-encrypted API key via [SecureKeyManager](src/main/services/SecureKeyManager.ts) (encryption key held in macOS Keychain)
-- **Live preview** — CDP screencast piped to a [LiveScreencast](src/components/LiveScreencast.tsx) React component so you can watch the agent work
+Pieces worth calling out:
 
-## Download
+- **[BaseVisionAgent](src/main/services/BaseVisionAgent.ts)** — abstract superclass shared by `LoginAgent`, `StoriesAgent`, `FeedAgent`. Handles screenshot capture, element labelling (Set-of-Mark overlay), Claude API calls with prompt caching, action dispatch, reference-image injection, and per-turn debug dumps.
+- **[elementLabeler](src/utils/elementLabeler.ts)** — draws numbered badges over interactive elements on the screenshot server-side (Jimp). No DOM injection, so it doesn't trip Instagram's bot checks.
+- **[BrowserManager](src/main/services/BrowserManager.ts)** — singleton, always headless, `playwright-extra` + stealth plugin, stealth init scripts applied on every context.
+- **[GhostMouse](src/main/services/GhostMouse.ts)** + **[HumanScroll](src/main/services/HumanScroll.ts)** — human-rhythm input. Direct `page.mouse` calls; CDP for scroll-position reads so state queries don't show up as `page.evaluate` injections.
+- **[RunManager](src/main/services/RunManager.ts)** — run lifecycle. Offline watchdog (3-strike), per-phase hard timeouts, cooperative stop via `STOP_REQUESTED` marker file, partial-record writes on abort.
+- **[SessionMemory](src/main/services/SessionMemory.ts)** — cross-session digest of which accounts / phases / recoveries worked. Read into the next run's navigator context.
+- **[cookie-probe](src/plugin/cookie-probe.ts)** — reads the Instagram `sessionid` cookie directly out of the Chromium profile's SQLite `Cookies` DB. No auth flow needed to check "am I logged in?".
 
-The latest release is available on GitHub:
+---
 
-**[Download Kowalski v0.1.0 →](https://github.com/krishnakem/kowalski/releases/latest)**
+## Agentic login (Stage 6)
 
-Grab the `Kowalski-0.1.0-arm64.dmg` asset from the release page.
+The defining piece of the project is that **login itself is driven by a vision agent**, not a scripted selector-based flow. `LoginAgent` extends the same `BaseVisionAgent` the capture phases use — it's just a different prompt ([login-instructions.md](src/main/prompts/login-instructions.md)) and a few login-specific actions.
 
-**Requirements:** macOS on Apple Silicon (M1 / M2 / M3 / M4). Intel Macs are not supported.
+**Scene classification.** Every turn starts by identifying the scene: `logged_out_landing`, `save_info_interstitial`, `two_factor_code`, `device_approval`, `suspicious_login_challenge`, `home_feed`, etc. Branching happens in the prompt based on what the agent sees.
 
-### Disclaimer
+**Credentials never touch the LLM.** The prompt emits `fill_username` / `fill_password` actions; the executor reads the values from `session.runConfig.igUsername` / `igPassword` (which came from env vars) and types them into the focused field character-by-character with 80–220 ms jitter. The model payload for that turn contains only the action name.
+
+**2FA round-trip.** When the agent sees a 2FA screen, it emits `emit_pending_2fa`, halts, and the `login` tool returns `{ status: 'pending_2fa', login_id }` with a `PendingLogin` keeping the Playwright page alive. The OpenClaw agent asks the user for their code in chat, the user replies, the agent calls `submit_verification_code(login_id, code)`, and the `LoginAgent` resumes against the same page with the code threaded into its user prompt.
+
+**Device-approval round-trip.** For "we sent a notification to your other device" challenges, the agent emits `emit_pending_device_approval` (quoting which device IG named). `submit_verification_code` with `code: null` polls `probeInstagramLogin` every 3s for up to 120s, waiting for the post-approval transition.
+
+**Headful fallback.** When agentic login can't resolve the flow — suspicious-login challenge, three consecutive stuck turns, or env vars not set — the plugin closes the headless context and opens the Stage 5 chromeless `--app` window for the user to complete manually. The cookie-polling auto-close loop (Stage 3.5) still applies, so the fallback window closes itself on success.
+
+**Run traces.** Every agentic login attempt writes per-turn screenshots + metadata into `${session.scratchDir}/kowalski-runs/login_<timestamp>/`. Debuggable after the fact without burning a fresh real-account attempt.
+
+See [REFACTOR_NOTES.md › Stage 6](REFACTOR_NOTES.md) for the full design trade-offs.
+
+---
+
+## Installation into OpenClaw
+
+The plugin is loaded directly from this repo as a live-linked plugin — no build step, no published npm package. The OpenClaw loader reads the `openclaw.extensions` field in this repo's `package.json` and imports TypeScript directly.
+
+```bash
+# 1. Install the OpenClaw gateway if you haven't already (user-level, no sudo).
+npm install -g openclaw
+
+# 2. One-time setup wizard. Pick Gateway mode. In the Agent section,
+#    pick Anthropic as the provider and claude-sonnet-4-6 as the model.
+openclaw configure
+
+# 3. Set the plugin's Anthropic API key BEFORE installing (the loader
+#    validates the plugin's configSchema at install time; see
+#    REFACTOR_NOTES.md for the chicken-and-egg details).
+openclaw config set \
+  plugins.entries.kowalski-openclaw.config.anthropicApiKey "sk-ant-…"
+
+# 4. (Optional) Set IG credentials for agentic login. If unset, the
+#    `login` tool falls back to opening a headful window.
+export IG_USERNAME="your.instagram.handle"
+export IG_PASSWORD="your.password"
+
+# 5. Install this repo as a live-linked plugin. --link symlinks the
+#    working tree so edits show up on the next gateway restart.
+openclaw plugins install /absolute/path/to/Kowalski-OpenClaw \
+  --link \
+  --dangerously-force-unsafe-install
+
+# 6. Run the gateway, then attach the TUI in another shell.
+openclaw gateway run
+openclaw tui
+```
+
+The `--dangerously-force-unsafe-install` flag is required because OpenClaw's static scanner flags three `process.env.*` reads near LLM calls as potential "credential harvesting" false positives. All three reads are a vision-detail feature flag (`KOWALSKI_VISION_DETAIL`), not credentials. See [REFACTOR_NOTES.md › Stage 3.5](REFACTOR_NOTES.md) for details.
+
+**Gateway reloads are NOT automatic.** After editing plugin code, `Ctrl-C` the `openclaw gateway run` process and start it again. `--link` only means source edits in this repo are picked up on the next boot — the gateway itself doesn't hot-reload.
+
+---
+
+## Configuration
+
+### Plugin config (set via `openclaw config set`)
+
+| Key | Required | Default |
+| --- | --- | --- |
+| `anthropicApiKey` | **yes** | — |
+| `browserProfileDir` | no | `~/.kowalski/browser` |
+| `scratchDir` | no | `~/.kowalski/scratch` |
+| `outputDir` | no | `~/.kowalski/output` |
+| `userName` | no | — |
+| `location` | no | — |
+
+### Environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `IG_USERNAME`, `IG_PASSWORD` | Enable the agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool falls back to headful. Credentials are never logged or passed through any LLM payload. |
+| `KOWALSKI_VISION_DETAIL` | `high` (default) or `low`. Controls Anthropic vision detail. |
+| `KOWALSKI_STORIES_MODEL` | Stories-phase navigation. Default `claude-sonnet-4-6`. |
+| `KOWALSKI_NAV_MODEL` | Feed-phase navigation. Default `claude-sonnet-4-6`. |
+| `KOWALSKI_SPECIALIST_MODEL` | Carousel / stuck recovery. Default `claude-sonnet-4-6`. |
+| `KOWALSKI_VISION_MODEL` | In-loop vision calls. Default `claude-sonnet-4-6`. |
+| `KOWALSKI_EXTRACTION_MODEL` | Per-capture structured extraction. Default `claude-sonnet-4-6`. |
+| `KOWALSKI_TAGGING_MODEL` | Per-image tagging. Default `claude-sonnet-4-6`. |
+| `KOWALSKI_DIGEST_MODEL` | Text-only digest synthesis. Default `claude-haiku-4-5`. |
+| `KOWALSKI_ANALYSIS_MODEL` | Analysis / insights pass. Default `claude-sonnet-4-6`. |
+
+Model defaults live in [src/shared/modelConfig.ts](src/shared/modelConfig.ts).
+
+### Session `runConfig` (threaded through [KowalskiSession](src/core/KowalskiSession.ts))
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `phases` | `['stories', 'feed']` | Selectable via `start_session` params. `"just stories"` / `"just feed"` are supported one-word asks in [SKILL.md](skills/instagram-digest/SKILL.md). |
+| `storiesTimeoutMs` | `15 * 60 * 1000` | Hard cap on the stories phase. Phase installs a `setTimeout` on entry that cooperatively stops the agent. |
+| `feedTimeoutMs` | `30 * 60 * 1000` | Same, for feed. |
+| `maxDurationMs` | `90 * 60 * 1000` | Overall run budget. |
+| `igUsername`, `igPassword` | (from env) | Stage 6 credentials — see above. |
+
+---
+
+## Project layout
+
+```
+src/
+├── core/
+│   └── KowalskiSession.ts          # Host-supplied session handle
+│                                   # (paths, api key, runConfig, events, abort signal)
+├── plugin/                         # OpenClaw plugin surface
+│   ├── index.ts                    # register(api) — the 8 tools
+│   ├── login-flow.ts               # Headful --app login window (Stage 5 fallback)
+│   ├── cookie-probe.ts             # Read Instagram sessionid out of Chromium cookies DB
+│   └── session-registry.ts         # Per-session event buffer for get_session_status
+├── main/
+│   ├── main.ts                     # Legacy Electron entry, gutted (breadcrumb only)
+│   ├── prompts/                    # Markdown prompts shipped to the agents
+│   │   ├── capabilities.md
+│   │   ├── navigator-agent.md
+│   │   ├── stories-instructions.md
+│   │   ├── feed-instructions.md
+│   │   ├── login-instructions.md   # Stage 6 — scene list + login actions
+│   │   └── examples/               # Reference screenshots per phase
+│   └── services/
+│       ├── BaseVisionAgent.ts      # Abstract observe→label→Claude→act loop
+│       ├── LoginAgent.ts           # Stage 6 — agentic IG login
+│       ├── StoriesAgent.ts         # Phase 1 — stories viewer
+│       ├── FeedAgent.ts            # Phase 2 — feed + post modals + carousels
+│       ├── Extractor.ts            # Phase 2.5 — per-image structured extraction
+│       ├── DigestGeneration.ts     # Phase 3 — text-only editorial
+│       ├── AnalysisGenerator.ts    # Insights pass over a digest
+│       ├── ContentVision.ts        # Shared Claude vision-call helpers
+│       ├── ImageTagger.ts          # Per-image tagging utilities
+│       ├── Kowalski.ts             # Phase orchestrator (stories → feed)
+│       ├── RunManager.ts           # Singleton — lifecycle, offline, stop-marker, timeouts
+│       ├── BrowserManager.ts       # Singleton — Playwright + stealth
+│       ├── ScreenshotCollector.ts  # raw/ + sidecar writer, session_log.md
+│       ├── SessionMemory.ts        # Cross-session learning digest
+│       ├── NetworkMonitor.ts       # Offline watchdog + error classification
+│       ├── GhostMouse.ts           # Direct page.mouse mouse input
+│       ├── HumanScroll.ts          # CDP-based scroll with failure detection
+│       ├── Scroller.ts             # Lower-level scroll primitives
+│       ├── InputForwarder.ts       # Keyboard input wrapper
+│       ├── UsageService.ts         # Token + cost accounting
+│       └── ChromiumVersionHelper.ts
+├── shared/
+│   ├── modelConfig.ts              # Centralised + env-overridable model IDs
+│   └── viewportConfig.ts           # Shared viewport dimensions
+├── utils/
+│   └── elementLabeler.ts           # Set-of-Mark overlay + viewport-space bbox map
+└── types/                          # analysis, instagram, navigation, session-memory, better-sqlite3
+
+scripts/                            # npm run test:* harnesses
+├── login.ts                        # Headful login smoke (npm run login)
+├── test-digest.ts                  # Digest generation test
+├── test-extract.ts                 # Extractor test
+├── test-run.ts                     # Full pipeline test (headless)
+├── test-plugin.ts                  # Plugin surface smoke (npm run test:plugin)
+├── test-login-agent.ts             # LoginAgent smoke against a fake IG fixture (npm run test:login)
+└── fixtures/
+    └── fake-ig-login.html          # Static IG-login-alike for test:login
+
+skills/
+└── instagram-digest/
+    └── SKILL.md                    # OpenClaw skill playbook (what to call, when)
+```
+
+---
+
+## Models and costs
+
+Default model choices are centralised in [src/shared/modelConfig.ts](src/shared/modelConfig.ts):
+
+- **Sonnet 4.6** for every vision-and-reasoning call (navigation, extraction, analysis, login).
+- **Haiku 4.5** for the text-only digest synthesis (all visual work is done upstream, so the writer runs cheap).
+
+Typical cost + duration expectations, per [SKILL.md](skills/instagram-digest/SKILL.md):
+
+- **Typical full run:** 10–30 minutes, $1–3 in Anthropic spend.
+- **Hard caps:** stories phase 15 min, feed phase 30 min.
+- **Worst case:** ~45 min total, ~$3.
+
+Every model is env-overridable so you can drop Sonnet to Haiku where accuracy allows — see the env-var table above.
+
+---
+
+## Development
+
+```bash
+npm install
+npx tsc --noEmit        # Typecheck
+
+npm run login           # Headful login smoke (no gateway needed)
+npm run test:plugin     # Plugin surface — asserts 8 tools registered in order
+npm run test:login      # LoginAgent against a local fake-IG fixture
+                        # (scripted callLLM — no Anthropic calls)
+npm run test:extract    # Extractor agent against an existing raw/ dir
+npm run test:digest     # Digest generation against a set of sidecars
+npm run test:run        # Full pipeline against a real IG session
+                        # (requires logged-in profile + API key + real Anthropic cost)
+```
+
+The plugin loads TypeScript directly — the OpenClaw loader consumes `src/plugin/index.ts` with no build step and no `dist/` output. Edits to any file in this tree are picked up on the next `openclaw gateway run` boot (provided the plugin was installed with `--link`).
+
+---
+
+## Disclaimer
 
 Instagram's terms of service prohibit automated access, and Instagram actively works to prevent AI agents and bots from using the platform. Running Kowalski may result in rate limiting, challenges, temporary restrictions, or permanent suspension of your Instagram account.
 
 **Use of Kowalski is entirely at your own risk.** I am not responsible for any consequences that arise from running this software, including but not limited to account bans, data loss, API costs, or any other issues. This is an experimental personal project provided as-is, with no warranty of any kind.
-
-### Install
-
-1. Open the downloaded `.dmg` and drag **Kowalski** into your `Applications` folder.
-2. On first launch, right-click `Kowalski.app` → **Open** → **Open**. This bypasses Gatekeeper for the unsigned build — you only need to do it once.
-
-
-The app is self-contained — its own Chromium ships inside the bundle, so there's nothing else to install.
-
-## Configuration
-
-Set your Anthropic API key in the app's **Settings** page — it's `safeStorage`-encrypted via [SecureKeyManager](src/main/services/SecureKeyManager.ts) before being written to disk, with the encryption key held in macOS Keychain.
-
-Models are centralised in [src/shared/modelConfig.ts](src/shared/modelConfig.ts) and every one is overridable via environment variable:
-
-| Variable | Stage | Default |
-|---|---|---|
-| `KOWALSKI_STORIES_MODEL` | Stories navigation | `claude-sonnet-4-6` |
-| `KOWALSKI_NAV_MODEL` | Feed navigation | `claude-sonnet-4-6` |
-| `KOWALSKI_SPECIALIST_MODEL` | Carousels / stuck recovery | `claude-sonnet-4-6` |
-| `KOWALSKI_VISION_MODEL` | In-loop vision calls | `claude-sonnet-4-6` |
-| `KOWALSKI_TAGGING_MODEL` | Per-image tagging | `claude-sonnet-4-6` |
-| `KOWALSKI_EXTRACTION_MODEL` | Extractor (per-image structured extraction) | `claude-sonnet-4-6` |
-| `KOWALSKI_DIGEST_MODEL` | Text-only digest synthesis | `claude-haiku-4-5` |
-| `KOWALSKI_ANALYSIS_MODEL` | Insights / analysis generation | `claude-sonnet-4-6` |
-
-## Project Structure
-
-```
-src/
-├── main/                          # Electron main process
-│   ├── main.ts                    # Entry point, window + IPC handlers, custom protocol
-│   ├── prompts/                   # Markdown prompts shipped to the agents
-│   │   ├── navigator-agent.md
-│   │   ├── stories-instructions.md
-│   │   ├── feed-instructions.md
-│   │   ├── capabilities.md
-│   │   └── examples/              # Few-shot screenshots + action traces
-│   └── services/
-│       ├── Kowalski.ts            # Phase orchestrator (stories → feed)
-│       ├── RunManager.ts          # Run lifecycle: start, stop, offline handling
-│       ├── BrowserManager.ts      # Playwright lifecycle + CDP screencast
-│       ├── BaseVisionAgent.ts     # Abstract screenshot → Claude → act loop
-│       ├── StoriesAgent.ts        # Phase 1 — stories navigation
-│       ├── FeedAgent.ts           # Phase 2 — feed navigation
-│       ├── Extractor.ts           # Phase 2.5 — async per-image structured extraction
-│       ├── DigestGeneration.ts    # Phase 3 — text-only editorial synthesis
-│       ├── AnalysisGenerator.ts   # Insights pass over the digest
-│       ├── ContentVision.ts       # Shared Claude vision call helpers
-│       ├── ImageTagger.ts         # Per-image tagging utilities
-│       ├── ScreenshotCollector.ts # raw/ + sidecar writer, session log
-│       ├── SessionMemory.ts       # Cross-session memory digest
-│       ├── NetworkMonitor.ts      # Offline watchdog + error classification
-│       ├── GhostMouse.ts          # Human-like mouse paths (Bezier + jitter)
-│       ├── HumanScroll.ts         # Human-like scroll dynamics
-│       ├── Scroller.ts            # Lower-level scroll primitives
-│       ├── InputForwarder.ts      # Renderer → page keystroke/paste bridge
-│       ├── SecureKeyManager.ts    # safeStorage-encrypted API key store
-│       ├── UsageService.ts        # Token + cost accounting
-│       └── ChromiumVersionHelper.ts
-├── components/
-│   ├── screens/                   # ZeroState, AgentActive, AnalysisReady, Gazette, Login, DigestFailed
-│   ├── gazette/                   # Digest rendering (DigestView, SectionCard, ContentItem)
-│   ├── LiveScreencast.tsx         # Live CDP screencast viewer
-│   ├── modals/, layouts/, ui/, icons/
-│   └── ErrorBoundary.tsx
-├── pages/                         # Top-level routes (Index, Settings, AnalysisArchive, NotFound)
-├── shared/
-│   ├── modelConfig.ts             # Centralised LLM model config
-│   └── viewportConfig.ts          # Shared viewport dimensions
-└── types/                         # TypeScript type definitions (analysis, instagram, navigation, session-memory)
-scripts/                           # Build pipeline: Chromium staging, icon generation, test runners
-```
-
-## Stopping a Run
-
-Use **Cmd/Ctrl + Shift + K** (or the Stop button in the active-run screen). Stop is cooperative: the screencast tears down immediately, the active agent sees the stop flag between LLM calls, and the browser closes cleanly without spinning on errors.
-
-## Where Things Live on Disk
-
-Everything lives under `~/Library/Application Support/Kowalski/`:
-
-- **Captured screenshots + sidecars** — `kowalski-runs/<timestamp>/raw/{stories,feed}/` — one JPEG plus a JSON sidecar per meaningful frame
-- **Generated digests** — `analysis_records/` as JSON, indexed via `electron-store` and surfaced through the **Archive** page
-- **Cross-session memory** — `session_memory/summaries.json` — compact per-run summaries that condition the next run
-- **Settings** — `electron-store` JSON
-- **API key** — `safeStorage`-encrypted in `electron-store`; the encryption key itself is held in macOS Keychain
-- **Browser profile** — dedicated Chromium user-data dir so the Instagram session persists between runs
