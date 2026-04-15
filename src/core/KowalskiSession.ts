@@ -30,6 +30,13 @@ export interface KowalskiSession {
         location?: string;
         phases?: Array<'stories' | 'feed'>;
         maxDurationMs?: number;
+        // Hard per-phase caps. Each phase installs a setTimeout at its start
+        // that cooperatively stops the agent when it fires, letting the
+        // extractor drain and the run fall through to the next phase /
+        // finalize. Defaults: 15 min stories, 30 min feed. Host-only knob
+        // for now — not surfaced as a tool parameter.
+        storiesTimeoutMs?: number;
+        feedTimeoutMs?: number;
     };
 
     browser?: {

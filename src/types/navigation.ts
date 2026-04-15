@@ -18,4 +18,8 @@ export interface NavigationLoopConfig {
     rawDir?: string;  // Directory for raw screenshot dumps (three-agent pipeline)
     phases?: ('stories' | 'feed')[];  // Which phases to run (default: both)
     onPhaseChange?: (phase: 'stories' | 'feed', info?: { maxDurationMs?: number }) => void;
+    // Per-phase hard caps. A setTimeout scoped to the phase fires agent.stop()
+    // when it elapses, so a stories timeout does not kill the feed phase.
+    storiesTimeoutMs?: number;
+    feedTimeoutMs?: number;
 }

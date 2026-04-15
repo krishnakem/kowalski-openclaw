@@ -41,6 +41,11 @@ export class Kowalski {
     private activeAgent: BaseVisionAgent | null = null;
     private stopped: boolean = false;
 
+    // Set when a phase's hard timeout fires. Surfaces to RunManager via the
+    // return value so the record / digest header can name the phase that was
+    // cut short.
+    private timedOutPhases: Set<'stories' | 'feed'> = new Set();
+
     constructor(
         context: BrowserContext,
         apiKey: string,
@@ -186,23 +191,44 @@ export class Kowalski {
             // Phase 1: Stories (Haiku — bounded, cheap)
             // ═══════════════════════════════════════════
             if (phases.includes('stories') && !this.stopped) {
-                const storiesMaxMs = Infinity; // No time limit — stories end when the ArrowRight button disappears
-                console.log(`\n📖 Phase 1: Stories (no time limit — exits when stories end, model: ${ModelConfig.stories})`);
+                // Hard cap: default 15 min. Agent's internal loop already
+                // reads maxDurationMs, so passing the same number is enough —
+                // the setTimeout is belt-and-braces in case the LLM gets
+                // wedged in a single long decision.
+                const STORIES_PHASE_MAX_MS = config?.storiesTimeoutMs ?? 15 * 60 * 1000;
+                console.log(`\n📖 Phase 1: Stories (hard cap: ${(STORIES_PHASE_MAX_MS / 60000).toFixed(1)} min, model: ${ModelConfig.stories})`);
                 this.screenshotCollector.appendLogRaw(`\n## Phase 1: Stories\n`);
-                onPhaseChange?.('stories');
+                onPhaseChange?.('stories', { maxDurationMs: STORIES_PHASE_MAX_MS });
 
                 const storiesAgent = new StoriesAgent(
                     this.page, this.ghost, this.scroll, this.screenshotCollector,
                     {
                         apiKey: this.apiKey,
-                        maxDurationMs: storiesMaxMs,
+                        maxDurationMs: STORIES_PHASE_MAX_MS,
                         debugMode: this.debugMode,
                         sessionMemoryDigest,
                         rawDir: storiesRawDir,
                     }
                 );
                 this.activeAgent = storiesAgent;
-                const storiesResult = await storiesAgent.run();
+
+                // Phase-scoped timer — fires agent.stop() when hit. Cleared on
+                // normal phase exit so it can't leak into the feed phase.
+                const storiesTimer = setTimeout(() => {
+                    if (this.activeAgent === storiesAgent) {
+                        this.timedOutPhases.add('stories');
+                        console.log(`⏱️  StoriesAgent: stopped (timeout ${(STORIES_PHASE_MAX_MS / 60000).toFixed(1)} min)`);
+                        this.screenshotCollector.appendLogRaw(`\n> StoriesAgent: stopped (timeout)\n`);
+                        storiesAgent.stop();
+                    }
+                }, STORIES_PHASE_MAX_MS);
+
+                let storiesResult;
+                try {
+                    storiesResult = await storiesAgent.run();
+                } finally {
+                    clearTimeout(storiesTimer);
+                }
 
                 totalRawScreenshots += storiesResult.rawScreenshotCount;
                 totalDecisions += storiesResult.decisionCount;
@@ -217,14 +243,16 @@ export class Kowalski {
             // Phase 2: Feed (Sonnet — remaining budget)
             // ═══════════════════════════════════════════
             if (phases.includes('feed') && !this.stopped) {
-                // Hard cap on the feed phase for testing — once it elapses the
-                // FeedAgent exits cooperatively and the run proceeds to digest.
-                const FEED_PHASE_MAX_MS = 30 * 60 * 1000;
+                // Hard cap on the feed phase — once it elapses the FeedAgent
+                // exits cooperatively and the run proceeds to digest. Belt
+                // and braces: both agent.maxDurationMs and a setTimeout fire
+                // agent.stop(), so a wedged LLM call can't run past the cap.
+                const FEED_PHASE_MAX_MS = config?.feedTimeoutMs ?? 30 * 60 * 1000;
                 const remainingMs = targetDurationMs - (Date.now() - startTime);
                 const feedMaxMs = Math.min(remainingMs, FEED_PHASE_MAX_MS);
 
                 if (feedMaxMs > 30000) { // Only run feed if >30s remaining
-                    console.log(`\n📰 Phase 2: Feed (budget: ${(feedMaxMs / 1000 / 60).toFixed(1)} min, model: ${ModelConfig.navigation})`);
+                    console.log(`\n📰 Phase 2: Feed (hard cap: ${(feedMaxMs / 60000).toFixed(1)} min, model: ${ModelConfig.navigation})`);
                     this.screenshotCollector.appendLogRaw(`\n## Phase 2: Feed\n`);
                     onPhaseChange?.('feed', { maxDurationMs: feedMaxMs });
 
@@ -239,7 +267,25 @@ export class Kowalski {
                         }
                     );
                     this.activeAgent = feedAgent;
-                    const feedResult = await feedAgent.run();
+
+                    // Phase-scoped timer. Tracks `feedMaxMs` (which may be
+                    // smaller than FEED_PHASE_MAX_MS when stories consumed
+                    // part of the overall run budget).
+                    const feedTimer = setTimeout(() => {
+                        if (this.activeAgent === feedAgent) {
+                            this.timedOutPhases.add('feed');
+                            console.log(`⏱️  FeedAgent: stopped (timeout ${(feedMaxMs / 60000).toFixed(1)} min)`);
+                            this.screenshotCollector.appendLogRaw(`\n> FeedAgent: stopped (timeout)\n`);
+                            feedAgent.stop();
+                        }
+                    }, feedMaxMs);
+
+                    let feedResult;
+                    try {
+                        feedResult = await feedAgent.run();
+                    } finally {
+                        clearTimeout(feedTimer);
+                    }
 
                     totalRawScreenshots += feedResult.rawScreenshotCount;
                     totalDecisions += feedResult.decisionCount;
@@ -309,7 +355,8 @@ export class Kowalski {
             rawScreenshotCount: totalRawScreenshots,
             captureCount: 0,
             videoCount: 0,
-            scrapedAt: new Date().toISOString()
+            scrapedAt: new Date().toISOString(),
+            timedOutPhases: Array.from(this.timedOutPhases)
         };
     }
 

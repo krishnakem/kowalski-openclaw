@@ -262,6 +262,7 @@ export interface BrowsingSession {
     captureCount: number;         // DEPRECATED: kept for compat, will be 0
     videoCount: number;           // Number of videos recorded
     scrapedAt: string;            // ISO timestamp
+    timedOutPhases: ('stories' | 'feed')[];  // Phases that hit their hard cap
 }
 
 /**

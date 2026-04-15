@@ -322,11 +322,32 @@ export function register(api: PluginApi): () => void {
                     'analysis_records',
                     `${result.record.id}.json`
                 );
+                // Build a one-line phase-timeout summary when anything was cut
+                // short. SKILL.md failure-mode list depends on this wording
+                // being scannable ("Stories phase timed out after 15 minutes").
+                let timeoutSummary = '';
+                const timedOut = result.timedOutPhases ?? [];
+                if (timedOut.length > 0) {
+                    const storyCaps = result.record.data?.images?.filter((i: any) => i.source === 'story').length ?? 0;
+                    const feedCaps = result.record.data?.images?.filter((i: any) => i.source === 'feed').length ?? 0;
+                    const parts: string[] = [];
+                    if (timedOut.includes('stories')) parts.push('Stories phase timed out after 15 minutes');
+                    if (timedOut.includes('feed')) parts.push('Feed phase timed out after 30 minutes');
+                    if (timedOut.includes('stories') && !timedOut.includes('feed')) {
+                        parts.push('feed phase ran to completion');
+                    } else if (timedOut.includes('feed') && !timedOut.includes('stories')) {
+                        parts.push('stories phase ran to completion');
+                    }
+                    timeoutSummary =
+                        `- ⚠️ ${parts.join('; ')}. ` +
+                        `Digest saved with ${storyCaps} story captures + ${feedCaps} feed captures.\n`;
+                }
                 const header =
                     `# Kowalski digest\n\n` +
                     `- record id: ${result.record.id}\n` +
                     `- saved to: ${recordPath}\n` +
                     `- captures: extracted=${result.counts.extracted}, skipped=${result.counts.skipped}, failed=${result.counts.failed}\n` +
+                    timeoutSummary +
                     `- lead story: ${result.record.leadStoryPreview || '(none)'}\n\n`;
                 const body = '```json\n' + JSON.stringify(result.record.data, null, 2) + '\n```\n';
                 return textResult(header + body);

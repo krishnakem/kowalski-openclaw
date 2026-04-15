@@ -38,6 +38,10 @@ export interface RunResult {
     lastAnalysisDate: string;
     analysisStatus: 'ready';
     counts: { extracted: number; skipped: number; failed: number };
+    // Phases that hit their hard cap mid-run. The success path still
+    // generates a digest from partial captures; the plugin surfaces these
+    // in the text header so the agent can explain what happened.
+    timedOutPhases: ('stories' | 'feed')[];
 }
 
 export class RunManager {
@@ -250,6 +254,8 @@ export class RunManager {
                 {
                     rawDir: path.join(sessionDir, 'raw'),
                     phases,
+                    storiesTimeoutMs: session.runConfig.storiesTimeoutMs,
+                    feedTimeoutMs: session.runConfig.feedTimeoutMs,
                     onPhaseChange: (phase, info) => {
                         this.emit('run-phase', { phase, ...(info ?? {}) });
                     }
@@ -353,8 +359,21 @@ export class RunManager {
                 });
             }
 
-            // 13. Save analysis JSON
-            const analysisWithImages = { ...analysis, images: imageMetadata };
+            // 13. Save analysis JSON. When a phase hit its hard cap we still
+            // generate the digest from the partial captures (success path),
+            // but tag the record so downstream consumers know it was cut
+            // short. The run is not considered aborted — the digest is real.
+            const timedOutPhases = browseSession.timedOutPhases ?? [];
+            const abortReason = timedOutPhases.includes('stories')
+                ? 'timeout-stories'
+                : timedOutPhases.includes('feed')
+                    ? 'timeout-feed'
+                    : undefined;
+            const analysisWithImages = {
+                ...analysis,
+                images: imageMetadata,
+                ...(abortReason ? { aborted: true, abortReason } : {})
+            };
             const previewSource = analysis.markdown
                 ? analysis.markdown.replace(/^#.*$/m, '').replace(/[#*_>`-]/g, '').trim().slice(0, 100)
                 : analysis.sections[0]?.content[0]?.substring(0, 100);
@@ -400,7 +419,8 @@ export class RunManager {
                     extracted: totalExtracted,
                     skipped: totalSkipped,
                     failed: totalFailed
-                }
+                },
+                timedOutPhases: browseSession.timedOutPhases ?? []
             };
 
         } catch (error: any) {
