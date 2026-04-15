@@ -150,9 +150,10 @@ export class RunManager {
         const phases = options?.phases ?? session.runConfig.phases ?? ['stories', 'feed'];
         console.log(`🚀 Run started (phases: ${phases.join(', ')})`);
 
-        // Background watchdog: probes Anthropic every 2s and trips notifyOffline
-        // after two consecutive failures (~4-6s to detect a real outage). This
-        // is the reliable path — navigator.onLine in Electron/macOS can lag.
+        // Background watchdog: probes Anthropic every 1s and trips notifyOffline
+        // after three consecutive failures (~1-3s to detect a real outage).
+        // Three-strike threshold guards against a single dropped probe while
+        // still firing well before fetch retry loops burn attempts.
         this.stopOfflineWatchdog = startOfflineWatchdog(() => {
             console.log('🌐 Offline watchdog: connectivity lost');
             this.notifyOffline();

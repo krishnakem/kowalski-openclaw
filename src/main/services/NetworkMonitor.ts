@@ -40,7 +40,11 @@ export function startOfflineWatchdog(
 ): () => void {
     let stopped = false;
     let consecutiveFailures = 0;
-    const REQUIRED_FAILURES = 2; // guard against a single dropped packet
+    // Require three consecutive failures before tripping. Stage 3.5 had a live
+    // run aborted by a single dropped probe mid-feed-phase; three checks
+    // (~200ms apart once failing) still fire in under a second but survive a
+    // lone packet loss or a WiFi stutter.
+    const REQUIRED_FAILURES = 3;
 
     const tick = async () => {
         while (!stopped) {
