@@ -8,8 +8,10 @@
  *      on both the named export and the default export.
  *   2. `register` accepts a minimal PluginApi with pluginConfig + a mock
  *      registerTool collector, and does not throw.
- *   3. All six expected tools are registered in the expected order, with
- *      the expected `optional` flag on `login`.
+ *   3. All eight expected tools are registered in the expected order
+ *      (start_session, login, submit_verification_code, run_digest,
+ *      get_session_status, reset_memory, stop_run, end_session) with
+ *      the expected `optional` flag (undefined for all of them).
  *   4. Each tool's `parameters` schema is a well-formed JSON-Schema-ish
  *      object (type: 'object', properties object present).
  *   5. Invoking `start_session.execute()` returns a result matching the
@@ -83,10 +85,11 @@ function main(): void {
     }
     console.log('✅ register(api) completed');
 
-    // (3) All seven tools got registered, in order, with the right `optional` flag.
+    // (3) All eight tools got registered, in order, with the right `optional` flag.
     const expected = [
         { name: 'start_session', optional: undefined },
         { name: 'login', optional: undefined },
+        { name: 'submit_verification_code', optional: undefined },
         { name: 'run_digest', optional: undefined },
         { name: 'get_session_status', optional: undefined },
         { name: 'reset_memory', optional: undefined },
