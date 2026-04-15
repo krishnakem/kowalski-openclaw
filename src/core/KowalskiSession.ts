@@ -37,6 +37,16 @@ export interface KowalskiSession {
         // for now — not surfaced as a tool parameter.
         storiesTimeoutMs?: number;
         feedTimeoutMs?: number;
+        // Instagram credentials for the Stage 6 agentic LoginAgent. Plumbed
+        // through session.runConfig (not a global singleton) so the plugin
+        // can gate on the env vars at register() time without threading a
+        // new arg down the service graph. Never pass these fields into any
+        // LLM payload — the LoginAgent executor reads them directly during
+        // fill_username / fill_password action dispatch. If either is
+        // absent, the plugin's `login` tool falls back to the Stage 5
+        // headful --app window.
+        igUsername?: string;
+        igPassword?: string;
     };
 
     browser?: {
