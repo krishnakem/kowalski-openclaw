@@ -56,6 +56,11 @@ export class RunManager {
     private offlineDetected = false;
     private stopOfflineWatchdog: (() => void) | null = null;
 
+    // Why the current run is (or was) aborting. Set at the point of abort so
+    // the catch-path partial-record writer can label the record. Cleared at
+    // the start of each run.
+    private abortReason: 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop' | null = null;
+
     private constructor() {}
 
     public static getInstance(): RunManager {
@@ -98,6 +103,7 @@ export class RunManager {
         if (this.offlineDetected) return;
         console.log('🌐 Offline detected — aborting run');
         this.offlineDetected = true;
+        if (!this.abortReason) this.abortReason = 'offline';
         this.emit('analysis-error', {
             message: 'Network connection lost',
             kind: 'offline',
@@ -120,6 +126,7 @@ export class RunManager {
     }
 
     public stopRun(): void {
+        if (!this.abortReason) this.abortReason = 'external';
         if (this.activeScraper) {
             console.log('🛑 Stopping active run...');
             // Cooperative stop: sets a flag the agent checks between LLM calls.
@@ -146,6 +153,7 @@ export class RunManager {
         const session = this.requireSession();
         this.status = 'running';
         this.offlineDetected = false;
+        this.abortReason = null;
         this.runAbortController = new AbortController();
         const phases = options?.phases ?? session.runConfig.phases ?? ['stories', 'feed'];
         console.log(`🚀 Run started (phases: ${phases.join(', ')})`);
@@ -168,6 +176,11 @@ export class RunManager {
             durationMs: MAX_DURATION_MS,
             startTime: Date.now()
         });
+
+        // Hoisted so the catch path can load partial captures off disk and
+        // still write an analysis record when the run aborts mid-flight.
+        let rawStoriesDir: string | null = null;
+        let rawFeedDir: string | null = null;
 
         try {
             // 1. Settings come from the session config (the host owns durable storage).
@@ -209,8 +222,8 @@ export class RunManager {
             const pad = (n: number) => n.toString().padStart(2, '0');
             const dateTime = `${runStart.getFullYear()}-${pad(runStart.getMonth() + 1)}-${pad(runStart.getDate())}_${pad(runStart.getHours())}-${pad(runStart.getMinutes())}-${pad(runStart.getSeconds())}`;
             const sessionDir = path.join(screenshotsDir, `run_${dateTime}`);
-            const rawStoriesDir = path.join(sessionDir, 'raw', 'stories');
-            const rawFeedDir = path.join(sessionDir, 'raw', 'feed');
+            rawStoriesDir = path.join(sessionDir, 'raw', 'stories');
+            rawFeedDir = path.join(sessionDir, 'raw', 'feed');
             fs.mkdirSync(rawStoriesDir, { recursive: true });
             fs.mkdirSync(rawFeedDir, { recursive: true });
 
@@ -414,10 +427,98 @@ export class RunManager {
                     this.emitError(`Run failed: ${error.message}`, 'general');
                 }
             }
+
+            // Write a partial record so aborted / timed-out / offline runs
+            // still produce an artifact under analysis_records/. The success
+            // path above handles the happy case; this path covers every other
+            // exit so a run is never completely lost.
+            if (!this.abortReason) {
+                this.abortReason = offline ? 'offline' : 'external';
+            }
+            try {
+                await this.writePartialRecord(session, {
+                    rawStoriesDir,
+                    rawFeedDir,
+                    abortReason: this.abortReason,
+                    errorMessage: error?.message ?? String(error),
+                });
+            } catch (writeErr) {
+                console.error('🚀 Failed to write partial record:', writeErr);
+            }
         }
 
         this.finishRun();
         return null;
+    }
+
+    /**
+     * Scan raw capture dirs on disk and persist a minimal analysis record so
+     * a run that aborted mid-flight still leaves an artifact. No digest is
+     * generated — the record just lists what got captured plus an
+     * `aborted: true` flag and the `abortReason` tag.
+     */
+    private async writePartialRecord(
+        session: KowalskiSession,
+        opts: {
+            rawStoriesDir: string | null;
+            rawFeedDir: string | null;
+            abortReason: 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop';
+            errorMessage: string;
+        }
+    ): Promise<void> {
+        const listCaptures = (dir: string | null, source: 'story' | 'feed') => {
+            if (!dir || !fs.existsSync(dir)) return [] as Array<{ source: string; filename: string; extracted: boolean }>;
+            return fs.readdirSync(dir)
+                .filter((f: string) => f.endsWith('.jpg'))
+                .sort()
+                .map((filename: string) => {
+                    const jsonPath = path.join(dir, filename.replace('.jpg', '.json'));
+                    let extracted = false;
+                    if (fs.existsSync(jsonPath)) {
+                        try {
+                            const sidecar = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+                            if (sidecar && typeof sidecar.extraction === 'object') extracted = true;
+                        } catch {
+                            /* sidecar unreadable → count as non-extracted */
+                        }
+                    }
+                    return { source, filename, extracted };
+                });
+        };
+
+        const stories = listCaptures(opts.rawStoriesDir, 'story');
+        const feed = listCaptures(opts.rawFeedDir, 'feed');
+        const captures = [...stories, ...feed];
+        const extractedCount = captures.filter(c => c.extracted).length;
+
+        const recordId = uuidv4();
+        const recordDir = path.join(session.outputDir, 'analysis_records');
+        await fs.promises.mkdir(recordDir, { recursive: true });
+
+        const record = {
+            id: recordId,
+            data: {
+                aborted: true,
+                abortReason: opts.abortReason,
+                errorMessage: opts.errorMessage,
+                date: new Date().toISOString(),
+                title: `Partial digest (${opts.abortReason})`,
+                captureCounts: {
+                    stories: stories.length,
+                    feed: feed.length,
+                    total: captures.length,
+                    extracted: extractedCount,
+                },
+                captures,
+            },
+            leadStoryPreview: `Run aborted (${opts.abortReason}) after ${captures.length} captures (${extractedCount} extracted).`,
+        };
+
+        const recordPath = path.join(recordDir, `${recordId}.json`);
+        const tempPath = path.join(recordDir, `${recordId}.tmp`);
+        await fs.promises.writeFile(tempPath, JSON.stringify(record, null, 2));
+        await fs.promises.rename(tempPath, recordPath);
+        console.log(`🚀 Partial record written: ${recordPath} (${opts.abortReason}, ${captures.length} captures)`);
     }
 
     private emitError(message: string, kind: 'offline' | 'credits' | 'general' = 'general') {
