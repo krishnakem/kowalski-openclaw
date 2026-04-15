@@ -17,6 +17,7 @@ import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { ChromiumVersionHelper } from '../main/services/ChromiumVersionHelper.js';
 import { KOWALSKI_VIEWPORT } from '../shared/viewportConfig.js';
+import { probeInstagramLogin } from './cookie-probe.js';
 
 chromium.use(StealthPlugin());
 
@@ -51,10 +52,39 @@ export async function runLogin(profileDir: string): Promise<void> {
     });
 
     console.log('');
-    console.log("👉 Log in in the browser window, then close it when you're done.");
+    console.log('👉 Log in in the browser window. The window will close automatically');
+    console.log('   once a valid Instagram session is detected. You can also close it');
+    console.log('   manually if you want to abort.');
     console.log(`   Cookies will land under: ${profileDir}`);
     console.log('');
 
-    await new Promise<void>((resolve) => context.on('close', () => resolve()));
-    console.log('✅ Browser closed. Login session persisted.');
+    const closed = new Promise<'closed'>((resolve) => {
+        context.on('close', () => resolve('closed'));
+    });
+
+    const detected = new Promise<'logged-in'>((resolve) => {
+        const interval = setInterval(() => {
+            try {
+                if (probeInstagramLogin(profileDir).logged_in === true) {
+                    clearInterval(interval);
+                    resolve('logged-in');
+                }
+            } catch {
+                // ignore probe errors — cookies file may be mid-write
+            }
+        }, 2000);
+        context.on('close', () => clearInterval(interval));
+    });
+
+    const outcome = await Promise.race([closed, detected]);
+    if (outcome === 'logged-in') {
+        console.log('✅ Valid Instagram session detected. Closing browser...');
+        try {
+            await context.close();
+        } catch {
+            /* ignore — already closing */
+        }
+    } else {
+        console.log('✅ Browser closed by user. Login session persisted (if any).');
+    }
 }

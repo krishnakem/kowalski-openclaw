@@ -471,7 +471,7 @@ export function register(api: PluginApi): () => void {
     };
 
     api.registerTool(startSession);
-    api.registerTool(loginTool, { optional: true });
+    api.registerTool(loginTool);
     api.registerTool(runDigest);
     api.registerTool(getSessionStatus);
     api.registerTool(resetMemory);
