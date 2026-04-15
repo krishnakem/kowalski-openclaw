@@ -9,7 +9,8 @@
     "test:digest": "npx tsx scripts/test-digest.ts",
     "test:extract": "npx tsx scripts/test-extract.ts",
     "test:run": "npx tsx scripts/test-run.ts",
-    "test:plugin": "npx tsx scripts/test-plugin.ts"
+    "test:plugin": "npx tsx scripts/test-plugin.ts",
+    "test:login": "npx tsx scripts/test-login-agent.ts"
   },
   "openclaw": {
     "extensions": ["./src/plugin/index.ts"]

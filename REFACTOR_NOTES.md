@@ -1,3 +1,197 @@
+## Stage 6 — Agentic self-login
+
+Stage 6 is the point of the project: replace the "user types into a
+real Instagram form" headful login with an AI-driven vision-agent
+login that reuses Kowalski's existing agent architecture. The user
+still supplies 2FA codes and device approvals when Instagram demands
+them; everything else is driven by the same
+observe→label→Claude→act loop that `StoriesAgent` / `FeedAgent`
+already run. The headful window remains as a fallback for any path
+the agent can't resolve.
+
+### Architecture
+
+New class [LoginAgent](src/main/services/LoginAgent.ts) extends
+`BaseVisionAgent`. It overrides:
+
+- `getInstructionPrompt()` — loads
+  [src/main/prompts/login-instructions.md](src/main/prompts/login-instructions.md),
+  which enumerates the login scenes (`logged_out_landing`,
+  `save_info_interstitial`, `two_factor_code`, `device_approval`,
+  `suspicious_login_challenge`, `home_feed`, …) and the canonical
+  action sequence for each.
+- `executeAction(decision)` — intercepts the Stage 6 action vocabulary
+  before delegating unrecognised actions to the base dispatcher.
+- `buildUserPrompt(remainingMs)` — injects a `VERIFICATION_CODE:` line
+  when the host resumes the agent via `submit_verification_code`. The
+  code is the only credential string that ever flows through the LLM
+  context, and only for one turn.
+
+The plugin-side registry in [src/plugin/index.ts](src/plugin/index.ts)
+gained a module-scope `pendingLogins: Map<string, PendingLogin>` that
+holds the Playwright `page` + `context` + `LoginAgent` across tool
+calls so the 2FA / device-approval round trips can resume against the
+exact same browser state. Entries older than 15 minutes are GC'd on
+each `login` / `submit_verification_code` invocation.
+
+### Action vocabulary
+
+Five new action names, all dispatched by `LoginAgent.executeAction`:
+
+| Action | Effect |
+| --- | --- |
+| `fill_username` | Executor types `session.runConfig.igUsername` char-by-char with 80–220ms jitter into the focused field. Prompt never sees the value. |
+| `fill_password` | Same as `fill_username` for `igPassword`. |
+| `emit_pending_2fa` | Stop the agent, set `pendingStatus = 'pending_2fa'`. Plugin registers a `PendingLogin` and returns `{ status, login_id }` to the OpenClaw agent. |
+| `emit_pending_device_approval` | Same halting semantics; plugin includes `device_description` in the response. |
+| `escalate_to_human` | Stop with `pendingStatus = 'escalate_to_human'`. Plugin closes the headless context and falls back to the Stage 5 `--app` window. |
+
+The base class's action union (`click | scroll | type | press | hover
+| wait | done | newtab | closetab | goback`) is left untouched —
+`VisionAction.action` is typed, but the runtime switch dispatches by
+string value, so widening the type in the base would just couple
+`BaseVisionAgent` to `LoginAgent`'s vocabulary for no benefit. The
+`isLoginAction` type guard in `LoginAgent.ts` absorbs the cast.
+
+### Credential flow
+
+Env vars → plugin boot → session.runConfig → LoginAgent executor:
+
+1. `process.env.IG_USERNAME` / `IG_PASSWORD` are read once in
+   `register()`. If either is missing, `agenticLoginEnabled` is false
+   and the `login` tool unconditionally falls back to the headful
+   window. A one-line warning logs which path is active.
+2. When present, both are threaded through every
+   `createKowalskiSession(...)` call on the `runConfig` object. The
+   two new optional fields are the only change to
+   [src/core/KowalskiSession.ts](src/core/KowalskiSession.ts) this
+   stage.
+3. At action-dispatch time, `LoginAgent.typeCredential` reads the
+   value from its own `config.credentials` struct (populated from
+   `session.runConfig`) and pipes it directly into
+   `page.keyboard.type(ch, { delay })`. The LLM payload for the
+   corresponding turn contains only the string `fill_username` /
+   `fill_password`.
+4. No tool-result JSON ever serialises `runConfig`. No log line ever
+   includes it. The plugin's one logger line says
+   `agenticLogin: true|false` — not the values.
+
+### 2FA / device-approval round trip
+
+Typical sequence for a `pending_2fa` flow:
+
+1. `login(session_id)` → `LoginAgent.run()` observes
+   `two_factor_code` scene → emits `emit_pending_2fa` → agent halts →
+   plugin registers `PendingLogin` under a fresh `login_id` and
+   returns `{ status: 'pending_2fa', login_id, message }`.
+2. OpenClaw agent asks the user for their code in chat.
+3. User replies.
+4. OpenClaw agent calls
+   `submit_verification_code(login_id, code)`. Plugin resumes the
+   same page by constructing a fresh `LoginAgent` with
+   `verificationCode` set; the agent's user prompt now contains the
+   `VERIFICATION_CODE: …` line so it knows to type and confirm.
+5. On success, plugin closes the context and returns text-success.
+   On rejection, re-emits `pending_2fa` for a fresh code. On
+   escalation, falls back to headful.
+
+`pending_device_approval` is similar but `code` is `null` — the
+plugin polls `probeInstagramLogin` every 3s for up to 120s, waiting
+for the user to approve on the other device.
+
+### Headful fallback
+
+Still the Stage 5 `--app` window (`runLogin` in
+[src/plugin/login-flow.ts](src/plugin/login-flow.ts)), untouched. It
+fires when:
+
+- env vars aren't set → agentic flow never attempted.
+- `LoginAgent` returned `escalate_to_human` (suspicious-login
+  challenge, stuck detection, unknown scene).
+- `submit_verification_code` encountered an unexpected status.
+- the agentic flow threw an exception mid-run.
+
+Stage 3.5's cookie-polling auto-close still applies — the fallback
+window closes itself once the user completes login, exactly as
+before.
+
+### Stealth considerations
+
+- Per-character typing with 80–220ms jitter (randomised per char).
+- Short 400–900ms pause before the executor types a credential, so
+  there's a human-looking gap between field focus and typing start.
+- `GhostMouse` still handles mouse moves before clicks.
+- Stuck detection: three consecutive turns with the same URL +
+  element-signature → auto-escalate. Prevents the agent mashing the
+  same button repeatedly (which is its own bot signal).
+- The prompt explicitly biases the model toward clicking "Log in"
+  rather than pressing Enter, toward mouse clicks rather than
+  rapid-tab navigation, and toward `wait(1|2)` between field
+  transitions.
+
+### Run logs
+
+Every agentic-login attempt writes to
+`${session.scratchDir}/kowalski-runs/login_<timestamp>/` with the
+same `raw/` layout the capture agents use, plus a `login/`
+debug folder (BaseVisionAgent's per-turn metadata) and a
+`session_log.md`. No extraction step — these traces exist purely to
+debug IG's reactions without needing to rerun against a live account.
+
+### Constraint deviations
+
+- `src/core/KowalskiSession.ts` gained two optional fields
+  (`igUsername`, `igPassword`) on `runConfig`. The prompt allowed
+  exactly this change; no other line in that file moves.
+- `src/plugin/index.ts` gained the `submit_verification_code` tool
+  (now 8 tools total), the `pendingLogins` map + GC, and a rewrite of
+  the `login` tool body. The other six tool implementations are
+  unchanged.
+
+### Known risks / open questions
+
+- **IG bot detection.** Per-character typing + `GhostMouse` moves +
+  natural pauses are best-effort. Instagram's classifier may still
+  flag the session — especially on a fresh IP or a profile that
+  hasn't been logged in before. The headful fallback is always
+  available, and we log every decision into the run dir so a flagged
+  account can be diagnosed post-hoc.
+- **Single-device verification.** If the user only has one device and
+  IG sends the approval there, the agent can't auto-resolve — the
+  user has to switch to their phone, approve, come back to chat,
+  acknowledge. Latency is bounded by how fast the user is.
+- **2FA code latency.** The 2FA round trip reads the code from chat,
+  which means the agent is idle (holding a Playwright page open)
+  while waiting. The 15-minute TTL protects against abandoned flows
+  but doesn't help users who take five minutes to find their
+  authenticator app. Consider shortening the TTL if users routinely
+  abandon mid-flow.
+- **Re-running on pending_2fa rejection.** We re-run the whole
+  `LoginAgent` rather than narrowly re-typing. If IG has meanwhile
+  moved the user to a different scene (session expired, challenge
+  escalated), the re-run picks it up. But it also burns another
+  turn's worth of LLM cost per retry.
+- **No credential store beyond env.** If a future stage wants
+  per-session credentials (multi-account support), `session.runConfig`
+  is already the right shim — but the plugin config would need a
+  matching change.
+
+### Verification
+
+- `npx tsc --noEmit` clean.
+- `npm run test:plugin` green against the now-eight-tool registration
+  list (updated in this stage).
+- `npm run test:login` (new) drives the LoginAgent against a local
+  static HTML fixture that mimics IG's login form. Asserts the
+  executor substitutes env-var-sourced credentials and types them
+  into the form without the LLM ever seeing the values. No Anthropic
+  calls are made — the test uses a scripted `callLLM` override.
+- Real-account testing is the user's responsibility (single-device
+  verification, IG's bot classifier, and the 2FA round trip all need
+  a live environment).
+
+---
+
 ## Stage 5 — Login browser polish
 
 Cosmetic-only stage: strip the login Chromium's UI chrome so the
