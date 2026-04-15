@@ -135,21 +135,37 @@ export class RunManager {
     }
 
     public stopRun(): void {
+        if (this.status !== 'running') {
+            console.log('🛑 stopRun: no active run to stop');
+            return;
+        }
         if (!this.abortReason) this.abortReason = 'external';
+        console.log(`🛑 Stopping active run (reason=${this.abortReason})...`);
+
+        // Hard stop: abort any in-flight fetch to Anthropic so the run
+        // can't hang waiting on a slow LLM response. This is the same
+        // mechanism notifyOffline() uses, and it's what makes the
+        // STOP_REQUESTED escape hatch finalize within ~30s instead of
+        // whenever the current LLM turn happens to return.
+        try {
+            this.runAbortController?.abort();
+        } catch (err) {
+            console.warn('🛑 stopRun: abort controller threw (ignored)', err);
+        }
+
+        // Cooperative stop for the scraper/extractors — the agent checks
+        // these flags between LLM calls and exits cleanly. The browser
+        // stays open so error-handling loops don't spin on "browser
+        // closed"; it closes naturally in startRun() step 8 after
+        // browseAndCapture returns.
         if (this.activeScraper) {
-            console.log('🛑 Stopping active run...');
-            // Cooperative stop: sets a flag the agent checks between LLM calls.
-            // The agent finishes its current action, sees the flag, and exits.
-            // The browser stays open so the agent's error-handling loops don't
-            // spin on "browser closed" errors — it closes naturally in startRun()
-            // step 8 after browseAndCapture returns.
             this.activeScraper.stop();
         }
         for (const e of this.activeExtractors) {
             e.stop();
         }
         if (!this.activeScraper && this.activeExtractors.length === 0) {
-            console.log('🛑 No active run to stop');
+            console.log('🛑 stopRun: no scraper/extractor attached yet — abort signal will catch the next await');
         }
     }
 

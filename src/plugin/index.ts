@@ -32,6 +32,7 @@ import {
 } from '../main/services/LoginAgent.js';
 import { runLogin } from './login-flow.js';
 import { probeInstagramLogin } from './cookie-probe.js';
+import { writeDigestPdf } from './digest-pdf.js';
 import {
     attachEventBuffer,
     createRegistry,
@@ -80,6 +81,12 @@ export interface PluginConfig {
     outputDir?: string;
     userName?: string;
     location?: string;
+    /**
+     * Where to write the text-only digest PDF emitted at the end of every
+     * `run_digest` call. Defaults to `$HOME/Downloads`. Tildes are NOT
+     * expanded here — set an absolute path if you want anything else.
+     */
+    downloadsDir?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,20 +153,31 @@ export function register(api: PluginApi): () => void {
     // -----------------------------------------------------------------------
     // Stage 6 — agentic login wiring.
     //
-    // Credentials come from the process env at register() time. If either
-    // var is missing, the `login` tool silently falls through to the Stage 5
-    // headful --app window. We deliberately do not throw here — the
-    // headful path is a valid operating mode and some users will prefer it.
-    // Credentials are NEVER logged, NEVER serialised into tool responses,
-    // and NEVER passed into any LLM payload (the LoginAgent's executor
-    // reads them during action dispatch, not via the prompt).
+    // Credential resolution order for the LoginAgent, highest-priority first:
+    //   1. `username` / `password` params on the `login` tool call itself.
+    //      The canonical path: the agent prompts the user in the TUI and
+    //      forwards whatever they type back into the tool.
+    //   2. `IG_USERNAME` / `IG_PASSWORD` process env vars set at gateway
+    //      launch. Power-user convenience for unattended scheduled runs.
+    //   3. Neither — the `login` tool returns `pending_credentials` and the
+    //      agent is expected to ask the user in the TUI, then call `login`
+    //      again with the params. Absolute last resort: the Stage 5
+    //      headful --app window if the user declines to share creds.
+    //
+    // Credentials are cached in-memory per session (on KowalskiSession.runConfig)
+    // so the agentic flow can resume across pending_2fa round trips without
+    // asking the user a second time. They are NEVER logged, NEVER serialised
+    // into tool responses, and NEVER passed into any LLM payload (the
+    // LoginAgent's executor reads them during action dispatch, not via the
+    // prompt).
     // -----------------------------------------------------------------------
-    const igUsername = process.env.IG_USERNAME;
-    const igPassword = process.env.IG_PASSWORD;
-    const agenticLoginEnabled = Boolean(igUsername && igPassword);
-    if (!agenticLoginEnabled) {
+    const envIgUsername = process.env.IG_USERNAME;
+    const envIgPassword = process.env.IG_PASSWORD;
+    if (envIgUsername && envIgPassword) {
+        log.info('[kowalski] IG_USERNAME / IG_PASSWORD found in env; agentic login will use them unless login is called with username/password params.');
+    } else {
         log.info(
-            '[kowalski] IG_USERNAME / IG_PASSWORD not set; agentic login disabled, falling back to headful'
+            '[kowalski] IG_USERNAME / IG_PASSWORD not set in env; login tool will request credentials from the agent via pending_credentials on first call.'
         );
     }
 
@@ -242,11 +260,14 @@ export function register(api: PluginApi): () => void {
                     userName: config.userName,
                     location: config.location,
                     phases,
-                    // Env-sourced Instagram credentials for the agentic
-                    // LoginAgent. Never pass these through any structured
-                    // response or log payload (see redaction note above).
-                    igUsername,
-                    igPassword,
+                    // Seed with env-sourced Instagram credentials if the
+                    // host set them. The login tool will override these on
+                    // a per-call basis if the agent passes username/password
+                    // params (which is the canonical TUI-prompt path).
+                    // Never pass these through any structured response or
+                    // log payload (see redaction note above).
+                    igUsername: envIgUsername,
+                    igPassword: envIgPassword,
                 },
             });
 
@@ -341,13 +362,25 @@ export function register(api: PluginApi): () => void {
     const loginTool: PluginTool = {
         name: 'login',
         description:
-            'Log into Instagram. If IG_USERNAME / IG_PASSWORD env vars are set on the host, runs a headless agentic login loop — and can return pending_2fa or pending_device_approval payloads which you must resolve via submit_verification_code. If env vars are unset or the agent escalates, opens a headful Chromium window for the user to finish manually (Stage 5 fallback). Only call when start_session reports logged_in: false.',
+            'Log into Instagram. Canonical flow: ask the user for their IG username and password in the TUI on first login, then call this tool with `username` and `password` params — a headless agentic login loop fills the form, handles "Remember me", and can return `pending_2fa` or `pending_device_approval` payloads which you resolve via `submit_verification_code`. If called without params and no IG_USERNAME/IG_PASSWORD env vars are set on the host, returns `pending_credentials` so you can prompt the user and call back. If agentic login escalates (suspicious-login checkpoint, stuck detection), falls back to a headful Chromium window. Only call when `start_session` reports `logged_in: false`.',
         parameters: {
             type: 'object',
             properties: {
                 session_id: {
                     type: 'string',
                     description: 'The id returned by start_session. Required so pending_2fa / pending_device_approval payloads can be routed back.',
+                },
+                username: {
+                    type: 'string',
+                    description: 'Instagram username or email. Ask the user in the TUI on first login — do NOT hardcode or guess. Cached on the session for the rest of the login round trip so you only need to ask once. Optional; if omitted, falls back to IG_USERNAME env var, and if that is also unset the tool returns pending_credentials.',
+                },
+                password: {
+                    type: 'string',
+                    description: 'Instagram password. Ask the user in the TUI on first login — do NOT hardcode or guess. Cached on the session for the rest of the login round trip. Optional; if omitted, falls back to IG_PASSWORD env var, and if that is also unset the tool returns pending_credentials.',
+                },
+                force_headful: {
+                    type: 'boolean',
+                    description: 'Skip the agentic flow entirely and open a headful Chromium window for the user to log in manually. Set this when the user declines to share credentials in chat, or when the agentic flow has failed enough times that a manual login is preferable. Default false.',
                 },
             },
             required: ['session_id'],
@@ -368,9 +401,42 @@ export function register(api: PluginApi): () => void {
                 );
             }
 
-            if (!agenticLoginEnabled) {
+            // Explicit user-declines path.
+            if (params.force_headful === true) {
+                log.info('[kowalski] login called with force_headful:true; opening headful window');
                 return runHeadfulFallback();
             }
+
+            // ----- Resolve credentials: params > session cache > env -----
+            const paramUsername =
+                typeof params.username === 'string' && params.username.trim()
+                    ? params.username.trim()
+                    : undefined;
+            const paramPassword =
+                typeof params.password === 'string' && params.password
+                    ? params.password
+                    : undefined;
+
+            if (paramUsername) entry.session.runConfig.igUsername = paramUsername;
+            if (paramPassword) entry.session.runConfig.igPassword = paramPassword;
+
+            const effectiveUsername =
+                entry.session.runConfig.igUsername ?? envIgUsername;
+            const effectivePassword =
+                entry.session.runConfig.igPassword ?? envIgPassword;
+
+            if (!effectiveUsername || !effectivePassword) {
+                return jsonTextResult({
+                    status: 'pending_credentials',
+                    session_id: sessionId,
+                    message:
+                        'No Instagram credentials available. Ask the user in the TUI for their Instagram username (or email/phone) and password, then call `login` again with `username` and `password` params. Never guess or reuse old creds. If the user declines to share their password in chat, call `login` again with `force_headful: true` and Instagram will open in a normal-looking browser window for them to type into directly.',
+                });
+            }
+            // Persist resolved creds on the session so submit_verification_code
+            // can pick them up too.
+            entry.session.runConfig.igUsername = effectiveUsername;
+            entry.session.runConfig.igPassword = effectivePassword;
 
             // Re-bind the singleton — another session may have been the
             // last to bind. Same pattern run_digest uses.
@@ -413,6 +479,34 @@ export function register(api: PluginApi): () => void {
 
                 if (status === 'pending_2fa' || status === 'pending_device_approval') {
                     const loginId = uuidv4();
+                    // CRITICAL: detach the context from BrowserManager's
+                    // singleton slot. Without this, any subsequent call to
+                    // BrowserManager.launch() (e.g. a stray re-login from
+                    // the agent, or a premature run_digest) would close
+                    // this context mid-2FA via the zombie-prevention path
+                    // in launch(). pendingLogins now owns its lifetime;
+                    // cleanup() in submit_verification_code closes it.
+                    try {
+                        BrowserManager.getInstance().detachContext();
+                    } catch (detachErr) {
+                        log.warn('[kowalski] detachContext failed (continuing)', {
+                            err: detachErr instanceof Error ? detachErr.message : String(detachErr),
+                        });
+                    }
+                    // If the stored context gets closed out-of-band (e.g.
+                    // Chromium crash, user killed the process), drop the
+                    // pending entry so the agent gets a clean
+                    // "login_id not found" instead of a confusing stale
+                    // handle on the next submit_verification_code.
+                    try {
+                        context.on('close', () => {
+                            if (pendingLogins.has(loginId)) {
+                                log.warn('[kowalski] pending login context closed unexpectedly; dropping entry', { loginId });
+                                pendingLogins.delete(loginId);
+                            }
+                        });
+                    } catch { /* ignore — context.on should always work */ }
+
                     pendingLogins.set(loginId, {
                         loginId,
                         sessionId,
@@ -525,6 +619,32 @@ export function register(api: PluginApi): () => void {
             const rawCode = params.code;
             const code = typeof rawCode === 'string' && rawCode.trim() ? rawCode.trim() : null;
 
+            // Defensive: the stored context may have been closed out-of-band
+            // (Chromium crash, BrowserManager.launch() before we wired in
+            // detachContext, etc.). Surface a clean, actionable error
+            // instead of letting a "Target closed" exception bubble up
+            // from inside LoginAgent.run().
+            const contextClosed = (() => {
+                try {
+                    if (entry.page.isClosed()) return true;
+                    // BrowserContext has no .isClosed(); probing a page is
+                    // the most reliable liveness check without issuing a
+                    // network op.
+                    return false;
+                } catch {
+                    return true;
+                }
+            })();
+            if (contextClosed) {
+                pendingLogins.delete(loginId);
+                return jsonTextResult({
+                    status: 'context_destroyed',
+                    login_id: loginId,
+                    message:
+                        'The login browser was closed before the code was submitted (likely a stale pending entry or an out-of-band close). Re-run the `login` tool to start fresh — Instagram may not ask for 2FA again if cookies got partially persisted.',
+                });
+            }
+
             const cleanup = async () => {
                 pendingLogins.delete(loginId);
                 try { entry.collector.flushSessionLog(); } catch { /* ignore */ }
@@ -609,17 +729,25 @@ export function register(api: PluginApi): () => void {
     // -----------------------------------------------------------------------
     // Tool: run_digest
     //
-    // Single blocking call that runs stories + feed capture, extraction,
-    // and digest generation. Can take tens of minutes. See Stage 3 notes
-    // for why this is one blocking tool rather than three async ones.
+    // Kicks off the Kowalski pipeline in the background and returns
+    // IMMEDIATELY with `{status: "started"}`. The actual digest is
+    // fetched later via `get_session_status` (which returns the full
+    // result once `digest_status === "completed"`).
+    //
+    // Why non-blocking? OpenClaw serializes tool dispatch per plugin.
+    // A blocking run_digest means no other tool (including `stop_run`)
+    // can fire until the run ends on its own — turning "stop" in the
+    // TUI into a no-op until the 30-45 minute run is done. Returning
+    // immediately frees the dispatcher so `stop_run` takes effect
+    // within ~30s whenever the user wants to abort.
     //
     // Input:  { session_id: string }
-    // Output: text block containing the digest markdown-ish payload
+    // Output: text block { status: "started" | "already_running", … }
     // -----------------------------------------------------------------------
     const runDigest: PluginTool = {
         name: 'run_digest',
         description:
-            'Run the full Kowalski pipeline for a session: capture stories + feed, extract posts, and generate a digest. Blocking call — can take tens of minutes. Returns the digest content. Prefer calling start_session and verifying logged_in: true before this.',
+            'Kick off the Kowalski pipeline (stories + feed capture, extraction, digest generation) in the background. Returns IMMEDIATELY with `{status: "started"}` — does NOT block. The actual run takes 10–30 min (worst case ~45 min) and costs ~$1–3 in Anthropic spend; always warn the user before calling. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`. After `run_digest` returns, tell the user the run is in flight and they can (a) say "stop" any time — `stop_run` now dispatches instantly, (b) ask "how much time is left?" — read the most recent ⏱ line from the TUI log pane and report it, (c) ask "is it done?" or wait for the user to prompt — call `get_session_status`; when `digest_status === "completed"` the response includes the full digest payload. The plugin streams a ⏱ line to the TUI log pane every 5 minutes plus on every phase transition. Call only after verifying `start_session` reported `logged_in: true`.',
         parameters: {
             type: 'object',
             properties: {
@@ -644,60 +772,207 @@ export function register(api: PluginApi): () => void {
                 );
             }
 
+            // Guard against concurrent runs. If there's already an active
+            // digest that isn't finished, reject — the user should either
+            // wait, poll get_session_status, or call stop_run first.
+            if (entry.activeDigest && entry.activeDigest.status === 'running') {
+                return jsonTextResult({
+                    status: 'already_running',
+                    session_id: sessionId,
+                    started_at: new Date(entry.activeDigest.startedAt).toISOString(),
+                    message:
+                        'A digest is already running on this session. Poll get_session_status for progress, or call stop_run to abort.',
+                });
+            }
+
             // Re-bind the singletons to this session — another session may have
             // been the last to bind. Cheap and safe.
             BrowserManager.getInstance().bindSession(entry.session);
             RunManager.getInstance().bindSession(entry.session);
             UsageService.getInstance().configure(entry.session.scratchDir);
 
-            try {
-                const result = await RunManager.getInstance().startRun({
-                    phases: entry.session.runConfig.phases,
-                });
-                if (!result) {
-                    return textResult(
-                        'run_digest: RunManager returned null (another run already in progress, or the run aborted before producing a digest). Check get_session_status for details.',
-                        true
-                    );
-                }
-                const recordPath = path.join(
-                    entry.session.outputDir,
-                    'analysis_records',
-                    `${result.record.id}.json`
-                );
-                // Build a one-line phase-timeout summary when anything was cut
-                // short. SKILL.md failure-mode list depends on this wording
-                // being scannable ("Stories phase timed out after 15 minutes").
-                let timeoutSummary = '';
-                const timedOut = result.timedOutPhases ?? [];
-                if (timedOut.length > 0) {
-                    const storyCaps = result.record.data?.images?.filter((i: any) => i.source === 'story').length ?? 0;
-                    const feedCaps = result.record.data?.images?.filter((i: any) => i.source === 'feed').length ?? 0;
-                    const parts: string[] = [];
-                    if (timedOut.includes('stories')) parts.push('Stories phase timed out after 15 minutes');
-                    if (timedOut.includes('feed')) parts.push('Feed phase timed out after 30 minutes');
-                    if (timedOut.includes('stories') && !timedOut.includes('feed')) {
-                        parts.push('feed phase ran to completion');
-                    } else if (timedOut.includes('feed') && !timedOut.includes('stories')) {
-                        parts.push('stories phase ran to completion');
+            // ---- Live progress ticks to the TUI via api.logger ------------
+            // See tool description above — the plugin emits a compact ⏱
+            // line every 5 min + on phase transitions so the user sees
+            // progress in the TUI log pane while run_digest is off doing
+            // its thing in the background.
+            const STORIES_CAP_MS = entry.session.runConfig.storiesTimeoutMs ?? 15 * 60_000;
+            const FEED_CAP_MS = entry.session.runConfig.feedTimeoutMs ?? 30 * 60_000;
+            const runStartedAt = Date.now();
+            let currentPhase: 'stories' | 'feed' | 'idle' = 'idle';
+            let phaseStartedAt = runStartedAt;
+
+            const fmt = (ms: number): string => {
+                if (ms < 0) ms = 0;
+                const s = Math.floor(ms / 1000);
+                const m = Math.floor(s / 60);
+                const secs = s - m * 60;
+                return `${m}m${secs.toString().padStart(2, '0')}s`;
+            };
+
+            log.info(
+                `run_digest started (non-blocking) — phases=${JSON.stringify(entry.session.runConfig.phases)} storiesCap=${fmt(STORIES_CAP_MS)} feedCap=${fmt(FEED_CAP_MS)} · ticks every 5 min + on phase transitions. Say "stop" any time to abort.`
+            );
+
+            const onPhase = (payload: { phase?: 'stories' | 'feed' }): void => {
+                if (payload?.phase === 'stories' || payload?.phase === 'feed') {
+                    const previous = currentPhase;
+                    currentPhase = payload.phase;
+                    phaseStartedAt = Date.now();
+                    const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
+                    if (previous === 'idle') {
+                        log.info(`⏱ phase=${currentPhase} STARTED — cap=${fmt(cap)}`);
+                    } else {
+                        log.info(
+                            `⏱ phase ${previous} DONE → ${currentPhase} STARTED — ${currentPhase} cap=${fmt(cap)}  totalElapsed=${fmt(Date.now() - runStartedAt)}`
+                        );
                     }
-                    timeoutSummary =
-                        `- ⚠️ ${parts.join('; ')}. ` +
-                        `Digest saved with ${storyCaps} story captures + ${feedCaps} feed captures.\n`;
                 }
-                const header =
-                    `# Kowalski digest\n\n` +
-                    `- record id: ${result.record.id}\n` +
-                    `- saved to: ${recordPath}\n` +
-                    `- captures: extracted=${result.counts.extracted}, skipped=${result.counts.skipped}, failed=${result.counts.failed}\n` +
-                    timeoutSummary +
-                    `- lead story: ${result.record.leadStoryPreview || '(none)'}\n\n`;
-                const body = '```json\n' + JSON.stringify(result.record.data, null, 2) + '\n```\n';
-                return textResult(header + body);
-            } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                return textResult(`run_digest failed: ${msg}`, true);
-            }
+            };
+            entry.session.events.on('run-phase', onPhase);
+
+            const TICK_INTERVAL_MS = 5 * 60_000;
+            const tick = setInterval(() => {
+                const now = Date.now();
+                const totalElapsed = now - runStartedAt;
+                if (currentPhase === 'idle') {
+                    log.info(
+                        `⏱ phase=idle  totalElapsed=${fmt(totalElapsed)} (waiting for first phase to start…)`
+                    );
+                    return;
+                }
+                const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
+                const phaseElapsed = now - phaseStartedAt;
+                const remaining = cap - phaseElapsed;
+                log.info(
+                    `⏱ phase=${currentPhase}  elapsed=${fmt(phaseElapsed)}/${fmt(cap)}  remaining=${fmt(remaining)}  totalElapsed=${fmt(totalElapsed)}`
+                );
+            }, TICK_INTERVAL_MS);
+
+            // Initialise ActiveDigest so get_session_status + stop_run can
+            // see a run is in flight.
+            entry.activeDigest = {
+                startedAt: runStartedAt,
+                status: 'running',
+                tickerHandle: tick,
+                detachPhaseListener: () => {
+                    try { entry.session.events.off('run-phase', onPhase); } catch { /* ignore */ }
+                },
+            };
+
+            // Fire-and-forget: run the pipeline in the background. The
+            // promise writes its outcome back into entry.activeDigest and
+            // tears down the ticker/listeners when done. We deliberately
+            // do NOT await it — this whole tool returns in <100ms so the
+            // gateway dispatcher is free for stop_run / status / etc.
+            (async () => {
+                try {
+                    const result = await RunManager.getInstance().startRun({
+                        phases: entry.session.runConfig.phases,
+                    });
+                    if (!result) {
+                        entry.activeDigest!.status = 'failed';
+                        entry.activeDigest!.errorMessage =
+                            'RunManager returned null (another run already in progress, or the run aborted before producing a digest).';
+                        log.warn(`❌ run_digest: RunManager returned null (no result)`);
+                        return;
+                    }
+
+                    const recordPath = path.join(
+                        entry.session.outputDir,
+                        'analysis_records',
+                        `${result.record.id}.json`
+                    );
+
+                    let timeoutSummary = '';
+                    const timedOut = result.timedOutPhases ?? [];
+                    if (timedOut.length > 0) {
+                        const storyCaps = result.record.data?.images?.filter((i: any) => i.source === 'story').length ?? 0;
+                        const feedCaps = result.record.data?.images?.filter((i: any) => i.source === 'feed').length ?? 0;
+                        const parts: string[] = [];
+                        if (timedOut.includes('stories')) parts.push('Stories phase timed out after 15 minutes');
+                        if (timedOut.includes('feed')) parts.push('Feed phase timed out after 30 minutes');
+                        if (timedOut.includes('stories') && !timedOut.includes('feed')) {
+                            parts.push('feed phase ran to completion');
+                        } else if (timedOut.includes('feed') && !timedOut.includes('stories')) {
+                            parts.push('stories phase ran to completion');
+                        }
+                        timeoutSummary =
+                            `- ⚠️ ${parts.join('; ')}. ` +
+                            `Digest saved with ${storyCaps} story captures + ${feedCaps} feed captures.\n`;
+                    }
+
+                    let pdfLine = '';
+                    try {
+                        const aborted = Boolean(
+                            (result.record.data as any)?.metadata?.aborted
+                        );
+                        const abortReason =
+                            (result.record.data as any)?.metadata?.abortReason;
+                        const pdfPath = await writeDigestPdf(result.record, {
+                            downloadsDir: config.downloadsDir,
+                            aborted,
+                            abortReason,
+                        });
+                        pdfLine = `- pdf: ${pdfPath}\n`;
+                    } catch (err) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        log.warn('[kowalski] PDF export failed (non-fatal)', { msg });
+                        pdfLine = `- pdf: (failed to write — ${msg})\n`;
+                    }
+
+                    const aborted = Boolean((result.record.data as any)?.metadata?.aborted);
+                    const abortReason = (result.record.data as any)?.metadata?.abortReason;
+                    const header =
+                        `# Kowalski digest\n\n` +
+                        `- record id: ${result.record.id}\n` +
+                        `- saved to: ${recordPath}\n` +
+                        pdfLine +
+                        `- captures: extracted=${result.counts.extracted}, skipped=${result.counts.skipped}, failed=${result.counts.failed}\n` +
+                        timeoutSummary +
+                        `- lead story: ${result.record.leadStoryPreview || '(none)'}\n\n`;
+                    const body = '```json\n' + JSON.stringify(result.record.data, null, 2) + '\n```\n';
+
+                    entry.activeDigest!.resultText = header + body;
+                    // user-stop and timeout-* are legitimate completions
+                    // that still produce a (partial) digest — tag with
+                    // 'stopped' when user-stop, 'completed' otherwise so
+                    // the agent can message differently.
+                    entry.activeDigest!.status =
+                        aborted && abortReason === 'user-stop' ? 'stopped' : 'completed';
+                    log.info(
+                        `✅ run_digest complete — totalElapsed=${fmt(Date.now() - runStartedAt)} record=${result.record.id} status=${entry.activeDigest!.status}`
+                    );
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    entry.activeDigest!.status = 'failed';
+                    entry.activeDigest!.errorMessage = msg;
+                    log.warn(
+                        `❌ run_digest failed — totalElapsed=${fmt(Date.now() - runStartedAt)} error=${msg}`
+                    );
+                } finally {
+                    if (entry.activeDigest?.tickerHandle) {
+                        clearInterval(entry.activeDigest.tickerHandle);
+                        entry.activeDigest.tickerHandle = null;
+                    }
+                    try {
+                        entry.activeDigest?.detachPhaseListener?.();
+                    } catch { /* ignore */ }
+                    if (entry.activeDigest) {
+                        entry.activeDigest.detachPhaseListener = null;
+                    }
+                }
+            })();
+
+            return jsonTextResult({
+                status: 'started',
+                session_id: sessionId,
+                started_at: new Date(runStartedAt).toISOString(),
+                stories_cap_ms: STORIES_CAP_MS,
+                feed_cap_ms: FEED_CAP_MS,
+                message:
+                    'Digest started in the background. Tell the user the run is in flight (10–30 min typical, ~45 min worst case) and they can say "stop" any time — stop_run now dispatches instantly. Progress ⏱ ticks stream to the TUI log pane every 5 min. To fetch the final digest, call get_session_status; when digest_status is "completed" or "stopped" the response includes the full result.',
+            });
         },
     };
 
@@ -739,12 +1014,36 @@ export function register(api: PluginApi): () => void {
                     true
                 );
             }
-            return jsonTextResult({
+
+            const ad = entry.activeDigest;
+            const digestStatus = ad ? ad.status : 'idle';
+            const payload: Record<string, unknown> = {
                 session_id: entry.sessionId,
                 created_at: new Date(entry.createdAt).toISOString(),
                 last_phase: entry.lastPhase,
+                digest_status: digestStatus,
                 events: entry.events,
-            });
+            };
+            if (ad) {
+                payload.digest_started_at = new Date(ad.startedAt).toISOString();
+                if (ad.status === 'running') {
+                    payload.digest_elapsed_ms = Date.now() - ad.startedAt;
+                }
+                if (ad.status === 'failed' && ad.errorMessage) {
+                    payload.digest_error = ad.errorMessage;
+                }
+                // Deliver the result exactly once: after the agent has
+                // seen it, clear resultText so subsequent status polls
+                // don't re-emit a giant payload. The agent is expected
+                // to return it to the user the first time.
+                if ((ad.status === 'completed' || ad.status === 'stopped') && ad.resultText) {
+                    payload.digest_result = ad.resultText;
+                    if (!ad.resultDelivered) {
+                        ad.resultDelivered = true;
+                    }
+                }
+            }
+            return jsonTextResult(payload);
         },
     };
 
@@ -779,6 +1078,136 @@ export function register(api: PluginApi): () => void {
                 const msg = err instanceof Error ? err.message : String(err);
                 return textResult(`reset_memory failed: ${msg}`, true);
             }
+        },
+    };
+
+    // -----------------------------------------------------------------------
+    // Tool: reset_all
+    //
+    // The nuclear option. Wipes everything Kowalski owns on disk and in
+    // memory so the user is back to a factory state:
+    //
+    //   - Browser profile (cookies, cached session, saved logins)
+    //   - Scratch dir     (session memory, STOP_REQUESTED markers, run temp)
+    //   - Output dir      (analysis_records/, per-run screenshots)
+    //   - In-memory       (active sessions, pending-login browsers, usage stats)
+    //
+    // Does NOT touch:
+    //   - The plugin's OpenClaw config (anthropicApiKey, downloadsDir,
+    //     userName, location, browserProfileDir override). Those are
+    //     OpenClaw-managed; the user clears them via `openclaw config unset`.
+    //   - The user's Downloads folder. Any digest PDFs already exported
+    //     there are safe — we only ever *write* to that folder, never
+    //     list or delete its contents.
+    //
+    // Requires `confirm: true` to guard against accidental triggering.
+    // Empty/missing confirm returns a description of what *would* be
+    // deleted without touching anything.
+    // -----------------------------------------------------------------------
+    const resetAll: PluginTool = {
+        name: 'reset_all',
+        description:
+            'Full factory reset: closes all active sessions + pending-login browsers, deletes the browser profile (login cookies included), scratch dir, and all analysis records. Requires `confirm: true` — call without it first to preview what will be wiped. Does NOT delete digest PDFs already written to Downloads, and does NOT clear plugin config (API keys, etc).',
+        parameters: {
+            type: 'object',
+            properties: {
+                confirm: {
+                    type: 'boolean',
+                    description:
+                        'Must be true to actually wipe data. Omit or set false to get a dry-run preview listing exactly which paths would be deleted.',
+                },
+            },
+            additionalProperties: false,
+        },
+        execute: async (_callId, params) => {
+            const targetPaths = [
+                { label: 'browser profile', path: browserProfileDir },
+                { label: 'scratch dir', path: scratchDir },
+                { label: 'output dir (analysis records + run screenshots)', path: outputDir },
+            ];
+
+            if (params.confirm !== true) {
+                const lines = targetPaths.map(
+                    (t) => `  - ${t.label}: ${t.path}`
+                );
+                return textResult(
+                    'reset_all dry-run. To actually wipe, call again with { confirm: true }.\n\n' +
+                        'Will delete:\n' +
+                        lines.join('\n') +
+                        `\n\n` +
+                        `Active sessions that will be aborted: ${sessions.size}\n` +
+                        `Pending-login browsers that will be closed: ${pendingLogins.size}\n\n` +
+                        'Will NOT touch: OpenClaw plugin config (API keys, downloadsDir, etc) or digest PDFs already in Downloads.'
+                );
+            }
+
+            const errors: string[] = [];
+
+            // 1. Abort any in-memory sessions. Their run_digest calls are
+            //    likely blocking the gateway — aborting the controller
+            //    unblocks LLM waits; the RunManager stop-marker handles
+            //    in-flight phases. We also write the marker explicitly
+            //    so any already-running phases start tearing down.
+            try {
+                fs.mkdirSync(scratchDir, { recursive: true });
+                fs.writeFileSync(
+                    path.join(scratchDir, 'STOP_REQUESTED'),
+                    String(Date.now())
+                );
+            } catch {
+                /* scratch dir about to be nuked anyway */
+            }
+            for (const entry of sessions.values()) {
+                try {
+                    entry.controller.abort();
+                } catch {
+                    /* ignore */
+                }
+            }
+            sessions.clear();
+
+            // 2. Close pending-login browsers.
+            for (const [id, plogin] of pendingLogins) {
+                try {
+                    await plogin.context.close();
+                } catch {
+                    /* ignore */
+                }
+                pendingLogins.delete(id);
+            }
+
+            // 3. rm -rf the three managed dirs, then recreate empty ones
+            //    so subsequent start_session calls don't ENOENT.
+            const deleted: string[] = [];
+            for (const t of targetPaths) {
+                try {
+                    if (fs.existsSync(t.path)) {
+                        fs.rmSync(t.path, { recursive: true, force: true });
+                    }
+                    fs.mkdirSync(t.path, { recursive: true });
+                    deleted.push(`${t.label}: ${t.path}`);
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    errors.push(`${t.label} (${t.path}): ${msg}`);
+                }
+            }
+
+            // 4. Rebind singletons — BrowserManager holds a closed
+            //    persistent context reference that's now on a deleted
+            //    path. Dropping session bindings is enough; the next
+            //    start_session rebinds cleanly.
+
+            const summary =
+                'reset_all complete.\n\n' +
+                'Deleted:\n' +
+                deleted.map((d) => `  - ${d}`).join('\n') +
+                (errors.length
+                    ? '\n\nErrors:\n' + errors.map((e) => `  - ${e}`).join('\n')
+                    : '') +
+                '\n\nNext step: call start_session. You will need to log in again (cookies are gone).';
+
+            log.info('reset_all', { deleted: deleted.length, errors: errors.length });
+            return textResult(summary, errors.length > 0);
         },
     };
 
@@ -824,6 +1253,18 @@ export function register(api: PluginApi): () => void {
             if (!entry) {
                 return textResult(`stop_run: session_id ${sessionId} not found.`, true);
             }
+
+            // Belt-and-suspenders: write the STOP_REQUESTED marker AND call
+            // RunManager.stopRun() directly in-process.
+            //   - Marker: resilient to out-of-band stops (e.g. user types
+            //     `touch …/STOP_REQUESTED` in a terminal, or this tool is
+            //     invoked across multiple runs). RunManager polls it on
+            //     a 3s setInterval.
+            //   - Direct call: fires instantly (no 3s poll latency) and,
+            //     thanks to the AbortController integration in stopRun,
+            //     tears down any in-flight Anthropic fetch immediately.
+            // Either mechanism alone would work; together they give the
+            // fastest, most reliable stop.
             const markerPath = path.join(entry.session.scratchDir, 'STOP_REQUESTED');
             try {
                 fs.writeFileSync(markerPath, '');
@@ -831,8 +1272,17 @@ export function register(api: PluginApi): () => void {
                 const msg = err instanceof Error ? err.message : String(err);
                 return textResult(`stop_run: failed to write stop marker at ${markerPath}: ${msg}`, true);
             }
+
+            try {
+                RunManager.getInstance().stopRun();
+            } catch (err) {
+                // Non-fatal: the marker poller is the fallback.
+                const msg = err instanceof Error ? err.message : String(err);
+                log.warn('[kowalski] stop_run: RunManager.stopRun() threw (marker still written)', { msg });
+            }
+
             return textResult(
-                'Stop requested. The run will finalize at the next phase checkpoint (within ~30 seconds) and produce a partial digest.'
+                'Stop requested. The run will finalize within ~30 seconds (usually faster, since the stop aborts any in-flight LLM call) and produce a partial digest. Call get_session_status — when digest_status is "stopped" the response includes the partial result.'
             );
         },
     };
@@ -895,6 +1345,7 @@ export function register(api: PluginApi): () => void {
     api.registerTool(runDigest);
     api.registerTool(getSessionStatus);
     api.registerTool(resetMemory);
+    api.registerTool(resetAll);
     api.registerTool(stopRun);
     api.registerTool(endSession);
 
@@ -902,8 +1353,8 @@ export function register(api: PluginApi): () => void {
         browserProfileDir,
         scratchDir,
         outputDir,
-        tools: 8,
-        agenticLogin: agenticLoginEnabled,
+        tools: 9,
+        envCredentialsPresent: Boolean(envIgUsername && envIgPassword),
     });
 
     return () => {

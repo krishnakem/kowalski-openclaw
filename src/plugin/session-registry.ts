@@ -19,6 +19,32 @@ export interface BufferedEvent {
     ts: number;
 }
 
+/**
+ * In-flight digest bookkeeping. Populated by `run_digest` when it kicks
+ * off the background promise; `get_session_status` reads it to report
+ * progress and to hand back the final result once the run completes.
+ *
+ * Non-blocking `run_digest` is what makes `stop_run` actually stop a
+ * live run — OpenClaw serializes tool dispatch per plugin, so as long
+ * as `run_digest` holds the gateway, no other tool call can fire.
+ * Returning immediately frees the dispatcher for `stop_run` / status
+ * polls / anything else the user needs mid-run.
+ */
+export interface ActiveDigest {
+    startedAt: number;
+    status: 'running' | 'completed' | 'failed' | 'stopped';
+    /** The header+JSON text block the tool used to return synchronously. */
+    resultText?: string;
+    /** Error message when status === 'failed'. */
+    errorMessage?: string;
+    /** True once the digest result has been delivered to the agent at least once. */
+    resultDelivered?: boolean;
+    /** Teardown handle for the status ticker. Set/cleared by run_digest. */
+    tickerHandle?: NodeJS.Timeout | null;
+    /** Teardown for the 'run-phase' listener. */
+    detachPhaseListener?: (() => void) | null;
+}
+
 export interface SessionEntry {
     sessionId: string;
     session: KowalskiSession;
@@ -26,6 +52,7 @@ export interface SessionEntry {
     events: BufferedEvent[];
     lastPhase: string | null;
     createdAt: number;
+    activeDigest?: ActiveDigest;
 }
 
 const EVENT_BUFFER_SIZE = 20;

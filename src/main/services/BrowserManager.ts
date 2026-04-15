@@ -457,6 +457,35 @@ export class BrowserManager {
     }
 
     /**
+     * Releases the current browser context from the singleton's ownership
+     * WITHOUT closing it. The caller takes over lifetime management.
+     *
+     * Use case: the pending-login flow (2FA / device approval) needs to
+     * keep a context alive across tool calls, but the singleton's own
+     * `launch()` closes whatever context it holds whenever anything else
+     * (e.g. `run_digest`) calls launch. Detaching moves the context out
+     * of the singleton so a subsequent `launch()` can't destroy it.
+     *
+     * The 'close' listener wired up in `launch()` is also cleared here
+     * since this.browserContext is nulled and we no longer want that
+     * listener firing state-clearing side effects on a context we no
+     * longer own.
+     *
+     * Returns the detached context, or null if nothing was attached.
+     */
+    public detachContext(): BrowserContext | null {
+        const ctx = this.browserContext;
+        if (!ctx) return null;
+        // Remove the close listener we installed in launch() — it nulls
+        // this.browserContext, which is already null now, so it's a
+        // no-op, but we keep the listener count tidy.
+        try { ctx.removeAllListeners('close'); } catch { /* ignore */ }
+        this.browserContext = null;
+        console.log('🔗 BrowserManager: Detached context; caller now owns its lifetime.');
+        return ctx;
+    }
+
+    /**
      * Validates if the current session is still authenticated with Instagram.
      * Uses the same check as login() but with shorter timeout.
      *
