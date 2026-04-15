@@ -26,7 +26,7 @@ export async function runLogin(profileDir: string): Promise<void> {
 
     const systemTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-    console.log(`🪟 Launching headful Chromium against profile: ${profileDir}`);
+    console.log(`🪟 Launching Instagram login window against profile: ${profileDir}`);
     const context = await chromium.launchPersistentContext(profileDir, {
         headless: false,
         viewport: { width: KOWALSKI_VIEWPORT.width, height: KOWALSKI_VIEWPORT.height },
@@ -37,6 +37,14 @@ export async function runLogin(profileDir: string): Promise<void> {
         colorScheme: 'light',
         extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
         args: [
+            '--app=https://www.instagram.com/',
+            `--window-size=${KOWALSKI_VIEWPORT.width},${KOWALSKI_VIEWPORT.height}`,
+            '--disable-extensions',
+            '--disable-default-apps',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-features=TranslateUI,Translate,AutofillServerCommunication,OptimizationHints',
+            '--disable-component-update',
             '--disable-blink-features=AutomationControlled',
             '--disable-infobars',
             '--no-sandbox',
@@ -46,13 +54,12 @@ export async function runLogin(profileDir: string): Promise<void> {
         acceptDownloads: true,
     });
 
+    // `--app` drives the initial navigation; just grab the page handle.
     const page = context.pages()[0] ?? (await context.newPage());
-    await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded' }).catch(() => {
-        console.warn('⚠️ Initial navigation slow, the window is still open — proceed anyway.');
-    });
+    void page;
 
     console.log('');
-    console.log('👉 Log in in the browser window. The window will close automatically');
+    console.log('👉 Log in in the Instagram login window. The window will close automatically');
     console.log('   once a valid Instagram session is detected. You can also close it');
     console.log('   manually if you want to abort.');
     console.log(`   Cookies will land under: ${profileDir}`);
