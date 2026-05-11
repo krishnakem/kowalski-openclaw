@@ -10,7 +10,8 @@
     "test:extract": "npx tsx scripts/test-extract.ts",
     "test:run": "npx tsx scripts/test-run.ts",
     "test:plugin": "npx tsx scripts/test-plugin.ts",
-    "test:login": "npx tsx scripts/test-login-agent.ts"
+    "test:login": "npx tsx scripts/test-login-agent.ts",
+    "postinstall": "playwright install chromium"
   },
   "openclaw": {
     "extensions": [

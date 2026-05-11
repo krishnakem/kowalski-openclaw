@@ -7,6 +7,54 @@ import { KOWALSKI_VIEWPORT } from '../../shared/viewportConfig.js';
 import { InputForwarder, type InputEventPayload } from './InputForwarder.js';
 import type { KowalskiSession } from '../../core/KowalskiSession.js';
 
+// Browser-binary policy: we use Playwright's default cache
+// (~/.cache/ms-playwright on Linux, ~/Library/Caches/ms-playwright on macOS).
+// Considered PLAYWRIGHT_BROWSERS_PATH=0 to keep the binary fully inside
+// node_modules — rejected because:
+//   1) ChromiumVersionHelper.tryDetectFromCache() scans the default cache to
+//      pick a matching User-Agent; setting =0 would break that fallback.
+//   2) The postinstall hook (`playwright install chromium`) is idempotent
+//      against the shared cache, so a re-`npm install` is a no-op rather
+//      than a 150 MB re-download.
+//   3) Cross-plugin disk savings on machines with other Playwright projects.
+
+// Standard Playwright Chromium system dependencies on Debian/Ubuntu.
+// Hardcoded rather than shelled out to `playwright install-deps --dry-run`
+// because we want a deterministic, dependency-free error string at launch
+// time. If Playwright's list drifts (e.g. libasound2 → libasound2t64 on
+// Ubuntu 24.04+) and this becomes stale, `sudo npx playwright install-deps
+// chromium` is the always-current fallback shown alongside it below.
+const CHROMIUM_APT_PACKAGES = [
+    'libnss3', 'libnspr4', 'libdbus-1-3', 'libatk1.0-0', 'libatk-bridge2.0-0',
+    'libcups2', 'libdrm2', 'libxkbcommon0', 'libatspi2.0-0', 'libxcomposite1',
+    'libxdamage1', 'libxfixes3', 'libxrandr2', 'libgbm1', 'libpango-1.0-0',
+    'libcairo2', 'libasound2',
+];
+
+export function rethrowIfMissingSystemLibs(err: unknown): never {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Playwright phrases this a few different ways across versions; also
+    // catch the raw loader error if Playwright's own wrapper didn't fire.
+    const looksLikeMissingLibs =
+        /missing dependencies to run browsers/i.test(msg) ||
+        /Host system is missing/i.test(msg) ||
+        /error while loading shared libraries/i.test(msg);
+
+    if (looksLikeMissingLibs && process.platform === 'linux') {
+        const aptCmd = `sudo apt install -y ${CHROMIUM_APT_PACKAGES.join(' ')}`;
+        const augmented = new Error(
+            `Chromium failed to launch because the host is missing shared libraries.\n` +
+            `Install them with:\n  ${aptCmd}\n` +
+            `(One-liner alternative that auto-detects the right package names on your distro:\n` +
+            `  sudo npx playwright install-deps chromium)\n\n` +
+            `Original Playwright error:\n${msg}`
+        );
+        (augmented as any).cause = err;
+        throw augmented;
+    }
+    throw err;
+}
+
 // GPU profiles for WebGL fingerprint randomization
 // Using common GPU configurations to avoid statistical anomalies
 const GPU_PROFILES = [
@@ -239,7 +287,10 @@ export class BrowserManager {
             console.error('🔥 Stack trace:', (error as Error).stack);
             // Ensure cleanup on failure
             this.browserContext = null;
-            throw error;
+            // If this is the well-known "missing system libraries" Linux
+            // failure, rethrow with the exact `sudo apt install …` command
+            // the user needs. Otherwise rethrow unchanged.
+            rethrowIfMissingSystemLibs(error);
         }
     }
 
