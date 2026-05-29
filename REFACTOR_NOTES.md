@@ -10,12 +10,12 @@ The Stage 6 agentic login originally required `IG_USERNAME` /
 canonical path should be the agent prompting for creds in the TUI
 on first login. Rewired:
 
-- `login` tool now accepts optional `username` / `password` / `force_headful` params.
+- `login` tool now accepts optional `username` / `password` params.
 - Resolution order: params → session-cached creds (from a prior login call) → env vars → return `pending_credentials`.
 - New `pending_credentials` tool response tells the agent to ask the
   user in the TUI, then call `login` again with the params.
-- `force_headful: true` remains as an explicit escape for users who
-  don't want to type their password into chat.
+- If users decline to type their password into chat, the headless-only
+  login flow stops with `pending_credentials`.
 - Creds are cached on `KowalskiSession.runConfig` so
   `submit_verification_code` reuses them across 2FA round trips
   without asking twice.
@@ -94,8 +94,8 @@ login that reuses Kowalski's existing agent architecture. The user
 still supplies 2FA codes and device approvals when Instagram demands
 them; everything else is driven by the same
 observe→label→Claude→act loop that `StoriesAgent` / `FeedAgent`
-already run. The headful window remains as a fallback for any path
-the agent can't resolve.
+already run. Stage 7 later removed the visible-window fallback; paths
+the agent can't resolve now return `login_failed_needs_manual`.
 
 ### Architecture
 
@@ -132,7 +132,7 @@ Five new action names, all dispatched by `LoginAgent.executeAction`:
 | `fill_password` | Same as `fill_username` for `igPassword`. |
 | `emit_pending_2fa` | Stop the agent, set `pendingStatus = 'pending_2fa'`. Plugin registers a `PendingLogin` and returns `{ status, login_id }` to the OpenClaw agent. |
 | `emit_pending_device_approval` | Same halting semantics; plugin includes `device_description` in the response. |
-| `escalate_to_human` | Stop with `pendingStatus = 'escalate_to_human'`. Plugin closes the headless context and falls back to the Stage 5 `--app` window. |
+| `escalate_to_human` | Stop with `pendingStatus = 'escalate_to_human'`. Plugin closes the headless context and returns `login_failed_needs_manual`. |
 
 The base class's action union (`click | scroll | type | press | hover
 | wait | done | newtab | closetab | goback`) is left untouched —
@@ -146,9 +146,8 @@ string value, so widening the type in the base would just couple
 Env vars → plugin boot → session.runConfig → LoginAgent executor:
 
 1. `process.env.IG_USERNAME` / `IG_PASSWORD` are read once in
-   `register()`. If either is missing, `agenticLoginEnabled` is false
-   and the `login` tool unconditionally falls back to the headful
-   window. A one-line warning logs which path is active.
+   `register()`. If either is missing, the `login` tool returns
+   `pending_credentials` so the host agent can ask in chat.
 2. When present, both are threaded through every
    `createKowalskiSession(...)` call on the `runConfig` object. The
    two new optional fields are the only change to
@@ -181,17 +180,16 @@ Typical sequence for a `pending_2fa` flow:
    `VERIFICATION_CODE: …` line so it knows to type and confirm.
 5. On success, plugin closes the context and returns text-success.
    On rejection, re-emits `pending_2fa` for a fresh code. On
-   escalation, falls back to headful.
+   escalation, returns `login_failed_needs_manual`.
 
 `pending_device_approval` is similar but `code` is `null` — the
 plugin polls `probeInstagramLogin` every 3s for up to 120s, waiting
 for the user to approve on the other device.
 
-### Headful fallback
+### Legacy visible-window fallback
 
-Still the Stage 5 `--app` window (`runLogin` in
-[src/plugin/login-flow.ts](src/plugin/login-flow.ts)), untouched. It
-fires when:
+Stage 7 removed this path. Before that, the Stage 5 visible login
+window fired when:
 
 - env vars aren't set → agentic flow never attempted.
 - `LoginAgent` returned `escalate_to_human` (suspicious-login
@@ -199,9 +197,8 @@ fires when:
 - `submit_verification_code` encountered an unexpected status.
 - the agentic flow threw an exception mid-run.
 
-Stage 3.5's cookie-polling auto-close still applies — the fallback
-window closes itself once the user completes login, exactly as
-before.
+Stage 3.5's cookie-polling auto-close applied at the time; the current
+plugin no longer opens that window.
 
 ### Stealth considerations
 
@@ -241,9 +238,8 @@ debug IG's reactions without needing to rerun against a live account.
 - **IG bot detection.** Per-character typing + `GhostMouse` moves +
   natural pauses are best-effort. Instagram's classifier may still
   flag the session — especially on a fresh IP or a profile that
-  hasn't been logged in before. The headful fallback is always
-  available, and we log every decision into the run dir so a flagged
-  account can be diagnosed post-hoc.
+  hasn't been logged in before. The plugin logs every decision into
+  the run dir so a flagged account can be diagnosed post-hoc.
 - **Single-device verification.** If the user only has one device and
   IG sends the approval there, the agent can't auto-resolve — the
   user has to switch to their phone, approve, come back to chat,
@@ -280,12 +276,11 @@ debug IG's reactions without needing to rerun against a live account.
 
 ---
 
-## Stage 5 — Login browser polish
+## Stage 5 — Legacy login browser polish
 
-Cosmetic-only stage: strip the login Chromium's UI chrome so the
-headful window reads as a focused login dialog, not a full browser.
-Touches a single file, `src/plugin/login-flow.ts`. Plugin-surface
-behavior is unchanged.
+Cosmetic-only stage from the earlier manual-login era: strip the login
+Chromium's UI chrome so the visible window reads as a focused login
+dialog, not a full browser. This path was removed in Stage 7.
 
 ### What changed
 
@@ -310,7 +305,7 @@ as a manual abort.
 
 ### Verification
 
-`npm run login` opened an `~1280×900` Instagram window with just a
+The legacy login smoke opened an `~1280×900` Instagram window with just a
 title bar and close button — no tabs, no URL bar, no menu strip. The
 existing persisted cookies were detected by the probe loop within
 ~2s and the window auto-closed normally. Post-run
@@ -609,9 +604,9 @@ commit on `main`):
   expected behavior given the SKILL playbook (Stage 4) tells the agent
   to call `login` whenever `logged_in !== true`.
 
-- **`runLogin` now polls `probeInstagramLogin` every 2 s and self-closes
-  the Chromium context when a valid `sessionid` cookie is detected**
-  ([src/plugin/login-flow.ts](src/plugin/login-flow.ts)). Previously
+- **The legacy login helper polled `probeInstagramLogin` every 2 s and
+  self-closed the Chromium context when a valid `sessionid` cookie was
+  detected.** Previously
   the tool blocked until the user manually closed the browser window,
   which was opaque when invoked through the TUI — the agent had no
   feedback loop and neither did the user. Manual close still works as
@@ -681,9 +676,8 @@ tool object describes inputs / outputs / when the agent should reach for it.
   `{ session_id, logged_in, phases, message }`. `logged_in` is `true` /
   `false` / `"unknown"`; on anything but `true` the message tells the
   agent to call `login` next.
-- `login` — **`{ optional: true }`**. Lifts
-  [runLogin](src/plugin/login-flow.ts) from the pre-plugin smoke test
-  and wraps it with a 10-minute timeout.
+- `login` — **`{ optional: true }`**. Originally lifted the pre-plugin
+  visible login smoke test and wrapped it with a 10-minute timeout.
 - `run_digest` — blocking. Re-binds the singletons to the target session
   (defends against a different session having bound last) and calls
   `RunManager.startRun({ phases })`. Returns a text block with a header
@@ -731,13 +725,12 @@ service change would be needed — only the plugin tool surface.
   read-only declaration lives at
   [src/types/better-sqlite3.d.ts](src/types/better-sqlite3.d.ts) — only
   covers `prepare / get / close`, which is all the cookie probe needs.
-- **`runLogin` moved into the plugin tree.** The implementation was
-  lifted from `scripts/login.ts` into
-  [src/plugin/login-flow.ts](src/plugin/login-flow.ts); the CLI script
-  is now a thin wrapper that re-exports and runs it. Reason:
+- **Legacy login helper moved into the plugin tree.** The implementation was
+  lifted from `scripts/login.ts` into the plugin source tree; the CLI script
+  became a thin wrapper that re-exported and ran it. Reason:
   `scripts/login.ts` is outside the tsc `rootDir`, so
   `src/plugin/index.ts` could not import it directly. Both the plugin
-  tool and `npm run login` now share exactly one codepath.
+  tool and the legacy CLI smoke shared exactly one codepath.
 - **`parameters` schema is plain JSON Schema,** not TypeBox. The SDK
   ultimately wants `TSchema` from `@sinclair/typebox`, but TypeBox is
   not a dep and adding it violated the "no casual deps" constraint.
@@ -780,12 +773,12 @@ silently; (4) `reset_memory` is the "forget last week" tool; (5)
 Two scratch scripts were added to de-risk the Stage 2 refactor before any
 plugin scaffolding lands.
 
-- **`scripts/login.ts`** (`npm run login`) — opens a headful persistent
+- **Legacy `scripts/login.ts` smoke** — opened a headful persistent
   Chromium context against `process.env.KOWALSKI_PROFILE_DIR` (default
   `~/.kowalski/browser`), navigates to instagram.com, and waits for the user
   to close the window. Cookies persist into the profile dir so subsequent
   headless runs are already logged in. The launch logic is exported as
-  `runLogin(profileDir)` so Stage 3 can lift it almost verbatim into the
+  a helper so Stage 3 can lift it almost verbatim into the
   plugin's `login` tool — only the timeout + caller plumbing should differ.
   The args / userAgent / viewport are duplicated from
   `BrowserManager.launch()` on purpose; consolidation is a Stage 3 decision

@@ -63,7 +63,7 @@ Save the `session_id` — every subsequent tool call needs it.
 
 ### 3. `login` (only if needed)
 
-Call `login` with the `session_id`. There are FIVE possible outcomes —
+Call `login` with the `session_id`. There are five possible outcomes —
 you MUST route each one correctly:
 
 ```json
@@ -71,7 +71,7 @@ you MUST route each one correctly:
 ```
 
 **a. Success (text response)** — e.g. `"Logged in agentically. Cookies
-persisted to …"` or `"Logged in. Cookies saved to …"`. Jump to step 4.
+persisted to …"`. Jump to step 4.
 
 **a1. `pending_credentials` (JSON response)** — no IG username/password is
 available (neither passed as params, nor set as IG_USERNAME/IG_PASSWORD env
@@ -90,16 +90,9 @@ Ask the user in the TUI: _"To log in to Instagram, I need your username
   "arguments": { "session_id": "…", "username": "…", "password": "…" } }
 ```
 
-If the user refuses to type their password into chat, offer the headful
-fallback instead — call:
-
-```json
-{ "name": "login",
-  "arguments": { "session_id": "…", "force_headful": true } }
-```
-
-…and Instagram opens in a normal-looking browser window they can type
-into directly. Never pressure the user; either path works.
+If the user refuses to type their password into chat, do not continue
+the login attempt. This plugin is headless-only and has no manual
+browser-window path.
 
 **b. `pending_2fa` (JSON response)** — the agentic login reached a 2FA
 screen and paused. Response shape:
@@ -117,9 +110,9 @@ When they reply with the code, call:
   "arguments": { "login_id": "…", "code": "123456" } }
 ```
 
-The `submit_verification_code` response has the same three shapes as
+The `submit_verification_code` response has the same core shapes as
 `login`: text-success, pending_2fa again (code was rejected — ask for a
-fresh code), or a headful-fallback result. A fourth shape,
+fresh code), or `login_failed_needs_manual`. A fourth shape,
 `context_destroyed`, can appear if the login browser got closed before
 the code arrived (rare — e.g. another tool call nuked it, or Chromium
 crashed). Re-run `login` from scratch; Instagram may not ask for 2FA
@@ -145,18 +138,22 @@ once you've done it."_ When they confirm, call:
 (Note: `code` is `null` for device approval — the tool polls the page
 for up to 120s waiting for the post-approval transition.) If the
 response is `still pending`, ask the user to try the notification
-again and call the same tool with `code: null` a second time, or
-accept the headful fallback.
+again and call the same tool with `code: null` a second time.
 
-**d. Headful-fallback text response** — the agentic flow escalated
-(suspicious-login challenge, stuck detection fired, or env vars weren't
-set). The text will say `"Logged in. Cookies saved to …"` if the user
-completed the headful window, or an error if they abandoned it. Tell
-the user _"A login window just opened — finish logging in there and
-I'll pick up the cookie automatically. The window will close itself."_
+**d. `login_failed_needs_manual` (JSON error response)** — the agentic
+flow escalated because Instagram showed a challenge the automated login
+cannot clear headlessly (for example suspicious-login review,
+checkpoint_required, or stuck detection). Response shape:
 
-On error containing `"did not close the browser within 10 minutes"`,
-the user abandoned the headful flow; suggest trying again.
+```json
+{ "status": "login_failed_needs_manual",
+  "reason": "…",
+  "message": "Instagram showed a challenge the automated login can't clear headlessly (e.g. a suspicious-login check). Try again later, or approve/clear the challenge from the Instagram app on your phone, then retry login." }
+```
+
+Relay the `message` to the user. Suggest they clear or approve the
+challenge from the Instagram app on their phone, then retry `login`
+afterward.
 
 **Credentials note.** The canonical path is: on first login, you ask
 the user for their IG username and password in the TUI, then pass them
@@ -165,11 +162,11 @@ caches them on the session for the duration of the login round trip
 (including 2FA follow-ups) so you only ask once — and they are never
 logged, never returned in any response, never included in any prompt
 sent to Claude. If the user declines to type their password into chat,
-call `login` again with `force_headful: true` and a Chromium window
-opens for them. Alternatively, power users can set `IG_USERNAME` and
-`IG_PASSWORD` env vars before launching `openclaw gateway run` for
-unattended/scheduled runs, in which case the first `login` call skips
-`pending_credentials` and goes straight to the agentic flow.
+stop the login flow politely; there is no visible-browser fallback.
+Alternatively, power users can set `IG_USERNAME` and `IG_PASSWORD` env
+vars before launching `openclaw gateway run` for unattended/scheduled
+runs, in which case the first `login` call skips `pending_credentials`
+and goes straight to the agentic flow.
 
 ### 4. Warn about cost + duration, then call `run_digest`
 
@@ -363,12 +360,12 @@ abort upfront if the cost or time isn't acceptable.
 | Trigger | What happened | How to respond |
 | --- | --- | --- |
 | `start_session` returns `logged_in: false` | Persistent profile has no valid sessionid cookie. | Call `login` next — don't panic. |
-| `login` returns `pending_credentials` | No creds available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, call `login` with `force_headful: true`. |
-| `login` error contains "did not close the browser within 10 minutes" | User abandoned the headful-fallback flow. | Suggest trying again; no need to call login again unless the user confirms. |
+| `login` returns `pending_credentials` | No creds available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, stop the login flow politely. |
+| `login` returns `login_failed_needs_manual` | Instagram showed a challenge the automated login cannot clear headlessly. | Relay the message, ask the user to approve or clear the challenge in the Instagram app on their phone, then retry login later. |
 | `login` returns `pending_2fa` | Agentic flow hit a 2FA screen. | Ask the user for their code, call `submit_verification_code` with it. Do NOT guess the code. |
 | `login` returns `pending_device_approval` | Agentic flow hit a device-push challenge. | Tell the user which device IG pinged (from `device_description`), then call `submit_verification_code` with `code: null` after they say they've approved it. |
 | `submit_verification_code` returns `pending_2fa` again | Code was rejected. | Ask for a fresh code (the previous one may have timed out). |
-| `submit_verification_code` returns `still pending` for device approval | User hasn't approved yet. | Ask if they saw the notification and call again with `code: null`, OR accept the headful fallback by calling `login` fresh. |
+| `submit_verification_code` returns `still pending` for device approval | User hasn't approved yet. | Ask if they saw the notification and call again with `code: null`. |
 | `submit_verification_code` returns `context_destroyed` | The pending-login browser was closed before the code was submitted (stale entry, Chromium crash, or out-of-band close). | Re-run `login` from scratch. The earlier attempt may have persisted enough cookies that Instagram skips 2FA the second time. |
 | `run_digest` error contains `"OFFLINE"` | Offline watchdog tripped (3 consecutive probe failures). Likely a transient network blip. | Suggest retrying. The partial record is still on disk under `analysis_records/<id>.json` with `aborted: true, abortReason: offline`. |
 | `run_digest` error mentions `"timed out"` / the header mentions `"Stories phase timed out after 15 minutes"` or `"Feed phase timed out after 30 minutes"` | A phase hit its hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
@@ -394,8 +391,8 @@ abort upfront if the cost or time isn't acceptable.
   are set). If they already gave them to you earlier in the conversation,
   re-use what's cached on the session — don't ask again. Never echo
   the password back to them, never log it, never include it in any
-  summary. If they refuse to share the password, call `login` with
-  `force_headful: true` instead.
+  summary. If they refuse to share the password, stop the login flow
+  politely because the plugin has no visible-browser fallback.
 - **Don't guess 2FA codes.** If you don't have a code from the user,
   don't make one up — Instagram locks accounts on repeated wrong
   codes. Return `pending_2fa` handling back to the user.

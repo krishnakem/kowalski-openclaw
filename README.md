@@ -29,7 +29,7 @@ The plugin registers **eight tools** on the OpenClaw agent surface. A [SKILL.md]
 | Tool | Purpose |
 | --- | --- |
 | `start_session` | Create a Kowalski session, probe whether the persistent browser profile is still logged in, return a `session_id` used by every other tool. |
-| `login` | Log into Instagram. If `IG_USERNAME` / `IG_PASSWORD` env vars are set, runs the agentic [LoginAgent](src/main/services/LoginAgent.ts) loop headlessly; otherwise opens a headful `--app` Chromium window. Can return `pending_2fa` or `pending_device_approval` payloads that the agent resolves via `submit_verification_code`. |
+| `login` | Log into Instagram with the headless agentic [LoginAgent](src/main/services/LoginAgent.ts) loop. If credentials are not already available from params or `IG_USERNAME` / `IG_PASSWORD`, returns `pending_credentials` so the agent can ask in chat. Can return `pending_2fa`, `pending_device_approval`, or `login_failed_needs_manual`. |
 | `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code and resumes the agent, or polls for device approval when `code: null`. |
 | `run_digest` | Single blocking call that runs stories + feed capture, extraction, and digest generation. Returns the digest markdown. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
 | `get_session_status` | Latest run phase + the last ~20 pipeline events. Useful between runs (OpenClaw typically serializes tool calls per session, so live polling during `run_digest` won't fire until the run returns). |
@@ -104,7 +104,7 @@ The defining piece of the project is that **login itself is driven by a vision a
 
 **Device-approval round-trip.** For "we sent a notification to your other device" challenges, the agent emits `emit_pending_device_approval` (quoting which device IG named). `submit_verification_code` with `code: null` polls `probeInstagramLogin` every 3s for up to 120s, waiting for the post-approval transition.
 
-**Headful fallback.** When agentic login can't resolve the flow — suspicious-login challenge, three consecutive stuck turns, or env vars not set — the plugin closes the headless context and opens the Stage 5 chromeless `--app` window for the user to complete manually. The cookie-polling auto-close loop (Stage 3.5) still applies, so the fallback window closes itself on success.
+**Manual-needed outcome.** When agentic login can't resolve the flow — suspicious-login challenge, three consecutive stuck turns, or another checkpoint that cannot be cleared headlessly — the plugin closes the headless context and returns `login_failed_needs_manual`. The agent should ask the user to approve or clear the challenge from the Instagram app on their phone, then retry login later.
 
 **Run traces.** Every agentic login attempt writes per-turn screenshots + metadata into `${session.scratchDir}/kowalski-runs/login_<timestamp>/`. Debuggable after the fact without burning a fresh real-account attempt.
 
@@ -131,7 +131,7 @@ openclaw config set \
   plugins.entries.kowalski-openclaw.config.anthropicApiKey "sk-ant-…"
 
 # 4. (Optional) Set IG credentials for agentic login. If unset, the
-#    `login` tool falls back to opening a headful window.
+#    `login` tool returns pending_credentials so the agent can ask in chat.
 export IG_USERNAME="your.instagram.handle"
 export IG_PASSWORD="your.password"
 
@@ -169,7 +169,7 @@ The `--dangerously-force-unsafe-install` flag is required because OpenClaw's sta
 
 | Variable | Purpose |
 | --- | --- |
-| `IG_USERNAME`, `IG_PASSWORD` | Enable the agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool falls back to headful. Credentials are never logged or passed through any LLM payload. |
+| `IG_USERNAME`, `IG_PASSWORD` | Enable unattended use of the headless agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool returns `pending_credentials`. Credentials are never logged or passed through any LLM payload. |
 | `KOWALSKI_VISION_DETAIL` | `high` (default) or `low`. Controls Anthropic vision detail. |
 | `KOWALSKI_STORIES_MODEL` | Stories-phase navigation. Default `claude-sonnet-4-6`. |
 | `KOWALSKI_NAV_MODEL` | Feed-phase navigation. Default `claude-sonnet-4-6`. |
@@ -203,7 +203,6 @@ src/
 │                                   # (paths, api key, runConfig, events, abort signal)
 ├── plugin/                         # OpenClaw plugin surface
 │   ├── index.ts                    # register(api) — the 8 tools
-│   ├── login-flow.ts               # Headful --app login window (Stage 5 fallback)
 │   ├── cookie-probe.ts             # Read Instagram sessionid out of Chromium cookies DB
 │   └── session-registry.ts         # Per-session event buffer for get_session_status
 ├── main/
@@ -245,7 +244,6 @@ src/
 └── types/                          # analysis, instagram, navigation, session-memory, better-sqlite3
 
 scripts/                            # npm run test:* harnesses
-├── login.ts                        # Headful login smoke (npm run login)
 ├── test-digest.ts                  # Digest generation test
 ├── test-extract.ts                 # Extractor test
 ├── test-run.ts                     # Full pipeline test (headless)
@@ -284,7 +282,6 @@ Every model is env-overridable so you can drop Sonnet to Haiku where accuracy al
 npm install
 npx tsc --noEmit        # Typecheck
 
-npm run login           # Headful login smoke (no gateway needed)
 npm run test:plugin     # Plugin surface — asserts 8 tools registered in order
 npm run test:login      # LoginAgent against a local fake-IG fixture
                         # (scripted callLLM — no Anthropic calls)

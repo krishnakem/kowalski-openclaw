@@ -32,9 +32,8 @@
 //    - BrowserManager.getInstance().clearData()
 //    - BrowserManager.getInstance().getContext()
 //    Screencast + input forwarding was the renderer-side interactive login.
-//    The OpenClaw plugin either (a) headfully launches and lets the user
-//    log in directly, or (b) drops screencast entirely. To be decided in a
-//    later stage.
+//    The OpenClaw plugin now drops this surface entirely; login is handled
+//    by the headless LoginAgent path.
 //
 // 3. Secure key storage
 //    Stage 2: SecureKeyManager has been deleted. Callers now read the API

@@ -207,7 +207,7 @@ export class LoginAgent extends BaseVisionAgent {
                 this.collector.appendLog(
                     `🆘 Escalate to human: ${this.pendingDescription}`
                 );
-                return 'escalated — host will fall back to headful login window';
+                return 'escalated — host will return login_failed_needs_manual';
         }
     }
 

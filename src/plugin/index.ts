@@ -30,7 +30,6 @@ import {
     makeLoginRunDir,
     type LoginPendingStatus,
 } from '../main/services/LoginAgent.js';
-import { runLogin } from './login-flow.js';
 import { probeInstagramLogin } from './cookie-probe.js';
 import { writeDigestPdf } from './digest-pdf.js';
 import {
@@ -161,8 +160,8 @@ export function register(api: PluginApi): () => void {
     //      launch. Power-user convenience for unattended scheduled runs.
     //   3. Neither — the `login` tool returns `pending_credentials` and the
     //      agent is expected to ask the user in the TUI, then call `login`
-    //      again with the params. Absolute last resort: the Stage 5
-    //      headful --app window if the user declines to share creds.
+    //      again with the params. There is no manual browser-window fallback;
+    //      every login attempt stays headless.
     //
     // Credentials are cached in-memory per session (on KowalskiSession.runConfig)
     // so the agentic flow can resume across pending_2fa round trips without
@@ -292,7 +291,7 @@ export function register(api: PluginApi): () => void {
                 probe.logged_in === true
                     ? 'Session ready. Instagram sessionid cookie is valid — call run_digest when you want to capture.'
                     : probe.logged_in === false
-                      ? 'Session ready, but the profile is not logged into Instagram. Call the login tool next (it opens a headful browser window for the user to log in).'
+                      ? 'Session ready, but the profile is not logged into Instagram. Call the login tool next; it will ask for Instagram credentials in chat if needed and log in automatically in a headless browser.'
                       : 'Session ready, but the login probe could not be completed. Recommend calling login first before run_digest.';
 
             log.info('start_session', { sessionId, logged_in: probe.logged_in });
@@ -306,7 +305,7 @@ export function register(api: PluginApi): () => void {
     };
 
     // -----------------------------------------------------------------------
-    // Tool: login  (Stage 6 — agentic first, headful fallback)
+    // Tool: login  (Stage 6 — headless agentic login only)
     //
     // Happy path: IG_USERNAME + IG_PASSWORD are set in the plugin env, so
     // we drive a headless Playwright page through the IG login flow with
@@ -320,49 +319,39 @@ export function register(api: PluginApi): () => void {
     //     to ask the user for their code and call submit_verification_code.
     //   - `pending_device_approval` — IG pushed a "notification to another
     //     device" challenge. Same round-trip shape, no code required.
-    //   - `escalate_to_human` — the agent got stuck, saw a checkpoint, or
-    //     the env vars weren't set. Fall back to the Stage 5 headful
-    //     --app window — the existing cookie-polling auto-close still
-    //     applies.
+    //   - `escalate_to_human` — the agent got stuck or saw a checkpoint
+    //     that cannot be cleared in a headless flow. Return a structured
+    //     login_failed_needs_manual result so the host can tell the user
+    //     how to clear the challenge outside the plugin and retry.
     //
     // Input:  { session_id: string } — required so we can route the agent
     //         event stream and resume on the same session on 2FA.
-    // Output: text block on success, JSON blob on pending states, or the
-    //         existing headful-login text if the env fallback fired.
+    // Output: text block on success, JSON blob on pending states or
+    //         headless-only failure states.
     // -----------------------------------------------------------------------
-    const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
     const AGENTIC_LOGIN_MAX_DURATION_MS = 3 * 60 * 1000;
+    const LOGIN_FAILED_NEEDS_MANUAL_MESSAGE =
+        "Instagram showed a challenge the automated login can't clear headlessly (e.g. a suspicious-login check). Try again later, or approve/clear the challenge from the Instagram app on your phone, then retry login.";
 
-    async function runHeadfulFallback(): Promise<AgentToolResult> {
-        let timer: NodeJS.Timeout | null = null;
-        try {
-            await Promise.race([
-                runLogin(browserProfileDir),
-                new Promise<never>((_, reject) => {
-                    timer = setTimeout(
-                        () =>
-                            reject(
-                                new Error(
-                                    `login: user did not close the browser within ${LOGIN_TIMEOUT_MS / 60000} minutes`
-                                )
-                            ),
-                        LOGIN_TIMEOUT_MS
-                    );
-                }),
-            ]);
-            return textResult(`Logged in. Cookies saved to ${browserProfileDir}.`);
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return textResult(`login failed: ${msg}`, true);
-        } finally {
-            if (timer) clearTimeout(timer);
-        }
+    function loginFailedNeedsManualResult(reason?: string | null): AgentToolResult {
+        const cleanReason =
+            typeof reason === 'string' && reason.trim()
+                ? reason.trim()
+                : 'Instagram showed a login challenge the automated flow cannot clear headlessly.';
+        return jsonTextResult(
+            {
+                status: 'login_failed_needs_manual',
+                reason: cleanReason,
+                message: LOGIN_FAILED_NEEDS_MANUAL_MESSAGE,
+            },
+            true
+        );
     }
 
     const loginTool: PluginTool = {
         name: 'login',
         description:
-            'Log into Instagram. Canonical flow: ask the user for their IG username and password in the TUI on first login, then call this tool with `username` and `password` params — a headless agentic login loop fills the form, handles "Remember me", and can return `pending_2fa` or `pending_device_approval` payloads which you resolve via `submit_verification_code`. If called without params and no IG_USERNAME/IG_PASSWORD env vars are set on the host, returns `pending_credentials` so you can prompt the user and call back. If agentic login escalates (suspicious-login checkpoint, stuck detection), falls back to a headful Chromium window. Only call when `start_session` reports `logged_in: false`.',
+            'Log into Instagram using the headless agentic flow only. Canonical flow: ask the user for their IG username and password in the TUI on first login, then call this tool with `username` and `password` params; the headless login loop fills the form, handles "Remember me", and can return `pending_2fa` or `pending_device_approval` payloads which you resolve via `submit_verification_code`. If called without params and no IG_USERNAME/IG_PASSWORD env vars are set on the host, returns `pending_credentials` so you can prompt the user and call back. If Instagram shows an unsolvable challenge (suspicious-login checkpoint, stuck detection), returns `login_failed_needs_manual` for the agent to relay. Only call when `start_session` reports `logged_in: false`.',
         parameters: {
             type: 'object',
             properties: {
@@ -377,10 +366,6 @@ export function register(api: PluginApi): () => void {
                 password: {
                     type: 'string',
                     description: 'Instagram password. Ask the user in the TUI on first login — do NOT hardcode or guess. Cached on the session for the rest of the login round trip. Optional; if omitted, falls back to IG_PASSWORD env var, and if that is also unset the tool returns pending_credentials.',
-                },
-                force_headful: {
-                    type: 'boolean',
-                    description: 'Skip the agentic flow entirely and open a headful Chromium window for the user to log in manually. Set this when the user declines to share credentials in chat, or when the agentic flow has failed enough times that a manual login is preferable. Default false.',
                 },
             },
             required: ['session_id'],
@@ -399,12 +384,6 @@ export function register(api: PluginApi): () => void {
                     `login: session_id ${sessionId} not found. Call start_session first.`,
                     true
                 );
-            }
-
-            // Explicit user-declines path.
-            if (params.force_headful === true) {
-                log.info('[kowalski] login called with force_headful:true; opening headful window');
-                return runHeadfulFallback();
             }
 
             // ----- Resolve credentials: params > session cache > env -----
@@ -430,7 +409,7 @@ export function register(api: PluginApi): () => void {
                     status: 'pending_credentials',
                     session_id: sessionId,
                     message:
-                        'No Instagram credentials available. Ask the user in the TUI for their Instagram username (or email/phone) and password, then call `login` again with `username` and `password` params. Never guess or reuse old creds. If the user declines to share their password in chat, call `login` again with `force_headful: true` and Instagram will open in a normal-looking browser window for them to type into directly.',
+                        'No Instagram credentials available. Ask the user in the TUI for their Instagram username (or email/phone) and password, then call `login` again with `username` and `password` params. Never guess or reuse old creds. If the user declines to share credentials in chat, login cannot continue because this plugin is headless-only.',
                 });
             }
             // Persist resolved creds on the session so submit_verification_code
@@ -542,21 +521,21 @@ export function register(api: PluginApi): () => void {
                 }
 
                 // status === 'escalate_to_human' — close the headless
-                // context and fall back to the Stage 5 headful window.
-                log.info('[kowalski] LoginAgent escalated, falling back to headful', {
+                // context and return a structured failure for the host.
+                log.info('[kowalski] LoginAgent escalated; returning headless-only manual-needed result', {
                     reason: agent.pendingDescription,
                 });
                 try { collector.flushSessionLog(); } catch { /* ignore */ }
                 try { await context.close(); } catch { /* ignore */ }
                 context = null;
                 collector = null;
-                return runHeadfulFallback();
+                return loginFailedNeedsManualResult(agent.pendingDescription);
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
-                log.warn('[kowalski] agentic login failed, falling back to headful', { msg });
+                log.warn('[kowalski] agentic login failed; returning headless-only manual-needed result', { msg });
                 try { if (collector) collector.flushSessionLog(); } catch { /* ignore */ }
                 try { if (context) await context.close(); } catch { /* ignore */ }
-                return runHeadfulFallback();
+                return loginFailedNeedsManualResult(`Headless login failed before completion: ${msg}`);
             }
         },
     };
@@ -694,11 +673,16 @@ export function register(api: PluginApi): () => void {
                             message: 'The previous code did not work. Ask the user for a fresh code and call submit_verification_code again.',
                         });
                     }
-                    // escalate or unexpected pending state — give up on the
-                    // headless path and fall back to headful.
+                    // Escalation or an unexpected pending state means the
+                    // headless flow cannot continue.
                     await cleanup();
-                    log.info('[kowalski] submit_verification_code escalated, falling back to headful');
-                    return runHeadfulFallback();
+                    log.info('[kowalski] submit_verification_code escalated; returning headless-only manual-needed result', {
+                        reason: resumed.pendingDescription,
+                    });
+                    return loginFailedNeedsManualResult(
+                        resumed.pendingDescription ??
+                            'Instagram did not accept the verification round-trip and needs manual challenge clearance.'
+                    );
                 }
 
                 // pending_device_approval — poll for 120s.
@@ -715,7 +699,7 @@ export function register(api: PluginApi): () => void {
                 return jsonTextResult({
                     status: 'pending_device_approval',
                     login_id: loginId,
-                    message: 'Still waiting for device approval after 120 seconds. Ask the user if they saw the notification; call submit_verification_code again with code: null to poll for another 120s, or accept the headful fallback.',
+                    message: 'Still waiting for device approval after 120 seconds. Ask the user if they saw the notification, then call submit_verification_code again with code: null to poll for another 120s.',
                 });
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);

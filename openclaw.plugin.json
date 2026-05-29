@@ -28,7 +28,7 @@
             },
             "browserProfileDir": {
                 "type": "string",
-                "description": "Path to the persistent Playwright user-data directory. Used by both the login flow (headful) and run flow (headless). Leading ~ is expanded to the user's home directory at plugin-register time.",
+                "description": "Path to the persistent Playwright user-data directory. Used by both the login and run flows, which are fully headless. Leading ~ is expanded to the user's home directory at plugin-register time.",
                 "default": "~/.kowalski/browser"
             },
             "scratchDir": {

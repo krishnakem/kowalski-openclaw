@@ -6,7 +6,7 @@
  * pass, and prints every event the session emits along the way.
  *
  * Skips cleanly if ANTHROPIC_API_KEY or KOWALSKI_PROFILE_DIR is missing — the
- * profile dir must contain valid IG cookies (run `npm run login` first).
+ * profile dir must contain valid IG cookies (use the plugin login tool first).
  *
  * Usage:
  *   ANTHROPIC_API_KEY=sk-ant-... KOWALSKI_PROFILE_DIR=~/.kowalski/browser \
@@ -28,7 +28,7 @@ async function main(): Promise<void> {
         return;
     }
     if (!profileDir) {
-        console.log('⏭  SKIPPED: KOWALSKI_PROFILE_DIR env var not set (run `npm run login` first)');
+        console.log('⏭  SKIPPED: KOWALSKI_PROFILE_DIR env var not set (use the plugin login tool first)');
         return;
     }
 

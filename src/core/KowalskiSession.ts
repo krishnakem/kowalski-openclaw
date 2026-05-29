@@ -43,8 +43,8 @@ export interface KowalskiSession {
         // new arg down the service graph. Never pass these fields into any
         // LLM payload — the LoginAgent executor reads them directly during
         // fill_username / fill_password action dispatch. If either is
-        // absent, the plugin's `login` tool falls back to the Stage 5
-        // headful --app window.
+        // absent, the plugin's `login` tool asks the host agent to collect
+        // credentials in chat and then continues headlessly.
         igUsername?: string;
         igPassword?: string;
     };
