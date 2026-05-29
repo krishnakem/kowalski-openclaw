@@ -135,37 +135,16 @@ openclaw config set \
 export IG_USERNAME="your.instagram.handle"
 export IG_PASSWORD="your.password"
 
-# 5. Clone the plugin and install its JS deps. The postinstall hook also
-#    downloads a Chromium binary into the shared Playwright cache
-#    (~150 MB on first install; a no-op on subsequent runs).
-git clone https://github.com/krishnakem/kowalski-openclaw.git
-cd kowalski-openclaw
-npm install
-
-# 6. Install this repo as a live-linked plugin. --link symlinks the
+# 5. Install this repo as a live-linked plugin. --link symlinks the
 #    working tree so edits show up on the next gateway restart.
-openclaw plugins install "$PWD" \
+openclaw plugins install /absolute/path/to/Kowalski-OpenClaw \
   --link \
   --dangerously-force-unsafe-install
 
-# 7. Run the gateway, then attach the TUI in another shell.
+# 6. Run the gateway, then attach the TUI in another shell.
 openclaw gateway run
 openclaw tui
 ```
-
-**System libraries (Linux-only, minimal images).** Step 5 only fetches the Chromium binary, not the shared C libraries it links against. On a fresh minimal Debian/Ubuntu image (e.g. a stock GCE VM) you also need:
-
-```bash
-sudo apt install -y \
-  libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
-  libcups2 libdrm2 libxkbcommon0 libatspi2.0-0 libxcomposite1 \
-  libxdamage1 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 \
-  libcairo2 libasound2
-# Or, equivalently — auto-detects the right package names per distro:
-sudo npx playwright install-deps chromium
-```
-
-Skip this on macOS and on most desktop Ubuntu installs — those already ship the libraries Chromium needs. If you skip it on a system that does need it, `run_digest` will surface a clear error pointing back to this command.
 
 The `--dangerously-force-unsafe-install` flag is required because OpenClaw's static scanner flags three `process.env.*` reads near LLM calls as potential "credential harvesting" false positives. All three reads are a vision-detail feature flag (`KOWALSKI_VISION_DETAIL`), not credentials. See [REFACTOR_NOTES.md › Stage 3.5](REFACTOR_NOTES.md) for details.
 

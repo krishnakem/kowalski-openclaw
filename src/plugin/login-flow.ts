@@ -16,7 +16,6 @@ import { chromium } from 'playwright-extra';
 // @ts-ignore — stealth ships its own .d.ts but is loose-typed
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { ChromiumVersionHelper } from '../main/services/ChromiumVersionHelper.js';
-import { rethrowIfMissingSystemLibs } from '../main/services/BrowserManager.js';
 import { KOWALSKI_VIEWPORT } from '../shared/viewportConfig.js';
 import { probeInstagramLogin } from './cookie-probe.js';
 
@@ -28,40 +27,32 @@ export async function runLogin(profileDir: string): Promise<void> {
     const systemTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
     console.log(`🪟 Launching Instagram login window against profile: ${profileDir}`);
-    let context;
-    try {
-        context = await chromium.launchPersistentContext(profileDir, {
-            headless: false,
-            viewport: { width: KOWALSKI_VIEWPORT.width, height: KOWALSKI_VIEWPORT.height },
-            deviceScaleFactor: 1,
-            userAgent: ChromiumVersionHelper.generateUserAgent(),
-            locale: 'en-US',
-            timezoneId: systemTimezone,
-            colorScheme: 'light',
-            extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
-            args: [
-                '--app=https://www.instagram.com/',
-                `--window-size=${KOWALSKI_VIEWPORT.width},${KOWALSKI_VIEWPORT.height}`,
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--no-first-run',
-                '--no-default-browser-check',
-                '--disable-features=TranslateUI,Translate,AutofillServerCommunication,OptimizationHints',
-                '--disable-component-update',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-infobars',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-            ],
-            acceptDownloads: true,
-        });
-    } catch (err) {
-        // Same preflight as BrowserManager.launch(): convert the Linux
-        // missing-system-libs failure into a message that prints the exact
-        // apt install command. Any other error rethrows unchanged.
-        rethrowIfMissingSystemLibs(err);
-    }
+    const context = await chromium.launchPersistentContext(profileDir, {
+        headless: false,
+        viewport: { width: KOWALSKI_VIEWPORT.width, height: KOWALSKI_VIEWPORT.height },
+        deviceScaleFactor: 1,
+        userAgent: ChromiumVersionHelper.generateUserAgent(),
+        locale: 'en-US',
+        timezoneId: systemTimezone,
+        colorScheme: 'light',
+        extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+        args: [
+            '--app=https://www.instagram.com/',
+            `--window-size=${KOWALSKI_VIEWPORT.width},${KOWALSKI_VIEWPORT.height}`,
+            '--disable-extensions',
+            '--disable-default-apps',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-features=TranslateUI,Translate,AutofillServerCommunication,OptimizationHints',
+            '--disable-component-update',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-infobars',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+        ],
+        acceptDownloads: true,
+    });
 
     // `--app` drives the initial navigation; just grab the page handle.
     const page = context.pages()[0] ?? (await context.newPage());
