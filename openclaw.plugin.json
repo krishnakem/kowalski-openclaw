@@ -5,6 +5,19 @@
     "version": "0.1.0",
     "kind": "capability",
     "main": "./src/plugin/index.ts",
+    "contracts": {
+        "tools": [
+            "start_session",
+            "login",
+            "submit_verification_code",
+            "run_digest",
+            "get_session_status",
+            "reset_memory",
+            "reset_all",
+            "stop_run",
+            "end_session"
+        ]
+    },
     "configSchema": {
         "type": "object",
         "properties": {
