@@ -18,6 +18,7 @@
             "end_session"
         ]
     },
+    "skills": ["./skills"],
     "configSchema": {
         "type": "object",
         "properties": {
