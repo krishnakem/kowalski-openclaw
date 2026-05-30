@@ -251,7 +251,12 @@ export function flattenPrompt(request: InferenceRequest): string {
         }
     }
     if (request.expectJson) {
-        parts.push('Return only the requested JSON or structured text. Do not wrap the response in a code fence.');
+        parts.push([
+            'Return ONLY one compact JSON object. No markdown, no code fence, no prose.',
+            'Keep all string values short so the object is not truncated.',
+            'For navigation JSON, keep "thinking", "intent", "expected_state", "if_wrong", and "memory" to one short sentence each.',
+            'The response must start with { and end with }.'
+        ].join('\n'));
     }
     return parts.filter(Boolean).join('\n\n');
 }

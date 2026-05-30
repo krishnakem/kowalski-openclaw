@@ -20,6 +20,7 @@ import { HumanScroll } from './HumanScroll.js';
 import { ScreenshotCollector } from './ScreenshotCollector.js';
 import { isOnline, isNetworkError, OFFLINE_ERROR } from './NetworkMonitor.js';
 import type { InferenceClient, InferenceMessage } from './Inference.js';
+import { parseJsonObjectFromText } from './jsonResponse.js';
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1168,24 +1169,11 @@ export abstract class BaseVisionAgent {
     // -----------------------------------------------------------------------
 
     protected parseJsonResponse(content: string): VisionAction {
-        const trimmed = content.trim();
-        try {
-            return JSON.parse(trimmed) as VisionAction;
-        } catch {
-            // Fall through
+        const parsed = parseJsonObjectFromText<VisionAction>(content);
+        if (!parsed.action) {
+            throw new SyntaxError(`JSON response missing action: ${content.trim().slice(0, 160)}`);
         }
-
-        const codeBlockMatch = trimmed.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
-        if (codeBlockMatch) {
-            return JSON.parse(codeBlockMatch[1]) as VisionAction;
-        }
-
-        const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-            return JSON.parse(jsonMatch[0]) as VisionAction;
-        }
-
-        throw new SyntaxError(`No JSON found in response: ${trimmed.slice(0, 100)}`);
+        return parsed;
     }
 
     protected delay(ms: number): Promise<void> {

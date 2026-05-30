@@ -25,6 +25,7 @@ import { ModelConfig } from '../../shared/modelConfig.js';
 // CaptureSource import removed — no longer used (capture handled by filter agent)
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
 import type { InferenceClient, InferenceMessage } from './Inference.js';
+import { parseJsonObjectFromText } from './jsonResponse.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const navigatorPrompt = readFileSync(join(__dirname, '../prompts/navigator-agent.md'), 'utf8');
@@ -1146,27 +1147,11 @@ export class Scroller {
 
     /** Parse JSON from LLM response, handling prose wrapper or markdown code blocks. */
     private parseJsonResponse(content: string): VisionAction {
-        // Try direct parse first
-        const trimmed = content.trim();
-        try {
-            return JSON.parse(trimmed) as VisionAction;
-        } catch {
-            // Fall through to extraction
+        const parsed = parseJsonObjectFromText<VisionAction>(content);
+        if (!parsed.action) {
+            throw new SyntaxError(`JSON response missing action: ${content.trim().slice(0, 160)}`);
         }
-
-        // Try extracting JSON from markdown code block
-        const codeBlockMatch = trimmed.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
-        if (codeBlockMatch) {
-            return JSON.parse(codeBlockMatch[1]) as VisionAction;
-        }
-
-        // Try extracting first JSON object from the text
-        const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-            return JSON.parse(jsonMatch[0]) as VisionAction;
-        }
-
-        throw new SyntaxError(`No JSON found in response: ${trimmed.slice(0, 100)}`);
+        return parsed;
     }
 
     private delay(ms: number): Promise<void> {
