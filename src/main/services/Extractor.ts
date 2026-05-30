@@ -200,7 +200,7 @@ export class Extractor {
                     model: ModelConfig.extraction,
                     prompt: this.buildExtractionPrompt(),
                     images: [{ buffer: image, mime: 'image/jpeg', label: 'capture' }],
-                    maxTokens: 800,
+                    maxTokens: 2000,
                     signal,
                     timeoutMs: 60_000,
                     purpose: 'Kowalski extraction',

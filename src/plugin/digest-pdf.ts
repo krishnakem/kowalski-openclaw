@@ -68,18 +68,6 @@ export async function writeDigestPdf(
     const stream = fs.createWriteStream(outPath);
     doc.pipe(stream);
 
-    // --- Banner for partial runs ---
-    if (opts.aborted) {
-        doc.fillColor('#aa2200');
-        emitPlain(
-            doc,
-            `⚠ PARTIAL DIGEST — ${partialRunLabel(opts.abortReason)}`,
-            FONT.bodyBold,
-            11
-        );
-        doc.moveDown(0.5).fillColor('black');
-    }
-
     // --- Header ---
     emitPlain(doc, record.data.title || 'Instagram digest', FONT.heading, 24);
     if (record.data.subtitle) {
@@ -106,21 +94,6 @@ export async function writeDigestPdf(
         stream.on('error', reject);
     });
     return outPath;
-}
-
-function partialRunLabel(reason?: string): string {
-    switch (reason) {
-        case 'user-stop':
-            return 'run stopped early by request';
-        case 'timeout-stories':
-            return 'stories phase timed out';
-        case 'timeout-feed':
-            return 'feed phase timed out';
-        case 'offline':
-            return 'network interrupted the run';
-        default:
-            return reason ? `run ended early (${reason})` : 'run ended early';
-    }
 }
 
 function registerFonts(doc: PDFKit.PDFDocument): void {

@@ -140,15 +140,19 @@ export class RunManager {
             console.log('🛑 stopRun: no active run to stop');
             return;
         }
-        if (!this.abortReason) this.abortReason = reason;
+        if (this.abortReason) {
+            this.clearStopMarker();
+            return;
+        }
+        this.abortReason = reason;
+        this.clearStopMarker();
         console.log(`🛑 Stopping active run (reason=${this.abortReason})...`);
 
         // User-initiated stops during browsing mirror the desktop app: stop
         // the active agent cooperatively and let the run unwind into digest
-        // generation with the captures already on disk. Non-user stops, and
-        // stops after browsing has ended, still hard-abort in-flight run-level
-        // LLM work so teardown cannot hang.
-        const shouldHardAbort = this.abortReason !== 'user-stop' || !this.activeScraper;
+        // generation with the captures already on disk. Non-user stops still
+        // hard-abort in-flight run-level LLM work so teardown cannot hang.
+        const shouldHardAbort = this.abortReason !== 'user-stop';
         if (shouldHardAbort) {
             try {
                 this.runAbortController?.abort();
@@ -169,7 +173,9 @@ export class RunManager {
             e.stop();
         }
         if (!this.activeScraper && this.activeExtractors.length === 0) {
-            console.log('🛑 stopRun: no scraper/extractor attached yet — abort signal will catch the next await');
+            console.log(shouldHardAbort
+                ? '🛑 stopRun: no scraper/extractor attached yet — abort signal will catch the next await'
+                : '🛑 stopRun: no scraper/extractor attached — run will finish cooperatively');
         }
     }
 
@@ -206,7 +212,6 @@ export class RunManager {
         this.stopMarkerPoller = setInterval(() => {
             if (fs.existsSync(stopMarker)) {
                 console.log('🛑 Stop marker detected — requesting graceful stop');
-                if (!this.abortReason) this.abortReason = 'user-stop';
                 this.stopRun('user-stop');
             }
         }, 3000);
@@ -888,6 +893,11 @@ export class RunManager {
             this.stopOfflineWatchdog();
             this.stopOfflineWatchdog = null;
         }
+        this.clearStopMarker();
+        this.emit('run-complete', {});
+    }
+
+    private clearStopMarker(): void {
         if (this.stopMarkerPoller) {
             clearInterval(this.stopMarkerPoller);
             this.stopMarkerPoller = null;
@@ -899,6 +909,5 @@ export class RunManager {
                 /* best-effort cleanup */
             }
         }
-        this.emit('run-complete', {});
     }
 }
