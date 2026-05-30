@@ -74,7 +74,7 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
         │                   merges structured extraction into sidecars)    │
         │      │                                                           │
         │      ▼  reads sidecars as text only                              │
-        │  DigestGeneration (Phase 3 — Haiku-by-default editorial)         │
+        │  DigestGeneration (Phase 3 — OpenClaw text model)                │
         │      │                                                           │
         │      ▼                                                           │
         │  AnalysisGenerator → analysis_records/<id>.json                  │
@@ -131,8 +131,7 @@ openclaw configure
 export IG_USERNAME="your.instagram.handle"
 export IG_PASSWORD="your.password"
 
-# 4. Install plugin dependencies. postinstall downloads Kowalski's
-#    plugin-local Playwright Chromium; no system Chrome is required.
+# 4. Install plugin dependencies and the plugin-local Playwright browser.
 cd /absolute/path/to/Kowalski-OpenClaw
 npm install
 npm run check:browser
@@ -235,7 +234,7 @@ src/
 │       ├── UsageService.ts         # Token + cost accounting
 │       └── ChromiumVersionHelper.ts
 ├── shared/
-│   ├── modelConfig.ts              # Centralised + env-overridable model IDs
+│   ├── modelConfig.ts              # Legacy model hints for non-runtime callers
 │   └── viewportConfig.ts           # Shared viewport dimensions
 ├── utils/
 │   └── elementLabeler.ts           # Set-of-Mark overlay + viewport-space bbox map
@@ -259,38 +258,44 @@ skills/
 
 ## Models and costs
 
-OpenClaw's configured gateway/provider chooses the models. Configure
-`agents.defaults.imageModel` to a vision-capable model for screenshot
-understanding. The legacy model hints in [src/shared/modelConfig.ts](src/shared/modelConfig.ts)
-are ignored by the OpenClaw inference client unless the runtime grows explicit
-model-hint support.
+OpenClaw's configured runtime chooses the models:
 
-- **Sonnet 4.6** for every vision-and-reasoning call (navigation, extraction, analysis, login).
-- **Haiku 4.5** for the text-only digest synthesis (all visual work is done upstream, so the writer runs cheap).
+- Screenshot understanding goes through `api.runtime.mediaUnderstanding`.
+- Text-only generation goes through `api.runtime.llm.complete`.
 
-Typical cost + duration expectations, per [SKILL.md](skills/instagram-digest/SKILL.md):
+Kowalski does not currently force specific model IDs from inside the plugin.
+Configure the text and image models in OpenClaw; screenshot understanding
+requires a vision-capable image model such as `agents.defaults.imageModel`.
 
-- **Typical full run:** 10–30 minutes. Cost depends on the configured OpenClaw provider.
-- **Hard caps:** stories phase 15 min, feed phase 30 min.
-- **Worst case:** ~45 min total, ~$3.
+Costs depend on your provider, selected models, and how many screenshots/agent
+turns a run needs. The plugin records provider/model/usage when the runtime
+returns them.
 
-Every model is env-overridable so you can drop Sonnet to Haiku where accuracy allows — see the env-var table above.
+Duration is bounded by the pipeline timeouts: stories cap at 15 minutes, feed
+caps at 30 minutes, so a full run can take up to about 45 minutes before it
+finalizes with a partial digest.
 
 ## Bundled Browser
 
-Kowalski installs its own Playwright Chromium under
-`node_modules/playwright-core/.local-browsers` and passes that executable
-path explicitly to Playwright. If the bundled browser is missing, browser
-launch fails with a repair command instead of silently using system Chrome
-or another Playwright cache.
+Kowalski uses a plugin-local Playwright Chromium/headless-shell install created
+by `npm install` or repaired with `npm run setup:browser`:
+
+```text
+node_modules/playwright-core/.local-browsers
+```
+
+Runtime always passes this executable path to Playwright. It does not use
+system Chrome, another project's Chromium, or the user-level Playwright cache.
+If the local browser is missing, launch fails and asks you to run the repair
+command.
 
 ```bash
-npm run setup:browser   # install/repair the plugin-local Chromium
+npm run setup:browser   # install/repair the plugin-local browser
 npm run check:browser   # verify the executable path + revision
 ```
 
-On Linux, the browser binary is bundled, but the host may still need the
-standard shared libraries that Playwright/Chromium require.
+On Linux, the host may still need the shared libraries required by
+Playwright/Chromium.
 
 ---
 
