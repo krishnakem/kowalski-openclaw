@@ -24,7 +24,7 @@ The heavy lifting is all local — real Playwright-controlled Chromium against a
 
 ## What the plugin exposes
 
-The plugin registers **nine tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
+The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
 
 | Tool | Purpose |
 | --- | --- |
@@ -33,8 +33,10 @@ The plugin registers **nine tools** on the OpenClaw agent surface. A [SKILL.md](
 | `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts `run_digest` automatically. |
 | `run_digest` | Manually start the non-blocking stories + feed capture, extraction, and digest generation run. Normally `start_session` or successful login starts this for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
 | `get_session_status` | Latest run phase + the last ~20 pipeline events. Also delivers the final digest once `digest_status` is `completed` or `stopped`. |
+| `set_api_key` | Validate an Anthropic API key and store it in the OS keychain via `@napi-rs/keyring`. |
+| `clear_api_key` | Clear the stored keychain API key and in-memory cache. Idempotent. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
-| `reset_all` | Dry-run-first factory reset for browser profile, scratch data, and output records. Requires `confirm: true` to actually wipe. |
+| `reset_all` | Dry-run-first factory reset for browser profile, scratch data, output records, and the stored keychain API key. Requires `confirm: true` to actually wipe. |
 | `stop_run` | Write a stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
@@ -50,7 +52,7 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
         ┌──────────────────────────────────────────────────────────────────┐
         │  OpenClaw agent (in chat)                                        │
         │    ↓ calls tools                                                 │
-        │  src/plugin/index.ts  ──────────  registers 9 tools              │
+        │  src/plugin/index.ts  ──────────  registers 11 tools             │
         └──────────────────────────┬───────────────────────────────────────┘
                                    │ (session_id + runConfig)
                                    ▼
@@ -125,11 +127,11 @@ npm install -g openclaw
 #    pick Anthropic as the provider and claude-sonnet-4-6 as the model.
 openclaw configure
 
-# 3. Set the plugin's Anthropic API key BEFORE installing (the loader
-#    validates the plugin's configSchema at install time; see
-#    REFACTOR_NOTES.md for the chicken-and-egg details).
-openclaw config set \
-  plugins.entries.kowalski-openclaw.config.anthropicApiKey "sk-ant-…"
+# 3. Provide an Anthropic API key.
+#    Preferred: let the plugin ask for it on first run and store it in
+#    the OS keychain via set_api_key. On headless servers or minimal VMs
+#    with no keychain backend, set ANTHROPIC_API_KEY before launching.
+export ANTHROPIC_API_KEY="sk-ant-…"
 
 # 4. (Optional) Set IG credentials for agentic login. If unset, the
 #    `login` tool returns pending_credentials so the agent can ask in chat.
@@ -159,7 +161,7 @@ The `--dangerously-force-unsafe-install` flag is required because OpenClaw's sta
 
 | Key | Required | Default |
 | --- | --- | --- |
-| `anthropicApiKey` | **yes** | — |
+| `anthropicApiKey` | no | — |
 | `browserProfileDir` | no | `~/.kowalski/browser` |
 | `scratchDir` | no | `~/.kowalski/scratch` |
 | `outputDir` | no | `~/.kowalski/output` |
@@ -170,6 +172,7 @@ The `--dangerously-force-unsafe-install` flag is required because OpenClaw's sta
 
 | Variable | Purpose |
 | --- | --- |
+| `ANTHROPIC_API_KEY` | Headless/server fallback when the OS keychain is unavailable. The resolver checks plugin config, then this env var, then the OS keychain. |
 | `IG_USERNAME`, `IG_PASSWORD` | Enable unattended use of the headless agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool returns `pending_credentials`. Credentials are never logged or passed through any LLM payload. |
 | `KOWALSKI_VISION_DETAIL` | `high` (default) or `low`. Controls Anthropic vision detail. |
 | `KOWALSKI_STORIES_MODEL` | Stories-phase navigation. Default `claude-sonnet-4-6`. |
@@ -203,7 +206,7 @@ src/
 │   └── KowalskiSession.ts          # Host-supplied session handle
 │                                   # (paths, api key, runConfig, events, abort signal)
 ├── plugin/                         # OpenClaw plugin surface
-│   ├── index.ts                    # register(api) — the 8 tools
+│   ├── index.ts                    # register(api) — the 11 tools
 │   ├── cookie-probe.ts             # Read Instagram sessionid out of Chromium cookies DB
 │   └── session-registry.ts         # Per-session event buffer for get_session_status
 ├── main/
@@ -283,7 +286,7 @@ Every model is env-overridable so you can drop Sonnet to Haiku where accuracy al
 npm install
 npx tsc --noEmit        # Typecheck
 
-npm run test:plugin     # Plugin surface — asserts 8 tools registered in order
+npm run test:plugin     # Plugin surface — asserts 11 tools registered in order
 npm run test:login      # LoginAgent against a local fake-IG fixture
                         # (scripted callLLM — no Anthropic calls)
 npm run test:extract    # Extractor agent against an existing raw/ dir

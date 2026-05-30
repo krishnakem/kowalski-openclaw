@@ -10,9 +10,10 @@ Instagram home (stories + feed) and return a markdown digest. It is a
 blocking, multi-tool workflow that typically takes 10–30 minutes and costs
 $1–3 in Anthropic API spend (worst case: ~45 min, ~$3).
 
-The plugin exposes nine tools: `start_session`, `login`,
+The plugin exposes eleven tools: `start_session`, `login`,
 `submit_verification_code`, `run_digest`, `get_session_status`,
-`reset_memory`, `reset_all`, `stop_run`, `end_session`.
+`set_api_key`, `clear_api_key`, `reset_memory`, `reset_all`,
+`stop_run`, `end_session`.
 
 ---
 
@@ -60,6 +61,24 @@ notes).
 ```
 
 `start_session` can return any of these shapes:
+
+```json
+{ "status": "pending_api_key", "message": "…" }
+```
+
+No Anthropic API key is available from OpenClaw config,
+`ANTHROPIC_API_KEY`, or the OS keychain. Ask the user for their
+Anthropic API key (it starts with `sk-ant-`), then call:
+
+```json
+{ "name": "set_api_key", "arguments": { "api_key": "sk-ant-…" } }
+```
+
+Never echo or summarize the key. If `set_api_key` fails because the OS
+keychain is unavailable, tell the user this is common on headless servers
+or minimal VMs and ask them to restart the gateway with
+`ANTHROPIC_API_KEY` set instead. After `set_api_key` succeeds, retry
+`start_session`.
 
 ```json
 { "status": "started", "session_id": "…", "triggered_by": "start_session", "message": "…" }
@@ -190,6 +209,27 @@ that response says `session_ended: true`.
 
 ## Non-digest paths
 
+### "Set my API key" / pending_api_key
+
+```json
+{ "name": "set_api_key", "arguments": { "api_key": "sk-ant-…" } }
+```
+
+Validates the key with Anthropic, stores it in the OS keychain, and keeps
+it in memory for the current gateway process. Never log or echo the key.
+If the OS keychain backend is unavailable, tell the user to set
+`ANTHROPIC_API_KEY` before launching `openclaw gateway run`.
+
+### "Clear my API key" / "Forget my Anthropic key"
+
+```json
+{ "name": "clear_api_key", "arguments": {} }
+```
+
+Clears the Anthropic API key stored in the OS keychain and forgets the
+in-memory cached key. It is idempotent. It does not clear OpenClaw plugin
+config or an `ANTHROPIC_API_KEY` env var.
+
 ### "Forget what you learned last week" / "Reset Kowalski's memory"
 
 ```json
@@ -216,12 +256,13 @@ again with `confirm: true`:
 ```
 
 This wipes the browser profile (login cookies go with it), the scratch
-dir (session memory, stop markers, run temp), and the output dir (every
-`analysis_records/<id>.json` plus every run's screenshots). It does NOT
-delete digest PDFs already written to Downloads, and it does NOT clear
-OpenClaw plugin config — the user's API key, `downloadsDir`, `userName`,
-and `location` stay put. After resetting, the next `start_session` will
-automatically begin the login flow before it can start a digest.
+dir (session memory, stop markers, run temp), the output dir (every
+`analysis_records/<id>.json` plus every run's screenshots), and the
+Anthropic API key stored in the OS keychain. It does NOT delete digest
+PDFs already written to Downloads, and it does NOT clear OpenClaw plugin
+config or an `ANTHROPIC_API_KEY` env var. After resetting, the next
+`start_session` will ask for whichever of API key and Instagram login is
+no longer available.
 
 Always ask before calling with `confirm: true`. If the user asks to
 "reset everything" or "wipe Kowalski", do the dry-run first, show them
@@ -276,7 +317,9 @@ Note: `end_session` does NOT interrupt a running digest — use
   - "Just feed" / "skip stories" → `phases: ["feed"]`
   - "Just stories" / "only stories" → `phases: ["stories"]`
 - **Every other tool** (except `reset_memory`) takes
-  `{ session_id: string }`. `submit_verification_code` also takes
+  `{ session_id: string }`. Exceptions: `set_api_key` takes
+  `{ api_key: string }`, `clear_api_key` takes `{}`, and `reset_all`
+  takes optional `{ confirm: boolean }`. `submit_verification_code` also takes
   `{ login_id: string, code?: string | null }` — `login_id` comes from
   a prior `login` pending response.
 
@@ -297,6 +340,9 @@ abort upfront if the cost or time isn't acceptable.
 
 | Trigger | What happened | How to respond |
 | --- | --- | --- |
+| `start_session` returns `pending_api_key` | No Anthropic API key is available from plugin config, `ANTHROPIC_API_KEY`, or the OS keychain. | Ask the user for their Anthropic API key, call `set_api_key`, then retry `start_session`. Never echo the key. If keychain storage fails, tell them to set `ANTHROPIC_API_KEY` before launching the gateway. |
+| `set_api_key` returns an error about the OS keychain | The host has no available keychain backend, common on headless servers or minimal VMs. | Tell the user to set `ANTHROPIC_API_KEY` in the environment and restart the gateway. |
+| `clear_api_key` succeeds | Stored keychain key and memory cache were cleared. | Confirm. If plugin config or `ANTHROPIC_API_KEY` still supplies a key, future sessions may still work. |
 | `start_session` returns `pending_credentials` | Persistent profile has no valid cookie, and no creds are available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` with the returned `session_id` and those params. If they refuse, stop the login flow politely. |
 | `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight and save the `session_id`. |
 | `login` returns `pending_credentials` | No creds available after an explicit login retry. | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, stop the login flow politely. |

@@ -1,7 +1,7 @@
 /**
  * OpenClaw plugin entrypoint for Kowalski.
  *
- * Exposes nine tools that drive the Kowalski pipeline. `start_session`
+ * Exposes eleven tools that drive the Kowalski pipeline. `start_session`
  * is the preferred entrypoint: it probes cookies, starts login if needed,
  * and starts the digest automatically once Instagram auth is verified.
  * See REFACTOR_NOTES.md for the stage-by-stage refactor history and why
@@ -33,11 +33,14 @@ import {
 } from '../main/services/LoginAgent.js';
 import { probeInstagramLogin } from './cookie-probe.js';
 import { writeDigestPdf } from './digest-pdf.js';
+import { keyStore } from './keyStore.js';
 import {
     attachEventBuffer,
     createRegistry,
     type SessionEntry,
 } from './session-registry.js';
+
+let cachedAnthropicApiKey: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Types kept local — the real @openclaw/plugin-sdk is a workspace-private
@@ -75,7 +78,7 @@ export interface PluginApi {
 }
 
 export interface PluginConfig {
-    anthropicApiKey: string;
+    anthropicApiKey?: string;
     browserProfileDir?: string;
     scratchDir?: string;
     outputDir?: string;
@@ -109,6 +112,57 @@ function jsonTextResult(payload: unknown, isError = false): AgentToolResult {
     return textResult(JSON.stringify(payload, null, 2), isError);
 }
 
+function cleanApiKey(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+}
+
+function pendingApiKeyResult(): AgentToolResult {
+    return jsonTextResult({
+        status: 'pending_api_key',
+        message:
+            'No Anthropic API key is configured. Ask the user for their Anthropic API key (starts with sk-ant-) and call set_api_key, then retry. (On a headless server with no OS keychain, set the ANTHROPIC_API_KEY env var instead.)',
+    });
+}
+
+async function validateAnthropicApiKey(apiKey: string): Promise<{ ok: true } | { ok: false; message: string }> {
+    try {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+                model: 'claude-haiku-4-5',
+                max_tokens: 1,
+                messages: [{ role: 'user', content: 'ping' }],
+            }),
+            signal: AbortSignal.timeout(30_000),
+        });
+
+        if (response.ok) return { ok: true };
+        if (response.status === 401 || response.status === 403) {
+            return {
+                ok: false,
+                message: 'Anthropic rejected the API key. Please check that it starts with sk-ant- and is active.',
+            };
+        }
+        return {
+            ok: false,
+            message: `Anthropic API key validation failed with HTTP ${response.status}. Please try again later.`,
+        };
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+            ok: false,
+            message: `Anthropic API key validation could not complete: ${msg}`,
+        };
+    }
+}
+
 function resolvePaths(config: PluginConfig): {
     browserProfileDir: string;
     scratchDir: string;
@@ -131,12 +185,7 @@ function resolvePaths(config: PluginConfig): {
 // ---------------------------------------------------------------------------
 
 export function register(api: PluginApi): () => void {
-    const config = api.pluginConfig;
-    if (!config || typeof config.anthropicApiKey !== 'string' || config.anthropicApiKey.trim() === '') {
-        throw new Error(
-            'Kowalski plugin: pluginConfig.anthropicApiKey is required and must be a non-empty string'
-        );
-    }
+    const config = api.pluginConfig ?? {};
 
     const { browserProfileDir, scratchDir, outputDir } = resolvePaths(config);
     for (const dir of [browserProfileDir, scratchDir, outputDir]) {
@@ -149,6 +198,32 @@ export function register(api: PluginApi): () => void {
         warn: (...a: unknown[]) => console.warn('[kowalski]', ...a),
         error: (...a: unknown[]) => console.error('[kowalski]', ...a),
     };
+
+    function resolveAnthropicApiKey(): string | null {
+        const fromConfig = cleanApiKey(config.anthropicApiKey);
+        if (fromConfig) {
+            cachedAnthropicApiKey = fromConfig;
+            return fromConfig;
+        }
+
+        const fromEnv = cleanApiKey(process.env.ANTHROPIC_API_KEY);
+        if (fromEnv) {
+            cachedAnthropicApiKey = fromEnv;
+            return fromEnv;
+        }
+
+        if (cachedAnthropicApiKey) {
+            return cachedAnthropicApiKey;
+        }
+
+        const fromKeychain = keyStore.get();
+        if (fromKeychain) {
+            cachedAnthropicApiKey = fromKeychain;
+            return fromKeychain;
+        }
+
+        return null;
+    }
 
     // -----------------------------------------------------------------------
     // Stage 6 — agentic login wiring.
@@ -446,6 +521,11 @@ export function register(api: PluginApi): () => void {
             additionalProperties: false,
         },
         execute: async (_callId, params) => {
+            const anthropicApiKey = resolveAnthropicApiKey();
+            if (!anthropicApiKey) {
+                return pendingApiKeyResult();
+            }
+
             const phasesRaw = params.phases;
             const phases = Array.isArray(phasesRaw)
                 ? (phasesRaw.filter(
@@ -454,7 +534,7 @@ export function register(api: PluginApi): () => void {
                 : (['stories', 'feed'] as Array<'stories' | 'feed'>);
 
             const { session, controller } = createKowalskiSession({
-                anthropicApiKey: config.anthropicApiKey,
+                anthropicApiKey,
                 browserProfileDir,
                 scratchDir,
                 outputDir,
@@ -861,6 +941,14 @@ export function register(api: PluginApi): () => void {
                             true
                         );
                     }
+                    const sessionEntry = sessions.get(entry.sessionId);
+                    if (!sessionEntry) {
+                        await cleanup();
+                        return textResult(
+                            `submit_verification_code: session ${entry.sessionId} not found. Start a new session to retry.`,
+                            true
+                        );
+                    }
                     // Resume by re-running the LoginAgent against the same
                     // page, with the code threaded into its user prompt.
                     const resumed = new LoginAgent(
@@ -869,12 +957,12 @@ export function register(api: PluginApi): () => void {
                         entry.scroll,
                         entry.collector,
                         {
-                            apiKey: sessions.get(entry.sessionId)?.session.anthropicApiKey ?? config.anthropicApiKey,
+                            apiKey: sessionEntry.session.anthropicApiKey,
                             maxDurationMs: AGENTIC_LOGIN_MAX_DURATION_MS,
                             rawDir: path.join(entry.runDir, 'raw'),
                             credentials: {
-                                username: sessions.get(entry.sessionId)?.session.runConfig.igUsername ?? '',
-                                password: sessions.get(entry.sessionId)?.session.runConfig.igPassword ?? '',
+                                username: sessionEntry.session.runConfig.igUsername ?? '',
+                                password: sessionEntry.session.runConfig.igPassword ?? '',
                             },
                             browserProfileDir,
                             verificationCode: code,
@@ -884,13 +972,6 @@ export function register(api: PluginApi): () => void {
                     const status = resumed.finaliseStatus();
                     if (status === 'success') {
                         await cleanup();
-                        const sessionEntry = sessions.get(entry.sessionId);
-                        if (!sessionEntry) {
-                            return textResult(
-                                `Logged in agentically (2FA accepted), but session ${entry.sessionId} is gone. Start a new session to run the digest.`,
-                                true
-                            );
-                        }
                         return startDigestForEntry(entry.sessionId, sessionEntry, 'submit_verification_code', {
                             logged_in: true,
                             login_status: 'success_2fa',
@@ -1100,6 +1181,73 @@ export function register(api: PluginApi): () => void {
     };
 
     // -----------------------------------------------------------------------
+    // Tool: set_api_key
+    //
+    // Validates an Anthropic API key with a minimal 1-token request, stores
+    // it in the OS keychain, and updates the module-scope cache for the
+    // current gateway process. The key is never logged or echoed.
+    // -----------------------------------------------------------------------
+    const setApiKey: PluginTool = {
+        name: 'set_api_key',
+        description:
+            'Validate and store the Anthropic API key in the OS keychain. Call when start_session returns pending_api_key. Never log or echo the key. On headless servers without an OS keychain, this may fail and the user should set ANTHROPIC_API_KEY instead.',
+        parameters: {
+            type: 'object',
+            properties: {
+                api_key: {
+                    type: 'string',
+                    description: 'Anthropic API key from the user. It usually starts with sk-ant-. Never echo this value back.',
+                },
+            },
+            required: ['api_key'],
+            additionalProperties: false,
+        },
+        execute: async (_callId, params) => {
+            const apiKey = cleanApiKey(params.api_key);
+            if (!apiKey) {
+                return textResult('set_api_key: api_key is required.', true);
+            }
+
+            const validation = await validateAnthropicApiKey(apiKey);
+            if (!validation.ok) {
+                return textResult(validation.message, true);
+            }
+
+            try {
+                keyStore.set(apiKey);
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                return textResult(`set_api_key failed: ${msg}`, true);
+            }
+
+            cachedAnthropicApiKey = apiKey;
+            return textResult('Anthropic API key validated and stored in the OS keychain. You can retry start_session now.');
+        },
+    };
+
+    // -----------------------------------------------------------------------
+    // Tool: clear_api_key
+    //
+    // Clears the stored OS-keychain key and drops the in-memory cache. This
+    // does not mutate OpenClaw plugin config or process env vars.
+    // -----------------------------------------------------------------------
+    const clearApiKey: PluginTool = {
+        name: 'clear_api_key',
+        description:
+            'Clear the Anthropic API key stored in the OS keychain and forget the in-memory cached key. Idempotent. Does not clear OpenClaw plugin config or ANTHROPIC_API_KEY env vars.',
+        parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+        },
+        execute: async () => {
+            keyStore.clear();
+            cachedAnthropicApiKey = null;
+            return textResult('Stored Anthropic API key cleared from the OS keychain.');
+        },
+    };
+
+    // -----------------------------------------------------------------------
     // Tool: reset_memory
     //
     // Deletes the session-memory JSON under the configured scratchDir.
@@ -1142,6 +1290,7 @@ export function register(api: PluginApi): () => void {
     //   - Browser profile (cookies, cached session, saved logins)
     //   - Scratch dir     (session memory, STOP_REQUESTED markers, run temp)
     //   - Output dir      (analysis_records/, per-run screenshots)
+    //   - Stored Anthropic API key in the OS keychain
     //   - In-memory       (active sessions, pending-login browsers, usage stats)
     //
     // Does NOT touch:
@@ -1159,7 +1308,7 @@ export function register(api: PluginApi): () => void {
     const resetAll: PluginTool = {
         name: 'reset_all',
         description:
-            'Full factory reset: closes all active sessions + pending-login browsers, deletes the browser profile (login cookies included), scratch dir, and all analysis records. Requires `confirm: true` — call without it first to preview what will be wiped. Does NOT delete digest PDFs already written to Downloads, and does NOT clear plugin config (API keys, etc).',
+            'Full factory reset: closes all active sessions + pending-login browsers, deletes the browser profile (login cookies included), scratch dir, all analysis records, and the Anthropic API key stored in the OS keychain. Requires `confirm: true` — call without it first to preview what will be wiped. Does NOT delete digest PDFs already written to Downloads, and does NOT clear OpenClaw plugin config or ANTHROPIC_API_KEY env vars.',
         parameters: {
             type: 'object',
             properties: {
@@ -1189,7 +1338,8 @@ export function register(api: PluginApi): () => void {
                         `\n\n` +
                         `Active sessions that will be aborted: ${sessions.size}\n` +
                         `Pending-login browsers that will be closed: ${pendingLogins.size}\n\n` +
-                        'Will NOT touch: OpenClaw plugin config (API keys, downloadsDir, etc) or digest PDFs already in Downloads.'
+                        'Will also clear: Anthropic API key stored in the OS keychain.\n\n' +
+                        'Will NOT touch: OpenClaw plugin config, ANTHROPIC_API_KEY env vars, or digest PDFs already in Downloads.'
                 );
             }
 
@@ -1228,6 +1378,12 @@ export function register(api: PluginApi): () => void {
                 pendingLogins.delete(id);
             }
 
+            // 2a. Clear the stored key. Idempotent, and intentionally
+            // best-effort: data reset should continue even if the keychain
+            // backend is unavailable.
+            keyStore.clear();
+            cachedAnthropicApiKey = null;
+
             // 3. rm -rf the three managed dirs, then recreate empty ones
             //    so subsequent start_session calls don't ENOENT.
             const deleted: string[] = [];
@@ -1253,10 +1409,11 @@ export function register(api: PluginApi): () => void {
                 'reset_all complete.\n\n' +
                 'Deleted:\n' +
                 deleted.map((d) => `  - ${d}`).join('\n') +
+                '\n  - Anthropic API key stored in the OS keychain' +
                 (errors.length
                     ? '\n\nErrors:\n' + errors.map((e) => `  - ${e}`).join('\n')
                     : '') +
-                '\n\nNext step: call start_session. You will need to log in again (cookies are gone).';
+                '\n\nNext step: call start_session. You will need to log in again (cookies are gone), and provide an API key again unless OpenClaw config or ANTHROPIC_API_KEY still supplies one.';
 
             log.info('reset_all', { deleted: deleted.length, errors: errors.length });
             return textResult(summary, errors.length > 0);
@@ -1396,6 +1553,8 @@ export function register(api: PluginApi): () => void {
     api.registerTool(submitVerificationCode);
     api.registerTool(runDigest);
     api.registerTool(getSessionStatus);
+    api.registerTool(setApiKey);
+    api.registerTool(clearApiKey);
     api.registerTool(resetMemory);
     api.registerTool(resetAll);
     api.registerTool(stopRun);
@@ -1405,7 +1564,7 @@ export function register(api: PluginApi): () => void {
         browserProfileDir,
         scratchDir,
         outputDir,
-        tools: 9,
+        tools: 11,
         envCredentialsPresent: Boolean(envIgUsername && envIgPassword),
     });
 

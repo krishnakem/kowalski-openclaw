@@ -12,6 +12,8 @@
             "submit_verification_code",
             "run_digest",
             "get_session_status",
+            "set_api_key",
+            "clear_api_key",
             "reset_memory",
             "reset_all",
             "stop_run",
@@ -24,7 +26,7 @@
         "properties": {
             "anthropicApiKey": {
                 "type": "string",
-                "description": "Anthropic API key used for Claude calls (navigator, extractor, digest generator)."
+                "description": "Optional Anthropic API key used for Claude calls. If omitted, the plugin checks ANTHROPIC_API_KEY and then the OS keychain; set_api_key can store it at runtime."
             },
             "browserProfileDir": {
                 "type": "string",
@@ -50,7 +52,6 @@
                 "description": "User's location (city / region) — surfaced to the agents as context."
             }
         },
-        "required": ["anthropicApiKey"],
         "additionalProperties": false
     }
 }

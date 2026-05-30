@@ -8,9 +8,10 @@
  *      on both the named export and the default export.
  *   2. `register` accepts a minimal PluginApi with pluginConfig + a mock
  *      registerTool collector, and does not throw.
- *   3. All nine expected tools are registered in the expected order
+ *   3. All eleven expected tools are registered in the expected order
  *      (start_session, login, submit_verification_code, run_digest,
- *      get_session_status, reset_memory, reset_all, stop_run, end_session) with
+ *      get_session_status, set_api_key, clear_api_key, reset_memory,
+ *      reset_all, stop_run, end_session) with
  *      the expected `optional` flag (undefined for all of them).
  *   4. Each tool's `parameters` schema is a well-formed JSON-Schema-ish
  *      object (type: 'object', properties object present).
@@ -41,17 +42,20 @@ function assert(cond: unknown, msg: string): asserts cond {
 }
 
 function main(): void {
-    // Force the no-cookie/no-env branch. start_session now auto-enters
-    // login and would launch Chromium if these were set in the shell.
+    // Force the no-cookie/no-IG-credentials branch. start_session now
+    // auto-enters login and would launch Chromium if IG creds were set.
+    // Provide a fake Anthropic key through env so this smoke test does not
+    // touch the user's real OS keychain.
+    const oldAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
     const oldIgUsername = process.env.IG_USERNAME;
     const oldIgPassword = process.env.IG_PASSWORD;
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-smoketest-not-a-real-key';
     delete process.env.IG_USERNAME;
     delete process.env.IG_PASSWORD;
 
     // Sandbox paths under tmpdir so the test never touches ~/.kowalski.
     const tmpRoot = path.join(os.tmpdir(), `kowalski-plugin-smoke-${uuidv4()}`);
     const pluginConfig = {
-        anthropicApiKey: 'sk-ant-smoketest-not-a-real-key',
         browserProfileDir: path.join(tmpRoot, 'browser'),
         scratchDir: path.join(tmpRoot, 'scratch'),
         outputDir: path.join(tmpRoot, 'output'),
@@ -92,13 +96,15 @@ function main(): void {
     }
     console.log('✅ register(api) completed');
 
-    // (3) All nine tools got registered, in order, with the right `optional` flag.
+    // (3) All eleven tools got registered, in order, with the right `optional` flag.
     const expected = [
         { name: 'start_session', optional: undefined },
         { name: 'login', optional: undefined },
         { name: 'submit_verification_code', optional: undefined },
         { name: 'run_digest', optional: undefined },
         { name: 'get_session_status', optional: undefined },
+        { name: 'set_api_key', optional: undefined },
+        { name: 'clear_api_key', optional: undefined },
         { name: 'reset_memory', optional: undefined },
         { name: 'reset_all', optional: undefined },
         { name: 'stop_run', optional: undefined },
@@ -151,14 +157,17 @@ function main(): void {
             assert(first.type === 'text' && typeof first.text === 'string',
                 'execute result content[0] must be { type: "text", text }');
             const parsed = JSON.parse(first.text);
+            assert(parsed.status === 'pending_credentials',
+                `start_session without IG creds should return pending_credentials, got ${parsed.status}`);
             assert(typeof parsed.session_id === 'string' && parsed.session_id.length > 0,
                 'start_session result missing session_id');
-            assert('logged_in' in parsed, 'start_session result missing logged_in');
             assert(typeof parsed.message === 'string', 'start_session result missing message');
-            console.log('✅ start_session returns { content:[{type:"text",text:<json>}] }');
+            console.log('✅ start_session without IG creds returns pending_credentials');
 
             // Teardown — and also clean up the tmp dirs so repeat runs stay clean.
             teardown?.();
+            if (oldAnthropicApiKey !== undefined) process.env.ANTHROPIC_API_KEY = oldAnthropicApiKey;
+            else delete process.env.ANTHROPIC_API_KEY;
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;
             if (oldIgPassword !== undefined) process.env.IG_PASSWORD = oldIgPassword;
             try {
@@ -171,6 +180,8 @@ function main(): void {
             process.exit(0);
         })
         .catch((err) => {
+            if (oldAnthropicApiKey !== undefined) process.env.ANTHROPIC_API_KEY = oldAnthropicApiKey;
+            else delete process.env.ANTHROPIC_API_KEY;
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;
             if (oldIgPassword !== undefined) process.env.IG_PASSWORD = oldIgPassword;
             fail(`start_session.execute threw: ${err instanceof Error ? err.message : String(err)}`);
