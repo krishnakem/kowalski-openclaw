@@ -15,17 +15,19 @@ import { ScrapedSession, ExtractedPost, GeneratorConfig } from '../../types/inst
 import { AnalysisObject } from '../../types/analysis.js';
 import { UsageService } from './UsageService.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
+import type { InferenceClient } from './Inference.js';
+import { inferenceUsageToTokenUsage } from './Inference.js';
 
 // Token management constants
 const MAX_CAPTION_LENGTH = 280;  // Tweet-length limit per caption
-const MAX_TOTAL_CONTENT_CHARS = 8000;  // Safe for Claude context
+const MAX_TOTAL_CONTENT_CHARS = 8000;  // Conservative context budget.
 
 export class AnalysisGenerator {
-    private apiKey: string;
+    private inferenceClient: InferenceClient;
     private usageService: UsageService;
 
-    constructor(apiKey: string) {
-        this.apiKey = apiKey;
+    constructor(inferenceClient: InferenceClient) {
+        this.inferenceClient = inferenceClient;
         this.usageService = UsageService.getInstance();
     }
 
@@ -42,7 +44,7 @@ export class AnalysisGenerator {
         // 1. Prepare content summary for LLM (with truncation)
         const contentSummary = this.prepareContentSummary(session);
 
-        // 2. Generate analysis via Claude
+        // 2. Generate analysis via OpenClaw runtime
         const analysis = await this.callGenerationAPI(contentSummary, config);
 
         // 3. Enrich with metadata
@@ -154,7 +156,7 @@ ${posts.join('\n\n')}`;
     }
 
     /**
-     * Call Claude to generate the newspaper-style analysis.
+     * Call the configured model provider to generate the newspaper-style analysis.
      * Uses Smart Brevity format with bullet points and insider context.
      */
     private async callGenerationAPI(
@@ -282,39 +284,24 @@ Return valid JSON:
     ]
 }`;
 
-        console.log('🤖 Generating analysis with Claude...');
+        console.log('🤖 Generating analysis...');
 
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': this.apiKey,
-                'anthropic-version': '2023-06-01'
-            },
-            body: JSON.stringify({
-                model: ModelConfig.analysis,
-                messages: [{ role: 'user', content: prompt }],
-                max_tokens: 16384
-            })
+        const result = await this.inferenceClient.complete({
+            model: ModelConfig.analysis,
+            prompt,
+            maxTokens: 16384,
+            purpose: 'Kowalski analysis generation',
+            expectJson: true,
         });
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            console.error('❌ Generation API error:', errorData);
-            throw new Error('GENERATION_FAILED');
-        }
-
-        const data = await response.json();
-
         // Track usage
-        if (data.usage) {
-            await this.usageService.incrementUsage(data.usage);
-            const totalTokens = (data.usage.input_tokens || 0) + (data.usage.output_tokens || 0);
+        if (result.usage) {
+            await this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
+            const totalTokens = (result.usage.inputTokens || 0) + (result.usage.outputTokens || 0);
             console.log(`💰 Generation cost tracked: ${totalTokens} tokens`);
         }
 
-        const contentBlocks = data.content as Array<{ type: string; text?: string }> | undefined;
-        const content = contentBlocks?.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('') || '';
+        const content = result.text;
 
         if (!content) {
             throw new Error('GENERATION_FAILED');

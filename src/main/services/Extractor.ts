@@ -20,7 +20,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ModelConfig } from '../../shared/modelConfig.js';
 import { UsageService } from './UsageService.js';
-import { isCreditsDepletedError, CREDITS_DEPLETED_ERROR } from './NetworkMonitor.js';
+import type { InferenceClient } from './Inference.js';
+import { inferenceUsageToTokenUsage } from './Inference.js';
 import { ExtractionBlock, ExtractionContentType, ExtractionUsefulness, ExtractionSkipReason } from '../../types/instagram.js';
 
 export interface ExtractorStats {
@@ -39,7 +40,7 @@ const VALID_SKIP_REASONS: Exclude<ExtractionSkipReason, null>[] = [
 
 export class Extractor {
     private rawDir: string;
-    private apiKey: string;
+    private inferenceClient: InferenceClient;
     private processed = new Set<string>();
     private running = false;
     private extracted = 0;
@@ -49,9 +50,9 @@ export class Extractor {
     private usageService: UsageService;
     private runSignal?: AbortSignal;
 
-    constructor(rawDir: string, apiKey: string, runSignal?: AbortSignal) {
+    constructor(rawDir: string, inferenceClient: InferenceClient, runSignal?: AbortSignal) {
         this.rawDir = rawDir;
-        this.apiKey = apiKey;
+        this.inferenceClient = inferenceClient;
         this.usageService = UsageService.getInstance();
         this.runSignal = runSignal;
     }
@@ -126,8 +127,7 @@ export class Extractor {
 
         try {
             const buffer = fs.readFileSync(filepath);
-            const base64 = buffer.toString('base64');
-            const extraction = await this.callExtractorLLM(base64);
+            const extraction = await this.callExtractorLLM(buffer);
 
             // Merge into existing sidecar (preserving turn/phase/timestamp/agent fields)
             let sidecar: Record<string, unknown> = {};
@@ -153,12 +153,6 @@ export class Extractor {
                 console.log(`  🧠 ✓ ${filename}: ${handle} — ${summary}`);
             }
         } catch (error) {
-            // Credit exhaustion must abort the whole run — don't fall back,
-            // don't continue the watcher loop.
-            if (error instanceof Error && error.message === CREDITS_DEPLETED_ERROR) {
-                this.running = false;
-                throw error;
-            }
             // Fail open: write a minimal extraction block so downstream still sees the image
             this.failed++;
             console.warn(`  🧠 ⚠️ ${filename}: extraction failed —`, error);
@@ -191,7 +185,7 @@ export class Extractor {
      * Call the vision LLM to extract structured content.
      * Uses the dedicated extraction model (Sonnet) — small overlay text demands fidelity.
      */
-    private async callExtractorLLM(base64Image: string): Promise<ExtractionBlock> {
+    private async callExtractorLLM(image: Buffer): Promise<ExtractionBlock> {
         const maxRetries = 4;
 
         for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -201,66 +195,23 @@ export class Extractor {
                 : attemptTimeout;
 
             try {
-                const response = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': this.apiKey,
-                        'anthropic-version': '2023-06-01'
-                    },
-                    body: JSON.stringify({
-                        model: ModelConfig.extraction,
-                        max_tokens: 800,
-                        messages: [{
-                            role: 'user',
-                            content: [
-                                {
-                                    type: 'image',
-                                    source: {
-                                        type: 'base64',
-                                        media_type: 'image/jpeg',
-                                        data: base64Image
-                                    }
-                                },
-                                { type: 'text', text: this.buildExtractionPrompt() }
-                            ]
-                        }]
-                    }),
-                    signal
+                const result = await this.inferenceClient.complete({
+                    model: ModelConfig.extraction,
+                    prompt: this.buildExtractionPrompt(),
+                    images: [{ buffer: image, mime: 'image/jpeg', label: 'capture' }],
+                    maxTokens: 800,
+                    signal,
+                    timeoutMs: 60_000,
+                    purpose: 'Kowalski extraction',
+                    expectJson: true,
                 });
 
-                if ((response.status === 529 || response.status === 429) && attempt < maxRetries - 1) {
-                    const baseDelay = response.status === 429 ? 10000 : 5000;
-                    const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
-                    const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
-                    const delay = Math.round(backoff + jitter);
-                    console.warn(`  🧠 ⏳ Extractor LLM ${response.status} (attempt ${attempt + 1}/${maxRetries - 1}). Retrying in ${(delay / 1000).toFixed(1)}s...`);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                    continue;
+                if (result.usage) {
+                    this.tokensUsed += (result.usage.inputTokens || 0) + (result.usage.outputTokens || 0);
+                    this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
                 }
 
-                if (!response.ok) {
-                    const errText = await response.text().catch(() => '');
-                    if (isCreditsDepletedError(response.status, errText)) {
-                        throw new Error(CREDITS_DEPLETED_ERROR);
-                    }
-                    throw new Error(`Extractor LLM HTTP ${response.status}`);
-                }
-
-                const data = await response.json() as any;
-
-                if (data.usage) {
-                    this.tokensUsed += (data.usage.input_tokens || 0) + (data.usage.output_tokens || 0);
-                    this.usageService.incrementUsage({
-                        input_tokens: data.usage.input_tokens || 0,
-                        output_tokens: data.usage.output_tokens || 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0
-                    });
-                }
-
-                const text: string = data.content?.[0]?.text || '';
-                return this.parseExtractionResponse(text);
+                return this.parseExtractionResponse(result.text);
             } catch (err) {
                 // The run is shutting down intentionally (stop/timeout/offline
                 // abort). Do not misclassify that as a transient network error
@@ -268,10 +219,15 @@ export class Extractor {
                 if (this.runSignal?.aborted) {
                     throw err;
                 }
-                // Credit exhaustion is unrecoverable — re-throw immediately
-                // so it bubbles to RunManager for the UI to handle.
-                if (err instanceof Error && err.message === CREDITS_DEPLETED_ERROR) {
-                    throw err;
+                const status = (err as { status?: number }).status;
+                if ((status === 529 || status === 429) && attempt < maxRetries - 1) {
+                    const baseDelay = status === 429 ? 10000 : 5000;
+                    const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
+                    const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
+                    const delay = Math.round(backoff + jitter);
+                    console.warn(`  🧠 ⏳ Extractor LLM ${status} (attempt ${attempt + 1}/${maxRetries - 1}). Retrying in ${(delay / 1000).toFixed(1)}s...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
                 }
                 if (attempt < maxRetries - 1) {
                     const delay = 5000 * Math.pow(2, attempt);

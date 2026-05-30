@@ -18,7 +18,8 @@ import { dirname, join } from 'node:path';
 import { GhostMouse } from './GhostMouse.js';
 import { HumanScroll } from './HumanScroll.js';
 import { ScreenshotCollector } from './ScreenshotCollector.js';
-import { isOnline, isNetworkError, isCreditsDepletedError, OFFLINE_ERROR, CREDITS_DEPLETED_ERROR } from './NetworkMonitor.js';
+import { isOnline, isNetworkError, OFFLINE_ERROR } from './NetworkMonitor.js';
+import type { InferenceClient, InferenceMessage } from './Inference.js';
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -55,7 +56,7 @@ export interface ActionHistoryEntry {
 }
 
 export interface BaseAgentConfig {
-    apiKey: string;
+    inferenceClient: InferenceClient;
     maxDurationMs: number;
     debugMode?: boolean;
     sessionMemoryDigest?: string;
@@ -727,9 +728,8 @@ export abstract class BaseVisionAgent {
     protected async callLLM(screenshot: Buffer, remainingMs: number): Promise<VisionAction> {
         const systemPrompt = this.getSystemPrompt();
         const userPrompt = this.buildUserPrompt(remainingMs);
-        const visionDetail = process.env.KOWALSKI_VISION_DETAIL || 'high';
 
-        const messages: Array<Record<string, unknown>> = [];
+        const messages: InferenceMessage[] = [];
 
         // Inject reference images on first turn
         if (!this.referenceImagesSent && this.referenceImages && this.referenceImages.length > 0) {
@@ -739,7 +739,7 @@ export abstract class BaseVisionAgent {
             for (const ref of this.referenceImages) {
                 refContent.push({
                     type: 'image',
-                    source: this.dataUrlToAnthropicSource(ref.base64)
+                    source: this.dataUrlToImageSource(ref.base64)
                 });
                 refContent.push({
                     type: 'text',
@@ -753,7 +753,7 @@ export abstract class BaseVisionAgent {
                     type: 'text',
                     text: `These are step-by-step instructions for how to handle ${folder.toLowerCase()} on Instagram. The images are numbered — follow them in sequence. Read the annotations in each image carefully.`
                 });
-                messages.push({ role: 'user', content: refContent });
+                messages.push({ role: 'user', content: refContent as any });
                 const summary = this.getWorkflowSummary();
                 messages.push({
                     role: 'assistant',
@@ -766,27 +766,21 @@ export abstract class BaseVisionAgent {
         }
 
         // Current turn: live screenshot + context
+        const currentContent = [
+            {
+                type: 'image',
+                source: {
+                    type: 'base64',
+                    media_type: 'image/jpeg',
+                    data: screenshot.toString('base64')
+                }
+            },
+            { type: 'text', text: userPrompt }
+        ];
         messages.push({
             role: 'user',
-            content: [
-                {
-                    type: 'image',
-                    source: {
-                        type: 'base64',
-                        media_type: 'image/jpeg',
-                        data: screenshot.toString('base64')
-                    }
-                },
-                { type: 'text', text: userPrompt }
-            ]
+            content: currentContent as any
         });
-
-        const requestBody: Record<string, unknown> = {
-            model: this.getModel(),
-            system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-            messages,
-            max_tokens: this.getMaxTokens(),
-        };
 
         // Attempt LLM call with exponential backoff
         const maxRetries = 4;
@@ -797,58 +791,32 @@ export abstract class BaseVisionAgent {
                 // 5 minutes — way too long when WiFi drops mid-request. The
                 // composed signal still honors run-level stop from this.abortController.
                 const perRequestTimeout = AbortSignal.timeout(20_000);
-                const response = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': this.config.apiKey,
-                        'anthropic-version': '2023-06-01',
-                        'anthropic-beta': 'prompt-caching-2024-07-31'
-                    },
-                    body: JSON.stringify(requestBody),
-                    signal: AbortSignal.any([this.abortController.signal, perRequestTimeout])
+                const result = await this.config.inferenceClient.complete({
+                    model: this.getModel(),
+                    systemPrompt,
+                    messages,
+                    images: [{ buffer: screenshot, mime: 'image/jpeg', label: 'current screenshot' }],
+                    maxTokens: this.getMaxTokens(),
+                    timeoutMs: 20_000,
+                    signal: AbortSignal.any([this.abortController.signal, perRequestTimeout]),
+                    purpose: `${this.getAgentName()} navigation`,
+                    expectJson: true,
                 });
 
-                if (!response.ok) {
-                    const errText = await response.text();
-                    console.warn(`  ⚠️ LLM API error (${response.status}): ${errText.slice(0, 200)}`);
-                    this.collector.appendLog(`  ⚠️ LLM API error (${response.status}): ${errText.slice(0, 200)}`);
-                    // Credit exhaustion is unrecoverable — fail the run now so
-                    // the UI can surface the "refill API balance" screen.
-                    if (isCreditsDepletedError(response.status, errText)) {
-                        throw new Error(CREDITS_DEPLETED_ERROR);
-                    }
-                    if ((response.status === 529 || response.status === 429) && attempt < maxRetries - 1) {
-                        const baseDelay = response.status === 429 ? 10000 : 5000;
-                        const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
-                        const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
-                        const delay = Math.round(backoff + jitter);
-                        console.log(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
-                        this.collector.appendLog(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
-                        await this.delay(delay);
-                        continue;
-                    }
-                    break;
-                }
-
-                const data = await response.json() as Record<string, unknown>;
-
-                const usage = data.usage as { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
+                const usage = result.usage;
                 if (usage) {
                     this.lastTokenUsage = {
-                        promptTokens: usage.input_tokens || 0,
-                        completionTokens: usage.output_tokens || 0
+                        promptTokens: usage.inputTokens || 0,
+                        completionTokens: usage.outputTokens || 0
                     };
-                    const cacheInfo = usage.cache_read_input_tokens
-                        ? ` (cached: ${usage.cache_read_input_tokens})`
+                    const cacheInfo = usage.cacheReadTokens
+                        ? ` (cached: ${usage.cacheReadTokens})`
                         : '';
-                    console.log(`  🧠 Tokens: ${usage.input_tokens} in${cacheInfo}, ${usage.output_tokens} out (vision:${visionDetail})`);
-                    this.collector.appendLog(`  🧠 Tokens: ${usage.input_tokens} in${cacheInfo}, ${usage.output_tokens} out (vision:${visionDetail})`);
+                    console.log(`  🧠 Tokens: ${usage.inputTokens} in${cacheInfo}, ${usage.outputTokens} out`);
+                    this.collector.appendLog(`  🧠 Tokens: ${usage.inputTokens} in${cacheInfo}, ${usage.outputTokens} out`);
                 }
 
-                const contentBlocks = data.content as Array<{ type: string; text?: string; thinking?: string }> | undefined;
-                const textBlock = contentBlocks?.find(b => b.type === 'text');
-                const content = textBlock?.text;
+                const content = result.text;
                 if (!content || typeof content !== 'string') {
                     console.warn(`  ⚠️ Empty LLM response (attempt ${attempt + 1}/${maxRetries})`);
                     this.collector.appendLog(`  ⚠️ Empty LLM response (attempt ${attempt + 1}/${maxRetries})`);
@@ -861,10 +829,16 @@ export abstract class BaseVisionAgent {
             } catch (err) {
                 if (this.stopped) break;
 
-                // Credit exhaustion thrown from the !response.ok branch above —
-                // re-throw so it propagates past Kowalski to RunManager.
-                if (err instanceof Error && err.message === CREDITS_DEPLETED_ERROR) {
-                    throw err;
+                const status = (err as { status?: number }).status;
+                if ((status === 529 || status === 429) && attempt < maxRetries - 1) {
+                    const baseDelay = status === 429 ? 10000 : 5000;
+                    const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
+                    const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
+                    const delay = Math.round(backoff + jitter);
+                    console.log(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
+                    this.collector.appendLog(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
+                    await this.delay(delay);
+                    continue;
                 }
 
                 console.warn(`  ⚠️ LLM call/parse error (attempt ${attempt + 1}/${maxRetries}):`, err);
@@ -896,7 +870,7 @@ export abstract class BaseVisionAgent {
         return capabilitiesPrompt + '\n\n' + this.getInstructionPrompt();
     }
 
-    private dataUrlToAnthropicSource(dataUrl: string): { type: 'base64'; media_type: string; data: string } {
+    private dataUrlToImageSource(dataUrl: string): { type: 'base64'; media_type: string; data: string } {
         const match = dataUrl.match(/^data:(image\/[^;]+);base64,(.+)$/);
         if (!match) {
             return { type: 'base64', media_type: 'image/jpeg', data: dataUrl };

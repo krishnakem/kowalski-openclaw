@@ -6,14 +6,15 @@ interface UsageData {
     lastResetDate: string; // ISO String
 }
 
-interface AnthropicTokenUsage {
+interface TokenUsage {
     input_tokens: number;
     output_tokens: number;
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
 }
 
-// Claude Opus 4.6 pricing
+// Conservative default token-cost estimate. OpenClaw may report provider cost
+// directly; this fallback keeps the historical usage accumulator useful.
 const MODEL_RATES = {
     INPUT_TOKEN: 0.000015,        // $15.00 / 1M tokens
     CACHED_INPUT_TOKEN: 0.0000015, // $1.50 / 1M tokens (cache read)
@@ -150,7 +151,7 @@ export class UsageService {
     /**
      * Adds actual API usage to the accumulator.
      */
-    public async incrementUsage(usage: AnthropicTokenUsage): Promise<number> {
+    public async incrementUsage(usage: TokenUsage): Promise<number> {
         const cached = usage.cache_read_input_tokens || 0;
         const regularInput = Math.max(0, usage.input_tokens - cached);
         const output = usage.output_tokens || 0;

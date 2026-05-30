@@ -5,7 +5,7 @@ import { BrowserManager } from './BrowserManager.js';
 import { Kowalski } from './Kowalski.js';
 import { DigestGeneration } from './DigestGeneration.js';
 import { Extractor } from './Extractor.js';
-import { isOnline, isNetworkError, startOfflineWatchdog, OFFLINE_ERROR, CREDITS_DEPLETED_ERROR } from './NetworkMonitor.js';
+import { isOnline, isNetworkError, startOfflineWatchdog, OFFLINE_ERROR } from './NetworkMonitor.js';
 import { CapturedPost, ExtractionBlock } from '../../types/instagram.js';
 import type { KowalskiSession } from '../../core/KowalskiSession.js';
 
@@ -187,7 +187,7 @@ export class RunManager {
         const phases = options?.phases ?? session.runConfig.phases ?? ['stories', 'feed'];
         console.log(`🚀 Run started (phases: ${phases.join(', ')})`);
 
-        // Background watchdog: probes Anthropic every 1s and trips notifyOffline
+        // Background watchdog: probes generic connectivity every 1s and trips notifyOffline
         // after three consecutive failures (~1-3s to detect a real outage).
         // Three-strike threshold guards against a single dropped probe while
         // still firing well before fetch retry loops burn attempts.
@@ -230,16 +230,10 @@ export class RunManager {
             // 1. Settings come from the session config (the host owns durable storage).
             const settings = session.runConfig;
 
-            // 2. API key comes from the session.
-            const apiKey = session.anthropicApiKey;
-            if (!apiKey) {
-                console.error('🚀 Run: NO API KEY');
-                this.emitError('API key not found.');
-                this.finishRun();
-                return null;
-            }
+            // 2. Model calls go through the session inference client.
+            const inferenceClient = session.inferenceClient;
 
-            // 2a. Pre-flight: confirm we can reach Anthropic before spending minutes
+            // 2a. Pre-flight: confirm we have network before spending minutes
             // in the browser. The browse phase doesn't hit the API directly, but
             // every extraction and the digest do — and the retry loops inside
             // those services will burn attempts if the network is actually down.
@@ -274,8 +268,8 @@ export class RunManager {
             // 6. Start extractor agents in background — one vision call per raw image,
             // result merged into the existing sidecar JSON in place. No filtered/ dir.
             console.log('🚀 Starting extractor agents...');
-            const storiesExtractor = new Extractor(rawStoriesDir, apiKey, this.runAbortController.signal);
-            const feedExtractor = new Extractor(rawFeedDir, apiKey, this.runAbortController.signal);
+            const storiesExtractor = new Extractor(rawStoriesDir, inferenceClient, this.runAbortController.signal);
+            const feedExtractor = new Extractor(rawFeedDir, inferenceClient, this.runAbortController.signal);
             this.activeExtractors = [storiesExtractor, feedExtractor];
             const storiesExtractorPromise = storiesExtractor.start();
             const feedExtractorPromise = feedExtractor.start();
@@ -284,7 +278,7 @@ export class RunManager {
             console.log('🚀 Browsing Instagram...');
             const scraper = new Kowalski(
                 context,
-                apiKey,
+                inferenceClient,
                 false,
                 path.join(session.scratchDir, 'session_memory', 'summaries.json')
             );
@@ -375,7 +369,7 @@ export class RunManager {
                 throw new Error(OFFLINE_ERROR);
             }
             console.log('🚀 Generating digest...');
-            const digestGenerator = new DigestGeneration(apiKey);
+            const digestGenerator = new DigestGeneration(inferenceClient);
             const analysis = await digestGenerator.generateDigest(bestCaptures, {
                 userName: settings.userName || 'User',
                 location: settings.location || ''
@@ -461,8 +455,7 @@ export class RunManager {
             console.log(`🚀 Run complete! Extracted: ${totalExtracted}, Skipped: ${totalSkipped}, Failed: ${totalFailed}`);
 
             // The host is responsible for durable storage of `record` +
-            // `metadata`. RunManager used to write both to electron-store; now
-            // it returns them and the host decides.
+            // `metadata`; RunManager returns both and the host decides.
             this.finishRun();
             return {
                 record: newRecord,
@@ -485,17 +478,13 @@ export class RunManager {
                 await browserManager.close();
             }
 
-            // Classify the failure. Three distinct kinds flow to the UI:
-            //   - credits: Anthropic returned credit_balance_too_low
+            // Classify the failure. Two distinct kinds flow to the UI:
             //   - offline: pre-flight OFFLINE, watchdog tripped, or a
             //       network-layer error surfaced from a fetch
             //   - general: anything else (rendered as a log-only for now)
-            const creditsDepleted = error?.message === CREDITS_DEPLETED_ERROR;
-            const offline = !creditsDepleted && (this.offlineDetected || error?.message === OFFLINE_ERROR || isNetworkError(error));
+            const offline = this.offlineDetected || error?.message === OFFLINE_ERROR || isNetworkError(error);
             if (!this.offlineDetected) {
-                if (creditsDepleted) {
-                    this.emitError('Please refill your API Balance', 'credits');
-                } else if (offline) {
+                if (offline) {
                     this.emitError('Network connection lost', 'offline');
                 } else {
                     this.emitError(`Run failed: ${error.message}`, 'general');
@@ -660,7 +649,7 @@ export class RunManager {
         if (bestCaptures.length === 0) return null;
 
         const counts = this.countCaptureQuality(bestCaptures);
-        const digestGenerator = new DigestGeneration(session.anthropicApiKey);
+        const digestGenerator = new DigestGeneration(session.inferenceClient);
         const digestController = new AbortController();
         const digestSignal = AbortSignal.any([
             digestController.signal,

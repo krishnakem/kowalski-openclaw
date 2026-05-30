@@ -1,10 +1,10 @@
 # Kowalski — OpenClaw plugin
 
-Kowalski is an [OpenClaw](https://openclaw.ai) plugin that captures your Instagram stories + feed and returns a markdown digest. You ask your OpenClaw agent _"what's happening on my feed today?"_, it triggers this plugin, the plugin drives Chromium + Claude vision agents through your home page, and you get back a readable summary instead of having to scroll.
+Kowalski is an [OpenClaw](https://openclaw.ai) plugin that captures your Instagram stories + feed and returns a markdown digest. You ask your OpenClaw agent _"what's happening on my feed today?"_, it triggers this plugin, the plugin drives Chromium + OpenClaw's configured model provider through your home page, and you get back a readable summary instead of having to scroll.
 
 The heavy lifting is all local — real Playwright-controlled Chromium against a real session cookie, vision-agent loops at every step (login, stories, feed), structured extraction per capture, and finally a text-only digest writer. No scraping, no undocumented APIs, just a browser driven by a model.
 
-> **Status — refactor complete.** This repo started as a standalone Electron desktop app and was refactored through six stages into a pure OpenClaw plugin. The Electron shell / React UI / IPC layer are gone; only the Playwright + Claude pipeline remains, wired to an OpenClaw `register(api)` entrypoint. See [REFACTOR_NOTES.md](REFACTOR_NOTES.md) for the full stage-by-stage history, including architectural trade-offs and known risks.
+> **Status — OpenClaw-native.** Kowalski is now a pure OpenClaw plugin: Playwright browser automation plus model calls routed through `api.runtime`, wired to an OpenClaw `register(api)` entrypoint. See [REFACTOR_NOTES.md](REFACTOR_NOTES.md) for the full refactor history, architectural trade-offs, and known risks.
 
 ---
 
@@ -33,10 +33,8 @@ The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md
 | `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts `run_digest` automatically. |
 | `run_digest` | Manually start the non-blocking stories + feed capture, extraction, and digest generation run. Normally `start_session` or successful login starts this for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
 | `get_session_status` | Latest run phase + the last ~20 pipeline events. Also delivers the final digest once `digest_status` is `completed` or `stopped`. |
-| `set_api_key` | Validate an Anthropic API key and store it in the OS keychain via `@napi-rs/keyring`. |
-| `clear_api_key` | Clear the stored keychain API key and in-memory cache. Idempotent. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
-| `reset_all` | Dry-run-first factory reset for browser profile, scratch data, output records, and the stored keychain API key. Requires `confirm: true` to actually wipe. |
+| `reset_all` | Dry-run-first factory reset for browser profile, scratch data, and output records. Requires `confirm: true` to actually wipe. |
 | `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
@@ -46,20 +44,20 @@ The canonical happy-path call chain for a digest ask is now just `start_session 
 
 ## Architecture
 
-Kowalski is structured as a **four-stage pipeline of vision agents**, all sharing the same `BaseVisionAgent` abstract class (observe → label elements → ask Claude → execute action → repeat). Agents communicate through the filesystem, not in-memory state, so a slow or stuck stage never blocks another.
+Kowalski is structured as a **four-stage pipeline of vision agents**, all sharing the same `BaseVisionAgent` abstract class (observe → label elements → ask OpenClaw runtime → execute action → repeat). Agents communicate through the filesystem, not in-memory state, so a slow or stuck stage never blocks another.
 
 ```
         ┌──────────────────────────────────────────────────────────────────┐
         │  OpenClaw agent (in chat)                                        │
         │    ↓ calls tools                                                 │
-        │  src/plugin/index.ts  ──────────  registers 11 tools             │
+        │  src/plugin/index.ts  ──────────  registers 9 tools              │
         └──────────────────────────┬───────────────────────────────────────┘
                                    │ (session_id + runConfig)
                                    ▼
             ┌─────────────────────────────────────────────────┐
             │  KowalskiSession  (src/core/KowalskiSession.ts) │
             │    scratchDir, outputDir, browserProfileDir,    │
-            │    anthropicApiKey, runConfig, events, abort    │
+            │    inferenceClient, runConfig, events, abort    │
             └─────────────────────────────────────────────────┘
                                    │
         ┌──────────────────────────┼───────────────────────────────────────┐
@@ -85,9 +83,9 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
 
 Pieces worth calling out:
 
-- **[BaseVisionAgent](src/main/services/BaseVisionAgent.ts)** — abstract superclass shared by `LoginAgent`, `StoriesAgent`, `FeedAgent`. Handles screenshot capture, element labelling (Set-of-Mark overlay), Claude API calls with prompt caching, action dispatch, reference-image injection, and per-turn debug dumps.
+- **[BaseVisionAgent](src/main/services/BaseVisionAgent.ts)** — abstract superclass shared by `LoginAgent`, `StoriesAgent`, `FeedAgent`. Handles screenshot capture, element labelling (Set-of-Mark overlay), OpenClaw runtime model calls, action dispatch, reference-image injection, and per-turn debug dumps.
 - **[elementLabeler](src/utils/elementLabeler.ts)** — draws numbered badges over interactive elements on the screenshot server-side (Jimp). No DOM injection, so it doesn't trip Instagram's bot checks.
-- **[BrowserManager](src/main/services/BrowserManager.ts)** — singleton, always headless, `playwright-extra` + stealth plugin, stealth init scripts applied on every context.
+- **[BrowserManager](src/main/services/BrowserManager.ts)** — singleton, always headless, launches the plugin-local Playwright Chromium with an explicit `executablePath`, and applies stealth init scripts on every context. It does not fall back to system Chrome or a user-level Playwright cache.
 - **[GhostMouse](src/main/services/GhostMouse.ts)** + **[HumanScroll](src/main/services/HumanScroll.ts)** — human-rhythm input. Direct `page.mouse` calls; CDP for scroll-position reads so state queries don't show up as `page.evaluate` injections.
 - **[RunManager](src/main/services/RunManager.ts)** — run lifecycle. Offline watchdog (3-strike), per-phase hard timeouts, cooperative stop via `STOP_REQUESTED` marker file, partial-record writes on abort.
 - **[SessionMemory](src/main/services/SessionMemory.ts)** — cross-session digest of which accounts / phases / recoveries worked. Read into the next run's navigator context.
@@ -123,33 +121,28 @@ The plugin is loaded directly from this repo as a live-linked plugin — no buil
 # 1. Install the OpenClaw gateway if you haven't already (user-level, no sudo).
 npm install -g openclaw
 
-# 2. One-time setup wizard. Pick Gateway mode. In the Agent section,
-#    pick Anthropic as the provider and claude-sonnet-4-6 as the model.
+# 2. One-time setup wizard. Pick Gateway mode and configure a provider/model.
+#    Kowalski defaults to OpenClaw's configured provider and needs a
+#    vision-capable image model for screenshots.
 openclaw configure
 
-# 3. Provide an Anthropic API key.
-#    Preferred: let the plugin ask for it on first run and store it in
-#    the OS keychain via set_api_key. On headless servers or minimal VMs
-#    with no keychain backend, set ANTHROPIC_API_KEY before launching.
-export ANTHROPIC_API_KEY="sk-ant-…"
-
-# 4. (Optional) Set IG credentials for agentic login. If unset, the
+# 3. (Optional) Set IG credentials for agentic login. If unset, the
 #    `login` tool returns pending_credentials so the agent can ask in chat.
 export IG_USERNAME="your.instagram.handle"
 export IG_PASSWORD="your.password"
 
-# 5. Install this repo as a live-linked plugin. --link symlinks the
+# 4. Install this repo as a live-linked plugin. --link symlinks the
 #    working tree so edits show up on the next gateway restart.
 openclaw plugins install /absolute/path/to/Kowalski-OpenClaw \
   --link \
   --dangerously-force-unsafe-install
 
-# 6. Run the gateway, then attach the TUI in another shell.
+# 5. Run the gateway, then attach the TUI in another shell.
 openclaw gateway run
 openclaw tui
 ```
 
-The `--dangerously-force-unsafe-install` flag is required because OpenClaw's static scanner flags three `process.env.*` reads near LLM calls as potential "credential harvesting" false positives. All three reads are a vision-detail feature flag (`KOWALSKI_VISION_DETAIL`), not credentials. See [REFACTOR_NOTES.md › Stage 3.5](REFACTOR_NOTES.md) for details.
+The `--dangerously-force-unsafe-install` flag is required because OpenClaw's static scanner can flag process-env reads near model-call paths as potential "credential harvesting" false positives. Kowalski reads environment variables only for optional runtime controls and Instagram login convenience; model credentials come from OpenClaw's configured provider.
 
 **Gateway reloads are NOT automatic.** After editing plugin code, `Ctrl-C` the `openclaw gateway run` process and start it again. `--link` only means source edits in this repo are picked up on the next boot — the gateway itself doesn't hot-reload.
 
@@ -161,20 +154,23 @@ The `--dangerously-force-unsafe-install` flag is required because OpenClaw's sta
 
 | Key | Required | Default |
 | --- | --- | --- |
-| `anthropicApiKey` | no | — |
 | `browserProfileDir` | no | `~/.kowalski/browser` |
 | `scratchDir` | no | `~/.kowalski/scratch` |
 | `outputDir` | no | `~/.kowalski/output` |
 | `userName` | no | — |
 | `location` | no | — |
 
+All model calls use OpenClaw's configured provider through `api.runtime`.
+Kowalski requires a vision-capable image model. If screenshots cannot be
+understood, configure `agents.defaults.imageModel` to a model with image input
+support.
+
 ### Environment variables
 
 | Variable | Purpose |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | Headless/server fallback when the OS keychain is unavailable. The resolver checks plugin config, then this env var, then the OS keychain. |
 | `IG_USERNAME`, `IG_PASSWORD` | Enable unattended use of the headless agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool returns `pending_credentials`. Credentials are never logged or passed through any LLM payload. |
-| `KOWALSKI_VISION_DETAIL` | `high` (default) or `low`. Controls Anthropic vision detail. |
+| `KOWALSKI_CONNECTIVITY_PROBE_URL` | Optional URL for the generic offline watchdog probe. Defaults to `https://www.gstatic.com/generate_204`. |
 | `KOWALSKI_STORIES_MODEL` | Stories-phase navigation. Default `claude-sonnet-4-6`. |
 | `KOWALSKI_NAV_MODEL` | Feed-phase navigation. Default `claude-sonnet-4-6`. |
 | `KOWALSKI_SPECIALIST_MODEL` | Carousel / stuck recovery. Default `claude-sonnet-4-6`. |
@@ -204,13 +200,12 @@ Model defaults live in [src/shared/modelConfig.ts](src/shared/modelConfig.ts).
 src/
 ├── core/
 │   └── KowalskiSession.ts          # Host-supplied session handle
-│                                   # (paths, api key, runConfig, events, abort signal)
+│                                   # (paths, inference client, runConfig, events, abort signal)
 ├── plugin/                         # OpenClaw plugin surface
-│   ├── index.ts                    # register(api) — the 11 tools
+│   ├── index.ts                    # register(api) — the 9 tools
 │   ├── cookie-probe.ts             # Read Instagram sessionid out of Chromium cookies DB
 │   └── session-registry.ts         # Per-session event buffer for get_session_status
 ├── main/
-│   ├── main.ts                     # Legacy Electron entry, gutted (breadcrumb only)
 │   ├── prompts/                    # Markdown prompts shipped to the agents
 │   │   ├── capabilities.md
 │   │   ├── navigator-agent.md
@@ -219,14 +214,14 @@ src/
 │   │   ├── login-instructions.md   # Stage 6 — scene list + login actions
 │   │   └── examples/               # Reference screenshots per phase
 │   └── services/
-│       ├── BaseVisionAgent.ts      # Abstract observe→label→Claude→act loop
+│       ├── BaseVisionAgent.ts      # Abstract observe→label→model→act loop
 │       ├── LoginAgent.ts           # Stage 6 — agentic IG login
 │       ├── StoriesAgent.ts         # Phase 1 — stories viewer
 │       ├── FeedAgent.ts            # Phase 2 — feed + post modals + carousels
 │       ├── Extractor.ts            # Phase 2.5 — per-image structured extraction
 │       ├── DigestGeneration.ts     # Phase 3 — text-only editorial
 │       ├── AnalysisGenerator.ts    # Insights pass over a digest
-│       ├── ContentVision.ts        # Shared Claude vision-call helpers
+│       ├── ContentVision.ts        # Shared vision-call helpers
 │       ├── ImageTagger.ts          # Per-image tagging utilities
 │       ├── Kowalski.ts             # Phase orchestrator (stories → feed)
 │       ├── RunManager.ts           # Singleton — lifecycle, offline, stop-marker, timeouts
@@ -265,18 +260,38 @@ skills/
 
 ## Models and costs
 
-Default model choices are centralised in [src/shared/modelConfig.ts](src/shared/modelConfig.ts):
+OpenClaw's configured gateway/provider chooses the models. Configure
+`agents.defaults.imageModel` to a vision-capable model for screenshot
+understanding. The legacy model hints in [src/shared/modelConfig.ts](src/shared/modelConfig.ts)
+are ignored by the OpenClaw inference client unless the runtime grows explicit
+model-hint support.
 
 - **Sonnet 4.6** for every vision-and-reasoning call (navigation, extraction, analysis, login).
 - **Haiku 4.5** for the text-only digest synthesis (all visual work is done upstream, so the writer runs cheap).
 
 Typical cost + duration expectations, per [SKILL.md](skills/instagram-digest/SKILL.md):
 
-- **Typical full run:** 10–30 minutes, $1–3 in Anthropic spend.
+- **Typical full run:** 10–30 minutes. Cost depends on the configured OpenClaw provider.
 - **Hard caps:** stories phase 15 min, feed phase 30 min.
 - **Worst case:** ~45 min total, ~$3.
 
 Every model is env-overridable so you can drop Sonnet to Haiku where accuracy allows — see the env-var table above.
+
+## Bundled Browser
+
+Kowalski installs its own Playwright Chromium under
+`node_modules/playwright-core/.local-browsers` and passes that executable
+path explicitly to Playwright. If the bundled browser is missing, browser
+launch fails with a repair command instead of silently using system Chrome
+or another Playwright cache.
+
+```bash
+npm run setup:browser   # install/repair the plugin-local Chromium
+npm run check:browser   # verify the executable path + revision
+```
+
+On Linux, the browser binary is bundled, but the host may still need the
+standard shared libraries that Playwright/Chromium require.
 
 ---
 
@@ -284,15 +299,15 @@ Every model is env-overridable so you can drop Sonnet to Haiku where accuracy al
 
 ```bash
 npm install
+npm run check:browser   # Confirm plugin-local Chromium exists
 npx tsc --noEmit        # Typecheck
 
-npm run test:plugin     # Plugin surface — asserts 11 tools registered in order
+npm run test:plugin     # Plugin surface — asserts 9 tools registered in order
 npm run test:login      # LoginAgent against a local fake-IG fixture
-                        # (scripted callLLM — no Anthropic calls)
-npm run test:extract    # Extractor agent against an existing raw/ dir
-npm run test:digest     # Digest generation against a set of sidecars
-npm run test:run        # Full pipeline against a real IG session
-                        # (requires logged-in profile + API key + real Anthropic cost)
+                        # (scripted callLLM — no provider calls)
+npm run test:extract    # Skips: extraction requires OpenClaw plugin runtime
+npm run test:digest     # Skips: digest generation requires OpenClaw plugin runtime
+npm run test:run        # Skips: full run requires OpenClaw plugin runtime
 ```
 
 The plugin loads TypeScript directly — the OpenClaw loader consumes `src/plugin/index.ts` with no build step and no `dist/` output. Edits to any file in this tree are picked up on the next `openclaw gateway run` boot (provided the plugin was installed with `--link`).

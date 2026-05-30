@@ -11,14 +11,15 @@ import { CapturedPost, DigestConfig, ExtractionBlock } from '../../types/instagr
 import { AnalysisObject } from '../../types/analysis.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
 import { UsageService } from './UsageService.js';
-import { isCreditsDepletedError, CREDITS_DEPLETED_ERROR } from './NetworkMonitor.js';
+import type { InferenceClient } from './Inference.js';
+import { inferenceUsageToTokenUsage } from './Inference.js';
 
 export class DigestGeneration {
-    private apiKey: string;
+    private inferenceClient: InferenceClient;
     private usageService: UsageService;
 
-    constructor(apiKey: string) {
-        this.apiKey = apiKey;
+    constructor(inferenceClient: InferenceClient) {
+        this.inferenceClient = inferenceClient;
         this.usageService = UsageService.getInstance();
     }
 
@@ -54,68 +55,53 @@ export class DigestGeneration {
         console.log(`🤖 Generating digest from ${usable.length} extractions (${captures.length - usable.length} skipped)...`);
 
         const maxRetries = 4;
-        let data: any;
+        let markdown = '';
 
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             // Bound each request at 60s — the digest can be large, but undici's
             // 5-minute default is far too long when connectivity drops.
-            const response = await fetch('https://api.anthropic.com/v1/messages', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': this.apiKey,
-                    'anthropic-version': '2023-06-01'
-                },
-                body: JSON.stringify({
+            try {
+                const result = await this.inferenceClient.complete({
                     model: ModelConfig.digest,
-                    system: systemPrompt,
-                    messages: [{
-                        role: 'user',
-                        content: userPrompt
-                    }],
-                    max_tokens: 16384
-                }),
-                signal: runSignal
-                    ? AbortSignal.any([runSignal, AbortSignal.timeout(60_000)])
-                    : AbortSignal.timeout(60_000)
-            });
+                    systemPrompt,
+                    prompt: userPrompt,
+                    maxTokens: 16384,
+                    signal: runSignal
+                        ? AbortSignal.any([runSignal, AbortSignal.timeout(60_000)])
+                        : AbortSignal.timeout(60_000),
+                    timeoutMs: 60_000,
+                    purpose: 'Kowalski digest generation',
+                });
 
-            if ((response.status === 529 || response.status === 429) && attempt < maxRetries - 1) {
-                const baseDelay = response.status === 429 ? 10000 : 5000;
-                const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
-                const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
-                const delay = Math.round(backoff + jitter);
-                console.warn(`  ⏳ Digest LLM ${response.status} (attempt ${attempt + 1}/${maxRetries - 1}). Retrying in ${(delay / 1000).toFixed(1)}s...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                continue;
-            }
-
-            if (!response.ok) {
-                const errText = await response.text().catch(() => '');
-                console.error('❌ Digest generation API error:', errText.slice(0, 300));
-                if (isCreditsDepletedError(response.status, errText)) {
-                    throw new Error(CREDITS_DEPLETED_ERROR);
+                if (result.usage) {
+                    await this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
+                    const totalTokens = (result.usage.inputTokens || 0) + (result.usage.outputTokens || 0);
+                    console.log(`💰 Digest cost tracked: ${totalTokens} tokens`);
                 }
+
+                markdown = result.text.trim();
+                break;
+            } catch (err) {
+                const status = (err as { status?: number }).status;
+                if ((status === 529 || status === 429) && attempt < maxRetries - 1) {
+                    const baseDelay = status === 429 ? 10000 : 5000;
+                    const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
+                    const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
+                    const delay = Math.round(backoff + jitter);
+                    console.warn(`  ⏳ Digest LLM ${status} (attempt ${attempt + 1}/${maxRetries - 1}). Retrying in ${(delay / 1000).toFixed(1)}s...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+
+                console.error('❌ Digest generation API error:', err);
                 throw new Error('DIGEST_GENERATION_FAILED');
             }
-
-            data = await response.json();
-            break;
         }
 
-        if (!data) {
+        if (!markdown) {
             console.error('❌ Digest generation: all retries exhausted');
             throw new Error('DIGEST_GENERATION_FAILED');
         }
-
-        if (data.usage) {
-            await this.usageService.incrementUsage(data.usage);
-            const totalTokens = (data.usage.input_tokens || 0) + (data.usage.output_tokens || 0);
-            console.log(`💰 Digest cost tracked: ${totalTokens} tokens`);
-        }
-
-        const contentBlocks = data.content as Array<{ type: string; text?: string }> | undefined;
-        const markdown = contentBlocks?.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('').trim() || '';
 
         if (!markdown) {
             throw new Error('DIGEST_GENERATION_FAILED: No content in response');

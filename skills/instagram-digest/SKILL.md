@@ -7,13 +7,17 @@ description: Run the Kowalski Instagram digest pipeline — capture stories and 
 
 This skill orchestrates the Kowalski OpenClaw plugin to capture the user's
 Instagram home (stories + feed) and return a markdown digest. It is a
-blocking, multi-tool workflow that typically takes 10–30 minutes and costs
-$1–3 in Anthropic API spend (worst case: ~45 min, ~$3).
+blocking, multi-tool workflow that typically takes 10–30 minutes. The default
+backend is OpenClaw's configured provider, so cost depends on the user's
+gateway/provider configuration.
 
-The plugin exposes eleven tools: `start_session`, `login`,
+Kowalski requires a vision-capable model. If screenshot understanding fails,
+tell the user to configure `agents.defaults.imageModel` to a model with image
+input.
+
+The plugin exposes nine tools: `start_session`, `login`,
 `submit_verification_code`, `run_digest`, `get_session_status`,
-`set_api_key`, `clear_api_key`, `reset_memory`, `reset_all`,
-`stop_run`, `end_session`.
+`reset_memory`, `reset_all`, `stop_run`, `end_session`.
 
 ---
 
@@ -61,24 +65,6 @@ notes).
 ```
 
 `start_session` can return any of these shapes:
-
-```json
-{ "status": "pending_api_key", "message": "…" }
-```
-
-No Anthropic API key is available from OpenClaw config,
-`ANTHROPIC_API_KEY`, or the OS keychain. Ask the user for their
-Anthropic API key (it starts with `sk-ant-`), then call:
-
-```json
-{ "name": "set_api_key", "arguments": { "api_key": "sk-ant-…" } }
-```
-
-Never echo or summarize the key. If `set_api_key` fails because the OS
-keychain is unavailable, tell the user this is common on headless servers
-or minimal VMs and ask them to restart the gateway with
-`ANTHROPIC_API_KEY` set instead. After `set_api_key` succeeds, retry
-`start_session`.
 
 ```json
 { "status": "started", "session_id": "…", "triggered_by": "start_session", "message": "…" }
@@ -210,27 +196,6 @@ available for inspection or explicit cleanup.
 
 ## Non-digest paths
 
-### "Set my API key" / pending_api_key
-
-```json
-{ "name": "set_api_key", "arguments": { "api_key": "sk-ant-…" } }
-```
-
-Validates the key with Anthropic, stores it in the OS keychain, and keeps
-it in memory for the current gateway process. Never log or echo the key.
-If the OS keychain backend is unavailable, tell the user to set
-`ANTHROPIC_API_KEY` before launching `openclaw gateway run`.
-
-### "Clear my API key" / "Forget my Anthropic key"
-
-```json
-{ "name": "clear_api_key", "arguments": {} }
-```
-
-Clears the Anthropic API key stored in the OS keychain and forgets the
-in-memory cached key. It is idempotent. It does not clear OpenClaw plugin
-config or an `ANTHROPIC_API_KEY` env var.
-
 ### "Forget what you learned last week" / "Reset Kowalski's memory"
 
 ```json
@@ -258,12 +223,10 @@ again with `confirm: true`:
 
 This wipes the browser profile (login cookies go with it), the scratch
 dir (session memory, stop markers, run temp), the output dir (every
-`analysis_records/<id>.json` plus every run's screenshots), and the
-Anthropic API key stored in the OS keychain. It does NOT delete digest
-PDFs already written to Downloads, and it does NOT clear OpenClaw plugin
-config or an `ANTHROPIC_API_KEY` env var. After resetting, the next
-`start_session` will ask for whichever of API key and Instagram login is
-no longer available.
+`analysis_records/<id>.json` plus every run's screenshots). It does NOT delete
+digest PDFs already written to Downloads, and it does NOT clear OpenClaw plugin
+config. After resetting, the next `start_session` will ask for Instagram login
+if the browser profile no longer has a valid cookie.
 
 Always ask before calling with `confirm: true`. If the user asks to
 "reset everything" or "wipe Kowalski", do the dry-run first, show them
@@ -329,9 +292,8 @@ Note: `end_session` does NOT interrupt a running digest — use
   - "Just stories" / "only stories" → `phases: ["stories"]`
 - **Most other tools** take `{ session_id: string }`.
   Exceptions: `stop_run` may take `{ session_id?: string }` or `{}` as
-  a global stop switch; `set_api_key` takes `{ api_key: string }`;
-  `clear_api_key` takes `{}`; and `reset_all` takes optional
-  `{ confirm: boolean }`. `submit_verification_code` also takes
+  a global stop switch, and `reset_all` takes optional `{ confirm: boolean }`.
+  `submit_verification_code` also takes
   `{ login_id: string, code?: string | null }` — `login_id` comes from
   a prior `login` pending response.
 
@@ -339,12 +301,12 @@ Note: `end_session` does NOT interrupt a running digest — use
 
 ## Cost + duration expectations
 
-- **Typical full run:** 10–30 minutes, $1–3 in Anthropic spend.
+- **Typical full run:** 10–30 minutes. Cost depends on the configured OpenClaw provider.
 - **Hard caps:** stories phase 15 min, feed phase 30 min.
 - **Worst case:** ~45 min total, ~$3.
 
-Always mention this range before calling `start_session` so the user can
-abort upfront if the cost or time isn't acceptable.
+Always mention the time range and provider-cost caveat before calling
+`start_session` so the user can abort upfront if the cost or time isn't acceptable.
 
 ---
 
@@ -352,9 +314,6 @@ abort upfront if the cost or time isn't acceptable.
 
 | Trigger | What happened | How to respond |
 | --- | --- | --- |
-| `start_session` returns `pending_api_key` | No Anthropic API key is available from plugin config, `ANTHROPIC_API_KEY`, or the OS keychain. | Ask the user for their Anthropic API key, call `set_api_key`, then retry `start_session`. Never echo the key. If keychain storage fails, tell them to set `ANTHROPIC_API_KEY` before launching the gateway. |
-| `set_api_key` returns an error about the OS keychain | The host has no available keychain backend, common on headless servers or minimal VMs. | Tell the user to set `ANTHROPIC_API_KEY` in the environment and restart the gateway. |
-| `clear_api_key` succeeds | Stored keychain key and memory cache were cleared. | Confirm. If plugin config or `ANTHROPIC_API_KEY` still supplies a key, future sessions may still work. |
 | `start_session` returns `pending_credentials` | Persistent profile has no valid cookie, and no creds are available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` with the returned `session_id` and those params. If they refuse, stop the login flow politely. |
 | `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight and save the `session_id`. |
 | `login` returns `pending_credentials` | No creds available after an explicit login retry. | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, stop the login flow politely. |
@@ -365,6 +324,7 @@ abort upfront if the cost or time isn't acceptable.
 | `submit_verification_code` returns `still pending` for device approval | User hasn't approved yet. | Ask if they saw the notification and call again with `code: null`. |
 | `submit_verification_code` returns `context_destroyed` | The pending-login browser was closed before the code was submitted (stale entry, Chromium crash, or out-of-band close). | Re-run `login` from scratch. The earlier attempt may have persisted enough cookies that Instagram skips 2FA the second time. |
 | `run_digest` error contains `"OFFLINE"` | Offline watchdog tripped (3 consecutive probe failures). Likely a transient network blip. | Suggest retrying. The partial record is still on disk under `analysis_records/<id>.json` with `aborted: true, abortReason: offline`. |
+| Tool error says `Bundled Chromium is missing` | The plugin-local Playwright browser was not installed or was deleted. | Tell the user to run `npm run setup:browser` in the kowalski-openclaw plugin directory, then retry. Do not suggest installing system Chrome. |
 | `run_digest` error mentions `"timed out"` / the header mentions `"Stories phase timed out after 15 minutes"` or `"Feed phase timed out after 30 minutes"` | A phase hit its hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
 | `run_digest` returns "another run already in progress" | The previous run is still holding the RunManager singleton. | Call `get_session_status` to see what's happening; if stale or no reliable session id exists, call `stop_run` with `{}` and wait briefly before retrying. |
 | `stop_run` says it used the global stop marker because session_id was missing/stale | The session registry entry was gone, but the singleton runner may still be active. | Treat this as a successful stop request. Tell the user the global stop marker was sent and wait briefly before starting another digest. |

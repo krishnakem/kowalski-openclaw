@@ -1,15 +1,9 @@
 /**
  * KowalskiSession — the host-supplied handle threaded through every service.
  *
- * Deviations from the Stage 1 sketch (REFACTOR_NOTES.md, bottom of file):
- *   - `runConfig` became a required object (all inner fields still optional) so
- *     callers don't have to spread `?.` through RunManager for every read.
- *   - Added `isPackaged?: boolean` — ChromiumVersionHelper used to branch on
- *     `app.isPackaged`; the plugin host may still want to nudge cache lookup.
- *     Default is false when the factory builds a session.
- *   - `browser.executablePath` kept; the Stage 1 `useCustomStealthBrowser`
- *     toggle was collapsed into "executablePath set → use it, else let
- *     Playwright decide." The Electron-only stealth-browser branch is gone.
+ * The OpenClaw plugin host owns durable paths, inference, run config, and
+ * cancellation. Services receive this object instead of reading global app
+ * state, which keeps concurrent or future multi-session wiring tractable.
  */
 
 import { EventEmitter } from 'node:events';
@@ -18,13 +12,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import type { BrowserContext } from 'playwright';
+import type { InferenceClient } from '../main/services/Inference.js';
 
 export interface KowalskiSession {
     scratchDir: string;
     outputDir: string;
     browserProfileDir: string;
 
-    anthropicApiKey: string;
+    inferenceClient: InferenceClient;
     runConfig: {
         userName?: string;
         location?: string;
@@ -64,7 +59,7 @@ export interface CreateKowalskiSessionOptions {
     scratchDir?: string;
     outputDir?: string;
     browserProfileDir?: string;
-    anthropicApiKey: string;
+    inferenceClient: InferenceClient;
     runConfig?: KowalskiSession['runConfig'];
     browser?: KowalskiSession['browser'];
     isPackaged?: boolean;
@@ -78,8 +73,8 @@ export interface CreateKowalskiSessionResult {
 export function createKowalskiSession(
     opts: CreateKowalskiSessionOptions
 ): CreateKowalskiSessionResult {
-    if (!opts.anthropicApiKey) {
-        throw new Error('createKowalskiSession: anthropicApiKey is required');
+    if (!opts.inferenceClient) {
+        throw new Error('createKowalskiSession: inferenceClient is required');
     }
 
     const base = path.join(os.tmpdir(), `kowalski-${uuidv4()}`);
@@ -96,7 +91,7 @@ export function createKowalskiSession(
         scratchDir,
         outputDir,
         browserProfileDir,
-        anthropicApiKey: opts.anthropicApiKey,
+        inferenceClient: opts.inferenceClient,
         runConfig: opts.runConfig ?? {},
         browser: opts.browser,
         isPackaged: opts.isPackaged ?? false,

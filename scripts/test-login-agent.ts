@@ -1,7 +1,7 @@
 /**
  * LoginAgent smoke test — runs the agent orchestration end-to-end
  * against a static HTML fixture that mimics Instagram's login layout,
- * without hitting Anthropic and without touching a real IG account.
+ * without hitting a live model provider and without touching a real IG account.
  *
  * The test:
  *   1. Launches a Playwright chromium instance (ephemeral — no profile).
@@ -20,7 +20,7 @@
  * What this proves:
  *   - The executor substitutes credentials from config.credentials
  *     without routing them through any LLM payload (we never set an
- *     api key — the scripted callLLM never reaches the network).
+ *     provider credentials — the scripted callLLM never reaches the network).
  *   - fill_username / fill_password type the right value into the
  *     focused field with per-character delay.
  *   - The base-class action dispatcher cleanly delegates login
@@ -44,6 +44,7 @@ import { HumanScroll } from '../src/main/services/HumanScroll.js';
 import { ScreenshotCollector } from '../src/main/services/ScreenshotCollector.js';
 import { LoginAgent, type LoginAgentConfig } from '../src/main/services/LoginAgent.js';
 import type { VisionAction } from '../src/main/services/BaseVisionAgent.js';
+import type { InferenceClient } from '../src/main/services/Inference.js';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const fixturePath = path.join(__dirname, 'fixtures', 'fake-ig-login.html');
@@ -57,8 +58,15 @@ function assert(cond: unknown, msg: string): asserts cond {
     if (!cond) fail(msg);
 }
 
+const scriptedInferenceClient: InferenceClient = {
+    backend: 'openclaw',
+    async complete() {
+        throw new Error('scripted login test should not call inference');
+    },
+};
+
 /**
- * Scripted-LLM subclass. Overrides callLLM so no Anthropic request is
+ * Scripted-LLM subclass. Overrides callLLM so no model-provider request is
  * ever made. The script drives a canonical happy-path login sequence;
  * the test asserts the executor dispatches each action correctly.
  */
@@ -144,7 +152,7 @@ async function main(): Promise<void> {
         const collector = new ScreenshotCollector(page);
 
         const agent = new ScriptedLoginAgent(page, ghost, scroll, collector, {
-            apiKey: 'sk-ant-smoketest-never-used',
+            inferenceClient: scriptedInferenceClient,
             maxDurationMs: 30_000,
             credentials: { username, password },
             // browserProfileDir points at a path that definitely has no

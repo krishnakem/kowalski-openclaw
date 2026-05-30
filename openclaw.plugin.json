@@ -12,8 +12,6 @@
             "submit_verification_code",
             "run_digest",
             "get_session_status",
-            "set_api_key",
-            "clear_api_key",
             "reset_memory",
             "reset_all",
             "stop_run",
@@ -24,10 +22,6 @@
     "configSchema": {
         "type": "object",
         "properties": {
-            "anthropicApiKey": {
-                "type": "string",
-                "description": "Optional Anthropic API key used for Claude calls. If omitted, the plugin checks ANTHROPIC_API_KEY and then the OS keychain; set_api_key can store it at runtime."
-            },
             "browserProfileDir": {
                 "type": "string",
                 "description": "Path to the persistent Playwright user-data directory. Used by both the login and run flows, which are fully headless. Leading ~ is expanded to the user's home directory at plugin-register time.",

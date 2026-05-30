@@ -16,34 +16,16 @@
 import { CapturedPost, ImageTag, TaggingResult } from '../../types/instagram.js';
 import { UsageService } from './UsageService.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
-
-/**
- * Internal type for image content in Anthropic API.
- */
-interface ImageContent {
-    type: 'image';
-    source: {
-        type: 'base64';
-        media_type: string;
-        data: string;
-    };
-}
-
-/**
- * Internal type for text content in Anthropic API.
- */
-interface TextContent {
-    type: 'text';
-    text: string;
-}
+import type { InferenceClient } from './Inference.js';
+import { inferenceUsageToTokenUsage } from './Inference.js';
 
 export class ImageTagger {
-    private apiKey: string;
+    private inferenceClient: InferenceClient;
     private userInterests: string[];
     private usageService: UsageService;
 
-    constructor(apiKey: string, userInterests: string[]) {
-        this.apiKey = apiKey;
+    constructor(inferenceClient: InferenceClient, userInterests: string[]) {
+        this.inferenceClient = inferenceClient;
         this.userInterests = userInterests;
         this.usageService = UsageService.getInstance();
     }
@@ -63,64 +45,8 @@ export class ImageTagger {
 
         console.log(`🏷️ Tagging ${captures.length} images with ${ModelConfig.tagging}...`);
 
-        // Build image content array
-        const imageContents: ImageContent[] = captures.map((capture) => ({
-            type: 'image' as const,
-            source: {
-                type: 'base64' as const,
-                media_type: 'image/jpeg',
-                data: capture.screenshot.toString('base64')
-            }
-        }));
-
-        const prompt = this.buildTaggingPrompt(captures.length);
-
-        // Build message content array
-        const messageContent: (TextContent | ImageContent)[] = [
-            { type: 'text', text: prompt },
-            ...imageContents
-        ];
-
         try {
-            const response = await fetch('https://api.anthropic.com/v1/messages', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': this.apiKey,
-                    'anthropic-version': '2023-06-01'
-                },
-                body: JSON.stringify({
-                    model: ModelConfig.tagging,
-                    messages: [{
-                        role: 'user',
-                        content: messageContent
-                    }],
-                    max_tokens: 4096
-                })
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
-                console.error('❌ Tagging API error:', errorData);
-                throw new Error('TAGGING_FAILED');
-            }
-
-            const data = await response.json();
-
-            // Track usage
-            const tokensUsed = (data.usage?.input_tokens || 0) + (data.usage?.output_tokens || 0);
-            if (data.usage) {
-                await this.usageService.incrementUsage(data.usage);
-                console.log(`💰 Tagging cost tracked: ${tokensUsed} tokens`);
-            }
-
-            const contentBlocks = data.content as Array<{ type: string; text?: string }> | undefined;
-            const content = contentBlocks?.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('') || '';
-            if (!content) {
-                throw new Error('TAGGING_FAILED: No content in response');
-            }
-
-            const tags = this.parseTaggingResponse(content, captures.length);
+            const { tags, tokensUsed } = await this.tagIndividually(captures);
 
             // Log summary
             const adCount = tags.filter(t => t.isAd).length;
@@ -138,6 +64,33 @@ export class ImageTagger {
             // On failure, return empty tags - caller should fall back to using all images
             return { tags: [], tokensUsed: 0 };
         }
+    }
+
+    private async tagIndividually(captures: CapturedPost[]): Promise<TaggingResult> {
+        const tags: ImageTag[] = [];
+        let tokensUsed = 0;
+
+        for (let i = 0; i < captures.length; i++) {
+            const imageId = i + 1;
+            const prompt = this.buildTaggingPrompt(1).replace(/imageId": 1/g, `imageId": ${imageId}`);
+            const result = await this.inferenceClient.complete({
+                model: ModelConfig.tagging,
+                prompt,
+                images: [{ buffer: captures[i].screenshot, mime: 'image/jpeg', label: `image ${imageId}` }],
+                maxTokens: 1024,
+                purpose: 'Kowalski image tagging',
+                expectJson: true,
+            });
+            if (result.usage) {
+                tokensUsed += (result.usage.inputTokens || 0) + (result.usage.outputTokens || 0);
+                await this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
+            }
+            const parsed = this.parseTaggingResponse(result.text, 1);
+            const tag = parsed[0];
+            if (tag) tags.push({ ...tag, imageId });
+        }
+
+        return { tags, tokensUsed };
     }
 
     /**

@@ -1,17 +1,16 @@
 /**
  * Fake-register smoke test for the OpenClaw plugin surface.
  *
- * Does NOT start a browser, hit Anthropic, or touch any real Instagram
+ * Does NOT start a browser, hit a live model provider, or touch any real Instagram
  * profile. What it proves:
  *
  *   1. The plugin module imports and exposes a `register(api)` function
  *      on both the named export and the default export.
  *   2. `register` accepts a minimal PluginApi with pluginConfig + a mock
  *      registerTool collector, and does not throw.
- *   3. All eleven expected tools are registered in the expected order
+ *   3. All nine expected tools are registered in the expected order
  *      (start_session, login, submit_verification_code, run_digest,
- *      get_session_status, set_api_key, clear_api_key, reset_memory,
- *      reset_all, stop_run, end_session) with
+ *      get_session_status, reset_memory, reset_all, stop_run, end_session) with
  *      the expected `optional` flag (undefined for all of them).
  *   4. Each tool's `parameters` schema is a well-formed JSON-Schema-ish
  *      object (type: 'object', properties object present).
@@ -46,12 +45,8 @@ function assert(cond: unknown, msg: string): asserts cond {
 function main(): void {
     // Force the no-cookie/no-IG-credentials branch. start_session now
     // auto-enters login and would launch Chromium if IG creds were set.
-    // Provide a fake Anthropic key through env so this smoke test does not
-    // touch the user's real OS keychain.
-    const oldAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
     const oldIgUsername = process.env.IG_USERNAME;
     const oldIgPassword = process.env.IG_PASSWORD;
-    process.env.ANTHROPIC_API_KEY = 'sk-ant-smoketest-not-a-real-key';
     delete process.env.IG_USERNAME;
     delete process.env.IG_PASSWORD;
 
@@ -73,6 +68,24 @@ function main(): void {
             info: () => {},
             warn: () => {},
             error: () => {},
+        },
+        runtime: {
+            config: { current: () => ({}) },
+            llm: {
+                complete: async () => ({
+                    text: 'ok',
+                    provider: 'mock',
+                    model: 'mock-text',
+                    usage: {},
+                }),
+            },
+            mediaUnderstanding: {
+                describeImageFile: async () => ({
+                    text: 'ok',
+                    provider: 'mock',
+                    model: 'mock-image',
+                }),
+            },
         },
         registerTool: (tool, opts) => {
             registered.push({ tool, opts });
@@ -98,15 +111,13 @@ function main(): void {
     }
     console.log('✅ register(api) completed');
 
-    // (3) All eleven tools got registered, in order, with the right `optional` flag.
+    // (3) All nine tools got registered, in order, with the right `optional` flag.
     const expected = [
         { name: 'start_session', optional: undefined },
         { name: 'login', optional: undefined },
         { name: 'submit_verification_code', optional: undefined },
         { name: 'run_digest', optional: undefined },
         { name: 'get_session_status', optional: undefined },
-        { name: 'set_api_key', optional: undefined },
-        { name: 'clear_api_key', optional: undefined },
         { name: 'reset_memory', optional: undefined },
         { name: 'reset_all', optional: undefined },
         { name: 'stop_run', optional: undefined },
@@ -186,8 +197,6 @@ function main(): void {
 
             // Teardown — and also clean up the tmp dirs so repeat runs stay clean.
             teardown?.();
-            if (oldAnthropicApiKey !== undefined) process.env.ANTHROPIC_API_KEY = oldAnthropicApiKey;
-            else delete process.env.ANTHROPIC_API_KEY;
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;
             if (oldIgPassword !== undefined) process.env.IG_PASSWORD = oldIgPassword;
             try {
@@ -200,8 +209,6 @@ function main(): void {
             process.exit(0);
         })
         .catch((err) => {
-            if (oldAnthropicApiKey !== undefined) process.env.ANTHROPIC_API_KEY = oldAnthropicApiKey;
-            else delete process.env.ANTHROPIC_API_KEY;
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;
             if (oldIgPassword !== undefined) process.env.IG_PASSWORD = oldIgPassword;
             fail(`plugin smoke execute threw: ${err instanceof Error ? err.message : String(err)}`);

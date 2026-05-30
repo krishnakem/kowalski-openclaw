@@ -1,21 +1,21 @@
 /**
- * NetworkMonitor — lightweight online check for the Anthropic API.
+ * NetworkMonitor — lightweight online check for the current host network.
  *
- * A run and a digest generation both require outbound connectivity to
- * api.anthropic.com. This helper performs a short HEAD probe so we can fail
- * fast with a typed "offline" error instead of letting the vision/digest
- * retry loops burn attempts on a dead connection.
+ * A run and a digest generation both require outbound connectivity. This
+ * helper performs a short generic probe so we can fail fast with a typed
+ * "offline" error instead of letting inference retry loops burn attempts on a
+ * dead connection. Provider health and billing are handled by the active
+ * inference backend.
  */
 
-const PROBE_URL = 'https://api.anthropic.com/v1/messages';
+const PROBE_URL = process.env.KOWALSKI_CONNECTIVITY_PROBE_URL || 'https://www.gstatic.com/generate_204';
 const PROBE_TIMEOUT_MS = 2000;
 
 export async function isOnline(): Promise<boolean> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
     try {
-        // HEAD is not allowed on /v1/messages, but any HTTP response (even 4xx)
-        // proves DNS + TCP + TLS reached Anthropic. Only network-layer failures
+        // Any HTTP response proves DNS + TCP + TLS reached the network. Only network-layer failures
         // (DNS, connection refused, timeout) mean we're truly offline.
         await fetch(PROBE_URL, { method: 'HEAD', signal: controller.signal });
         return true;
@@ -31,8 +31,8 @@ export async function isOnline(): Promise<boolean> {
  * `onOffline` the first time the probe fails. Returns a stop() function.
  *
  * We don't rely on `navigator.onLine` events alone because Chromium on macOS
- * can lag by many seconds when WiFi toggles — actively pinging Anthropic is
- * the only reliable way to detect the loss within ~1 second.
+ * can lag by many seconds when WiFi toggles. A generic connectivity probe gives
+ * us a provider-independent way to detect loss quickly.
  */
 export function startOfflineWatchdog(
     onOffline: () => void,
@@ -87,16 +87,3 @@ export function isNetworkError(err: unknown): boolean {
 }
 
 export const OFFLINE_ERROR = 'OFFLINE';
-export const CREDITS_DEPLETED_ERROR = 'CREDITS_DEPLETED';
-
-/**
- * Parse an Anthropic API error body and return true if it's a
- * credit-balance-exhausted error. Anthropic responds with 400 and a body
- * like `{"type":"error","error":{"type":"invalid_request_error","message":
- * "Your credit balance is too low to access the Claude API..."}}`.
- */
-export function isCreditsDepletedError(status: number, body: string): boolean {
-    if (status !== 400 && status !== 403) return false;
-    const lower = body.toLowerCase();
-    return lower.includes('credit balance') || lower.includes('credit_balance');
-}

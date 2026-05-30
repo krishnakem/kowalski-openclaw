@@ -24,10 +24,11 @@ import { ModelConfig } from '../../shared/modelConfig.js';
 import type { NavigationLoopConfig } from '../../types/navigation.js';
 import type { SessionSummary } from '../../types/session-memory.js';
 import type { BaseVisionAgent } from './BaseVisionAgent.js';
+import type { InferenceClient } from './Inference.js';
 
 export class Kowalski {
     private context: BrowserContext;
-    private apiKey: string;
+    private inferenceClient: InferenceClient;
     private usageService: UsageService;
     private debugMode: boolean;
 
@@ -48,12 +49,12 @@ export class Kowalski {
 
     constructor(
         context: BrowserContext,
-        apiKey: string,
+        inferenceClient: InferenceClient,
         debugMode: boolean = false,
         sessionMemoryPath: string
     ) {
         this.context = context;
-        this.apiKey = apiKey;
+        this.inferenceClient = inferenceClient;
         this.usageService = UsageService.getInstance();
         this.debugMode = debugMode;
         this.sessionMemory = new SessionMemory(sessionMemoryPath);
@@ -203,7 +204,7 @@ export class Kowalski {
                 const storiesAgent = new StoriesAgent(
                     this.page, this.ghost, this.scroll, this.screenshotCollector,
                     {
-                        apiKey: this.apiKey,
+                        inferenceClient: this.inferenceClient,
                         maxDurationMs: STORIES_PHASE_MAX_MS,
                         debugMode: this.debugMode,
                         sessionMemoryDigest,
@@ -259,7 +260,7 @@ export class Kowalski {
                     const feedAgent = new FeedAgent(
                         this.page, this.ghost, this.scroll, this.screenshotCollector,
                         {
-                            apiKey: this.apiKey,
+                            inferenceClient: this.inferenceClient,
                             maxDurationMs: feedMaxMs,
                             debugMode: this.debugMode,
                             sessionMemoryDigest,
@@ -332,7 +333,7 @@ export class Kowalski {
 
         } catch (error: any) {
             console.error('❌ Navigation error:', error.message);
-            if (['SESSION_EXPIRED', 'RATE_LIMITED', 'OFFLINE', 'CREDITS_DEPLETED'].includes(error.message)) {
+            if (['SESSION_EXPIRED', 'RATE_LIMITED', 'OFFLINE'].includes(error.message)) {
                 throw error;
             }
         } finally {

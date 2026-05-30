@@ -204,9 +204,9 @@ export class BrowserManager {
                 console.warn('📐 Could not verify viewport:', viewportErr);
             }
 
-            // Legacy cookie-injection path from the Electron onboarding flow.
-            // Plugin hosts can drop a session.json alongside the browser profile
-            // to pre-seed cookies; otherwise this is a no-op.
+            // Optional cookie-injection path. Plugin hosts can drop a session.json
+            // alongside the browser profile to pre-seed cookies; otherwise this is
+            // a no-op.
             try {
                 const sessionPath = path.join(session.browserProfileDir, 'session.json');
                 if (fs.existsSync(sessionPath)) {

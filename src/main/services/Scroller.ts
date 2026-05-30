@@ -24,6 +24,7 @@ import { ScreenshotCollector } from './ScreenshotCollector.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
 // CaptureSource import removed — no longer used (capture handled by filter agent)
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
+import type { InferenceClient, InferenceMessage } from './Inference.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const navigatorPrompt = readFileSync(join(__dirname, '../prompts/navigator-agent.md'), 'utf8');
@@ -58,7 +59,7 @@ interface ActionHistoryEntry {
 }
 
 export interface ScrollerConfig {
-    apiKey: string;
+    inferenceClient: InferenceClient;
     maxDurationMs: number;
     userInterests: string[];
     debugMode?: boolean;
@@ -742,10 +743,9 @@ export class Scroller {
     private async callLLM(screenshot: Buffer, remainingMs: number): Promise<VisionAction> {
         const systemPrompt = this.getSystemPrompt();
         const userPrompt = this.buildUserPrompt(remainingMs);
-        const visionDetail = process.env.KOWALSKI_VISION_DETAIL || 'high';
 
         // Build messages array
-        const messages: Array<Record<string, unknown>> = [];
+        const messages: InferenceMessage[] = [];
 
         // Inject reference images only for navigator (specialist works from current screenshot)
         if (this.activeModel === 'navigator') {
@@ -760,7 +760,7 @@ export class Scroller {
                     for (const ref of generalImages) {
                         refContent.push({
                             type: 'image',
-                            source: this.dataUrlToAnthropicSource(ref.base64)
+                            source: this.dataUrlToImageSource(ref.base64)
                         });
                         refContent.push({
                             type: 'text',
@@ -774,7 +774,7 @@ export class Scroller {
                 for (const ref of phaseImages) {
                     refContent.push({
                         type: 'image',
-                        source: this.dataUrlToAnthropicSource(ref.base64)
+                        source: this.dataUrlToImageSource(ref.base64)
                     });
                     refContent.push({
                         type: 'text',
@@ -787,7 +787,7 @@ export class Scroller {
                         type: 'text',
                         text: `These are step-by-step instructions for how to handle ${phase.toLowerCase()} on Instagram. The images are numbered — follow them in sequence. Read the annotations in each image carefully.`
                     });
-                    messages.push({ role: 'user', content: refContent });
+                    messages.push({ role: 'user', content: refContent as any });
                     messages.push({
                         role: 'assistant',
                         content: `Understood. I'll follow the ${phase.toLowerCase()} workflow steps shown above.`
@@ -800,88 +800,55 @@ export class Scroller {
         }
 
         // Current turn: live screenshot + context
+        const currentContent = [
+            {
+                type: 'image',
+                source: {
+                    type: 'base64',
+                    media_type: 'image/jpeg',
+                    data: screenshot.toString('base64')
+                }
+            },
+            { type: 'text', text: userPrompt }
+        ];
         messages.push({
             role: 'user',
-            content: [
-                {
-                    type: 'image',
-                    source: {
-                        type: 'base64',
-                        media_type: 'image/jpeg',
-                        data: screenshot.toString('base64')
-                    }
-                },
-                { type: 'text', text: userPrompt }
-            ]
+            content: currentContent as any
         });
 
-        // Build request body — different config per model
+        // Pick token budget per model.
         const isSpecialist = this.activeModel === 'specialist';
-        const requestBody: Record<string, unknown> = {
-            model: isSpecialist ? this.specialistModel : this.model,
-            system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
-            messages,
-            max_tokens: isSpecialist ? 16000 : 2048,
-        };
-
-        // Only enable extended thinking for specialist (Opus)
-        if (isSpecialist) {
-            requestBody.thinking = { type: 'enabled', budget_tokens: 10000 };
-        }
 
         // Attempt LLM call with exponential backoff on overload/rate-limit
         const maxRetries = 4;
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             try {
-                const response = await fetch('https://api.anthropic.com/v1/messages', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': this.config.apiKey,
-                        'anthropic-version': '2023-06-01',
-                        'anthropic-beta': 'prompt-caching-2024-07-31'
-                    },
-                    body: JSON.stringify(requestBody)
+                const result = await this.config.inferenceClient.complete({
+                    model: isSpecialist ? this.specialistModel : this.model,
+                    systemPrompt,
+                    messages,
+                    images: [{ buffer: screenshot, mime: 'image/jpeg', label: 'current screenshot' }],
+                    maxTokens: isSpecialist ? 16000 : 2048,
+                    timeoutMs: 60_000,
+                    purpose: `Kowalski ${this.activeModel} navigation`,
+                    expectJson: true,
                 });
 
-                if (!response.ok) {
-                    const errText = await response.text();
-                    console.warn(`  ⚠️ LLM API error (${response.status}): ${errText.slice(0, 200)}`);
-                    this.collector.appendLog(`  ⚠️ LLM API error (${response.status}): ${errText.slice(0, 200)}`);
-                    // Retry on overload (529) or rate limit (429) with exponential backoff
-                    if ((response.status === 529 || response.status === 429) && attempt < maxRetries - 1) {
-                        const baseDelay = response.status === 429 ? 10000 : 5000;
-                        const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
-                        const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
-                        const delay = Math.round(backoff + jitter);
-                        console.log(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
-                        this.collector.appendLog(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
-                        await this.delay(delay);
-                        continue;
-                    }
-                    break; // Don't retry other API errors
-                }
-
-                const data = await response.json() as Record<string, unknown>;
-
                 // Log token usage
-                const usage = data.usage as { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | undefined;
+                const usage = result.usage;
                 if (usage) {
                     this.lastTokenUsage = {
-                        promptTokens: usage.input_tokens || 0,
-                        completionTokens: usage.output_tokens || 0
+                        promptTokens: usage.inputTokens || 0,
+                        completionTokens: usage.outputTokens || 0
                     };
-                    const cacheInfo = usage.cache_read_input_tokens
-                        ? ` (cached: ${usage.cache_read_input_tokens})`
+                    const cacheInfo = usage.cacheReadTokens
+                        ? ` (cached: ${usage.cacheReadTokens})`
                         : '';
-                    console.log(`  🧠 Tokens: ${usage.input_tokens} in${cacheInfo}, ${usage.output_tokens} out (vision:${visionDetail})`);
-                    this.collector.appendLog(`  🧠 Tokens: ${usage.input_tokens} in${cacheInfo}, ${usage.output_tokens} out (vision:${visionDetail})`);
+                    console.log(`  🧠 Tokens: ${usage.inputTokens} in${cacheInfo}, ${usage.outputTokens} out`);
+                    this.collector.appendLog(`  🧠 Tokens: ${usage.inputTokens} in${cacheInfo}, ${usage.outputTokens} out`);
                 }
 
-                const contentBlocks = data.content as Array<{ type: string; text?: string; thinking?: string }> | undefined;
-                // Skip 'thinking' blocks from extended thinking — only extract the 'text' block
-                const textBlock = contentBlocks?.find(b => b.type === 'text');
-                const content = textBlock?.text;
+                const content = result.text;
                 if (!content || typeof content !== 'string') {
                     console.warn(`  ⚠️ Empty LLM response (attempt ${attempt + 1}/${maxRetries})`);
                     this.collector.appendLog(`  ⚠️ Empty LLM response (attempt ${attempt + 1}/${maxRetries})`);
@@ -893,6 +860,17 @@ export class Scroller {
                 return parsed;
 
             } catch (err) {
+                const status = (err as { status?: number }).status;
+                if ((status === 529 || status === 429) && attempt < maxRetries - 1) {
+                    const baseDelay = status === 429 ? 10000 : 5000;
+                    const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
+                    const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
+                    const delay = Math.round(backoff + jitter);
+                    console.log(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
+                    this.collector.appendLog(`  ⏳ Retrying (${attempt + 1}/${maxRetries - 1}) after ${(delay / 1000).toFixed(1)}s backoff...`);
+                    await this.delay(delay);
+                    continue;
+                }
                 console.warn(`  ⚠️ LLM call/parse error (attempt ${attempt + 1}/${maxRetries}):`, err);
                 this.collector.appendLog(`  ⚠️ LLM call/parse error (attempt ${attempt + 1}/${maxRetries}): ${err}`);
                 if (attempt < maxRetries - 1) { await this.delay(500); continue; }
@@ -910,9 +888,9 @@ export class Scroller {
     // -----------------------------------------------------------------------
 
     /**
-     * Convert a data URL (data:image/jpeg;base64,...) to Anthropic image source format.
+     * Convert a data URL (data:image/jpeg;base64,...) to the internal image source format.
      */
-    private dataUrlToAnthropicSource(dataUrl: string): { type: 'base64'; media_type: string; data: string } {
+    private dataUrlToImageSource(dataUrl: string): { type: 'base64'; media_type: string; data: string } {
         const match = dataUrl.match(/^data:(image\/[^;]+);base64,(.+)$/);
         if (!match) {
             return { type: 'base64', media_type: 'image/jpeg', data: dataUrl };

@@ -6,10 +6,9 @@
  * context isn't open yet when start_session runs) and check for a
  * non-expired `sessionid` cookie on `.instagram.com`.
  *
- * Ported from the pre-refactor main.ts's TODO #7 breadcrumb. Uses
- * better-sqlite3 which is already a runtime dep. Any failure — DB missing,
- * schema drift, file locked — returns `logged_in: 'unknown'` so the agent
- * falls back to calling `login`.
+ * Uses better-sqlite3 which is already a runtime dep. Any failure — DB
+ * missing, schema drift, file locked — returns `logged_in: 'unknown'` so the
+ * agent falls back to calling `login`.
  */
 
 import fs from 'node:fs';

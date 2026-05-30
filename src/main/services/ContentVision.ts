@@ -1,7 +1,7 @@
 /**
  * ContentVision - Stateless Vision API Content Extraction
  *
- * Uses Anthropic Messages API ONLY for content extraction (not navigation).
+ * Uses the configured OpenClaw vision provider for content extraction (not navigation).
  * Each call is stateless - no conversation history maintained.
  *
  * Cost: varies by model (see ModelConfig.vision)
@@ -17,6 +17,8 @@ import { Page } from 'playwright';
 import { ExtractedPost, ExtractionResult } from '../../types/instagram.js';
 import { UsageService } from './UsageService.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
+import type { InferenceClient } from './Inference.js';
+import { inferenceUsageToTokenUsage } from './Inference.js';
 
 /**
  * Configuration for exponential backoff retry logic.
@@ -28,7 +30,7 @@ interface BackoffConfig {
 }
 
 export class ContentVision {
-    private apiKey: string;
+    private inferenceClient: InferenceClient;
     private usageService: UsageService;
     // NO conversationHistory - each call is stateless
 
@@ -40,8 +42,8 @@ export class ContentVision {
         maxDelayMs: 60000     // Cap at 60 seconds
     };
 
-    constructor(apiKey: string) {
-        this.apiKey = apiKey;
+    constructor(inferenceClient: InferenceClient) {
+        this.inferenceClient = inferenceClient;
         this.usageService = UsageService.getInstance();
     }
 
@@ -169,8 +171,6 @@ export class ContentVision {
                 quality: 80  // Reduce size to minimize API cost
             });
 
-            const base64Image = screenshot.toString('base64');
-
             // 2. Calculate and log estimated cost
             const viewport = page.viewportSize();
             if (viewport) {
@@ -182,24 +182,7 @@ export class ContentVision {
                 console.log(`📸 Vision API: Estimated cost $${estimatedCost.toFixed(4)}`);
             }
 
-            // 3. Single stateless Vision API call (with exponential backoff)
-            const response = await this.fetchWithBackoff(
-                'https://api.anthropic.com/v1/messages',
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': this.apiKey,
-                        'anthropic-version': '2023-06-01'
-                    },
-                    body: JSON.stringify({
-                        model: ModelConfig.vision,
-                        messages: [{
-                            role: 'user',
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: `Extract all visible Instagram posts from this screenshot.
+            const prompt = `Extract all visible Instagram posts from this screenshot.
 
 For each post, provide:
 - username: The account that posted (include @ symbol)
@@ -219,56 +202,23 @@ Return ONLY valid JSON. Example:
   {"username": "@creator", "caption": "Check out this reel!", "contentType": "reel", "isVideoContent": true}
 ]}
 
-If no posts visible, return: {"posts": []}`
-                                },
-                                {
-                                    type: 'image',
-                                    source: {
-                                        type: 'base64',
-                                        media_type: 'image/jpeg',
-                                        data: base64Image
-                                    }
-                                }
-                            ]
-                        }],
-                        max_tokens: 16384
-                    })
-                }
-            );
+If no posts visible, return: {"posts": []}`;
 
-            if (!response.ok) {
-                const errorData = await response.json().catch(() => ({}));
+            // 3. Single stateless Vision API call
+            const result = await this.inferenceClient.complete({
+                model: ModelConfig.vision,
+                prompt,
+                images: [{ buffer: Buffer.from(screenshot), mime: 'image/jpeg', label: 'viewport' }],
+                maxTokens: 16384,
+                purpose: 'Kowalski visible content extraction',
+                expectJson: true,
+            });
 
-                // Content policy violation - skip this viewport (NO DOM FALLBACK)
-                if (errorData.error?.code === 'content_policy_violation') {
-                    console.warn('⚠️ Vision API: Content policy violation - skipping viewport');
-                    return {
-                        success: false,
-                        posts: [],
-                        skipped: true,
-                        reason: 'CONTENT_POLICY'
-                    };
-                }
-
-                // Other API error - skip this viewport (rate limits handled by fetchWithBackoff)
-                console.warn(`⚠️ Vision API error: ${errorData.error?.message || response.statusText} - skipping`);
-                return {
-                    success: false,
-                    posts: [],
-                    skipped: true,
-                    reason: 'API_ERROR'
-                };
+            if (result.usage) {
+                await this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
             }
 
-            const data = await response.json();
-
-            // Track usage
-            if (data.usage) {
-                await this.usageService.incrementUsage(data.usage);
-            }
-
-            const contentBlocks = data.content as Array<{ type: string; text?: string }> | undefined;
-            const content = contentBlocks?.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('') || '';
+            const content = result.text;
 
             // 4. Parse response
             const parsed = JSON.parse(content);
@@ -315,61 +265,28 @@ If no posts visible, return: {"posts": []}`
                 quality: 70
             });
 
-            const base64Image = screenshot.toString('base64');
-
-            const response = await this.fetchWithBackoff(
-                'https://api.anthropic.com/v1/messages',
-                {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key': this.apiKey,
-                        'anthropic-version': '2023-06-01'
-                    },
-                    body: JSON.stringify({
-                        model: ModelConfig.vision,
-                        messages: [{
-                            role: 'user',
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: `Extract the Instagram story content:
+            const prompt = `Extract the Instagram story content:
 - username: Story author (include @ symbol)
 - caption: Any visible text on the story
 - visualDescription: Brief description of what's shown
 
-Return ONLY valid JSON: {"username": "", "caption": "", "visualDescription": ""}`
-                                },
-                                {
-                                    type: 'image',
-                                    source: {
-                                        type: 'base64',
-                                        media_type: 'image/jpeg',
-                                        data: base64Image
-                                    }
-                                }
-                            ]
-                        }],
-                        max_tokens: 16384
-                    })
-                }
-            );
+Return ONLY valid JSON: {"username": "", "caption": "", "visualDescription": ""}`;
 
-            if (!response.ok) {
-                console.warn('⚠️ Story extraction failed:', response.statusText);
-                return null;
-            }
+            const result = await this.inferenceClient.complete({
+                model: ModelConfig.vision,
+                prompt,
+                images: [{ buffer: Buffer.from(screenshot), mime: 'image/jpeg', label: 'story' }],
+                maxTokens: 16384,
+                purpose: 'Kowalski story extraction',
+                expectJson: true,
+            });
 
-            const data = await response.json();
-
-            // Track usage
-            if (data.usage) {
-                await this.usageService.incrementUsage(data.usage);
+            if (result.usage) {
+                await this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
             }
 
             // Parse response, stripping any markdown code blocks if present
-            const contentBlocks2 = data.content as Array<{ type: string; text?: string }> | undefined;
-            let rawContent = contentBlocks2?.filter((b: any) => b.type === 'text').map((b: any) => b.text).join('') || '{}';
+            let rawContent = result.text || '{}';
             if (!rawContent) rawContent = '{}';
             // Strip ```json ... ``` wrapper if present
             rawContent = rawContent.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
