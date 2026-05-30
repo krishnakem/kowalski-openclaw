@@ -4,10 +4,14 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "postinstall": "node scripts/install-bundled-browser.mjs",
+    "setup:browser": "node scripts/install-bundled-browser.mjs",
+    "check:browser": "node scripts/check-bundled-browser.mjs",
     "lint": "eslint .",
     "test:digest": "npx tsx scripts/test-digest.ts",
     "test:extract": "npx tsx scripts/test-extract.ts",
     "test:run": "npx tsx scripts/test-run.ts",
+    "test:browser-resolver": "npx tsx scripts/test-bundled-browser-resolver.ts",
     "test:plugin": "npx tsx scripts/test-plugin.ts",
     "test:login": "npx tsx scripts/test-login-agent.ts",
     "test:inference": "npx tsx scripts/test-inference-factory.ts"

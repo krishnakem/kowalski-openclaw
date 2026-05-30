@@ -1,10 +1,12 @@
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import {
+    getPlaywrightChromiumBrowserInfo,
+    resolveBundledBrowserExecutable,
+} from './BundledBrowserResolver.js';
 
 /**
  * Production-safe helper for detecting Chromium version and generating User-Agent.
- * Uses a 3-tier fallback chain to ensure it works in both development and packaged apps.
+ * Uses playwright-core/browsers.json instead of the user's Playwright cache so
+ * UA generation tracks the plugin-bundled Chromium.
  */
 export class ChromiumVersionHelper {
     private static cachedVersion: string | null = null;
@@ -12,146 +14,51 @@ export class ChromiumVersionHelper {
     private static cachedUserAgent: string | null = null;
 
     /**
-     * Gets Chromium version using a production-safe fallback chain:
-     * 1. browsers.json via require() (handles asar transparency)
-     * 2. Scan Playwright cache directory (external to app bundle)
-     * 3. Hardcoded fallback (safety net)
+     * Gets Chromium version from playwright-core/browsers.json.
+     * The fallback is only for UA generation/logging, never for launch path.
      */
     static getChromiumVersion(): string {
         if (this.cachedVersion) return this.cachedVersion;
 
-        // Method 1: Try browsers.json via require (asar-safe)
         this.cachedVersion = this.tryReadBrowsersJson();
         if (this.cachedVersion) return this.cachedVersion;
 
-        // Method 2: Detect from Playwright cache (production-safe)
-        this.cachedVersion = this.tryDetectFromCache();
-        if (this.cachedVersion) return this.cachedVersion;
-
-        // Method 3: Hardcoded fallback
         console.warn('⚠️ ChromiumVersionHelper: Using hardcoded fallback version');
         this.cachedVersion = '143.0.0.0';
         return this.cachedVersion;
     }
 
     /**
-     * Try reading version from playwright-core's browsers.json
-     * Uses require() which handles asar transparency in production
+     * Try reading version from playwright-core's browsers.json.
      */
     private static tryReadBrowsersJson(): string | null {
         try {
-            // require() works with asar - no need for fs.readFileSync
-            const browsersJson = require('playwright-core/browsers.json');
-            const chromiumEntry = browsersJson.browsers?.find(
-                (b: { name: string }) => b.name === 'chromium'
-            );
-            if (chromiumEntry?.browserVersion) {
-                console.log(`🔍 ChromiumVersionHelper: Detected v${chromiumEntry.browserVersion} from browsers.json`);
-                return chromiumEntry.browserVersion;
-            }
-        } catch (error) {
-            // Expected to fail in some edge cases - fall through to next method
-            console.log('🔍 ChromiumVersionHelper: browsers.json not accessible, trying cache scan...');
-        }
-        return null;
-    }
-
-    /**
-     * Scan the Playwright cache directory to detect installed Chromium revision
-     * This is production-safe because the cache is on the user's filesystem
-     */
-    private static tryDetectFromCache(): string | null {
-        try {
-            const userHome = os.homedir();
-            const cacheDir = this.getPlaywrightCacheDir(userHome);
-
-            if (!fs.existsSync(cacheDir)) return null;
-
-            // Find all chromium-* directories and get the highest revision
-            const revisions = fs.readdirSync(cacheDir)
-                .filter(d => d.startsWith('chromium-') && !d.includes('headless'))
-                .map(d => parseInt(d.replace('chromium-', ''), 10))
-                .filter(n => !isNaN(n))
-                .sort((a, b) => b - a); // Descending order
-
-            if (revisions.length > 0) {
-                const latestRevision = revisions[0];
-                const version = this.revisionToVersion(latestRevision);
-                console.log(`🔍 ChromiumVersionHelper: Detected revision ${latestRevision} → Chrome ${version}`);
+            const { chromiumHeadlessShell, chromium } = getPlaywrightChromiumBrowserInfo();
+            const version = chromiumHeadlessShell.browserVersion ?? chromium.browserVersion;
+            if (version) {
+                console.log(`🔍 ChromiumVersionHelper: Detected v${version} from browsers.json`);
                 return version;
             }
         } catch (error) {
-            console.warn('⚠️ ChromiumVersionHelper: Cache scan failed:', error);
+            console.warn('⚠️ ChromiumVersionHelper: browsers.json not accessible:', error);
         }
         return null;
-    }
-
-    /**
-     * Maps Playwright revision numbers to approximate Chrome versions
-     * Based on Playwright release history
-     */
-    private static revisionToVersion(revision: number): string {
-        // Mapping based on Playwright releases
-        // Update this periodically or when issues arise
-        const versionMap: [number, string][] = [
-            [1255, '145.0.0.0'],
-            [1220, '143.0.0.0'],
-            [1200, '131.0.0.0'],
-            [1140, '128.0.0.0'],
-            [1100, '125.0.0.0'],
-        ];
-
-        // Find the closest match (revision >= known)
-        for (const [knownRevision, version] of versionMap) {
-            if (revision >= knownRevision) {
-                return version;
-            }
-        }
-
-        // Default for older revisions
-        return '125.0.0.0';
-    }
-
-    /**
-     * Gets the Playwright cache directory for the current platform.
-     */
-    private static getPlaywrightCacheDir(userHome: string): string {
-        if (process.platform === 'darwin') {
-            return path.join(userHome, 'Library/Caches/ms-playwright');
-        } else if (process.platform === 'win32') {
-            return path.join(userHome, 'AppData/Local/ms-playwright');
-        } else {
-            return path.join(userHome, '.cache/ms-playwright');
-        }
     }
 
     /**
      * Gets the latest installed Chromium revision number
-     * Used for constructing the executable path
+     * from playwright-core/browsers.json.
      */
     static getLatestRevision(): string {
         if (this.cachedRevision) return this.cachedRevision;
 
         try {
-            const userHome = os.homedir();
-            const cacheDir = this.getPlaywrightCacheDir(userHome);
-
-            if (!fs.existsSync(cacheDir)) {
-                this.cachedRevision = '1200'; // Fallback
-                return this.cachedRevision;
-            }
-
-            const revisions = fs.readdirSync(cacheDir)
-                .filter(d => d.startsWith('chromium-') && !d.includes('headless'))
-                .map(d => d.replace('chromium-', ''))
-                .filter(r => !isNaN(parseInt(r, 10)))
-                .sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
-
-            this.cachedRevision = revisions[0] || '1200';
+            const { chromiumHeadlessShell, chromium } = getPlaywrightChromiumBrowserInfo();
+            this.cachedRevision = chromiumHeadlessShell.revision ?? chromium.revision;
             console.log(`🔍 ChromiumVersionHelper: Latest revision is ${this.cachedRevision}`);
         } catch (error) {
             console.warn('⚠️ ChromiumVersionHelper: Failed to detect revision:', error);
-            this.cachedRevision = '1200';
+            this.cachedRevision = 'unknown';
         }
 
         return this.cachedRevision;
@@ -180,30 +87,10 @@ export class ChromiumVersionHelper {
     }
 
     /**
-     * Constructs the path to the custom Kowalski browser executable
-     * Dynamically uses the latest installed revision
+     * Constructs the path to the bundled Kowalski browser executable.
      */
     static getCustomExecutablePath(): string {
-        const userHome = os.homedir();
-        const revision = this.getLatestRevision();
-        const cacheDir = this.getPlaywrightCacheDir(userHome);
-
-        if (process.platform === 'darwin') {
-            return path.join(
-                cacheDir,
-                `chromium-${revision}/chrome-mac-arm64/Kowalski.app/Contents/MacOS/Google Chrome for Testing`
-            );
-        } else if (process.platform === 'win32') {
-            return path.join(
-                cacheDir,
-                `chromium-${revision}/chrome-win/Kowalski.exe`
-            );
-        } else {
-            return path.join(
-                cacheDir,
-                `chromium-${revision}/chrome-linux/Kowalski`
-            );
-        }
+        return resolveBundledBrowserExecutable();
     }
 
 }

@@ -1,6 +1,7 @@
 import path from 'path';
 import fs from 'fs';
 import { chromium, BrowserContext, Page, CDPSession } from 'playwright';
+import { resolveBundledBrowserExecutable } from './BundledBrowserResolver.js';
 import { ChromiumVersionHelper } from './ChromiumVersionHelper.js';
 import { SessionValidationResult } from '../../types/instagram.js';
 import { KOWALSKI_VIEWPORT } from '../../shared/viewportConfig.js';
@@ -73,20 +74,21 @@ export class BrowserManager {
             const scrapingViewport = { width: KOWALSKI_VIEWPORT.width, height: KOWALSKI_VIEWPORT.height };
             console.log(`📐 BrowserManager: Viewport ${KOWALSKI_VIEWPORT.width}x${KOWALSKI_VIEWPORT.height}`);
 
-            // If the host supplied an explicit executable path, use it; otherwise
-            // let Playwright pick its own default Chromium.
-            const executablePath = session.browser?.executablePath ?? '';
-            if (executablePath) {
+            // Developer override remains explicit; normal runtime always uses
+            // the plugin-owned Playwright browser under node_modules.
+            const executablePath =
+                session.browser?.executablePath ?? resolveBundledBrowserExecutable();
+            if (session.browser?.executablePath) {
                 console.log('🕵️‍♀️ BrowserManager: Using host-supplied executable:', executablePath);
             } else {
-                console.log('📦 BrowserManager: Using Playwright default Chromium');
+                console.log('📦 BrowserManager: Using bundled Chromium:', executablePath);
             }
 
             const systemTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
             this.browserContext = await chromium.launchPersistentContext(persistentContextPath, {
                 headless: true, // ALWAYS headless — no visible Chromium window, ever
-                executablePath: executablePath || undefined,
+                executablePath,
                 viewport: scrapingViewport,
                 deviceScaleFactor: 1,
                 // Dynamic User-Agent that matches actual Chromium version (auto-detected)

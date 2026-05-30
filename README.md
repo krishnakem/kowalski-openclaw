@@ -131,13 +131,19 @@ openclaw configure
 export IG_USERNAME="your.instagram.handle"
 export IG_PASSWORD="your.password"
 
-# 4. Install this repo as a live-linked plugin. --link symlinks the
+# 4. Install plugin dependencies. postinstall downloads Kowalski's
+#    plugin-local Playwright Chromium; no system Chrome is required.
+cd /absolute/path/to/Kowalski-OpenClaw
+npm install
+npm run check:browser
+
+# 5. Install this repo as a live-linked plugin. --link symlinks the
 #    working tree so edits show up on the next gateway restart.
 openclaw plugins install /absolute/path/to/Kowalski-OpenClaw \
   --link \
   --dangerously-force-unsafe-install
 
-# 5. Run the gateway, then attach the TUI in another shell.
+# 6. Run the gateway, then attach the TUI in another shell.
 openclaw gateway run
 openclaw tui
 ```
@@ -295,6 +301,7 @@ npm install
 npm run check:browser   # Confirm plugin-local Chromium exists
 npx tsc --noEmit        # Typecheck
 
+npm run test:browser-resolver
 npm run test:plugin     # Plugin surface — asserts 9 tools registered in order
 npm run test:login      # LoginAgent against a local fake-IG fixture
                         # (scripted callLLM — no provider calls)
