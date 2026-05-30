@@ -1106,7 +1106,7 @@ export function register(api: PluginApi): () => void {
     const getSessionStatus: PluginTool = {
         name: 'get_session_status',
         description:
-            'Return the latest run phase and last ~20 pipeline events for a session. Useful to check progress on a long-running run_digest call. NOTE: the call that first surfaces a terminal status (`digest_result` for completed/stopped, `digest_error` for failed) ALSO auto-ends the session — the response will include `session_ended: true` and subsequent polls will return `session_id not found`. Hand the digest back to the user immediately on that response.',
+            'Return the latest run phase and last ~20 pipeline events for a session. Useful to check progress on a long-running run_digest call. NOTE: the call that first surfaces a terminal completed/stopped status (`digest_result`) ALSO auto-ends the session — the response will include `session_ended: true` and subsequent polls will return `session_id not found`. Failed sessions remain available for inspection or stop_run/end_session.',
         parameters: {
             type: 'object',
             properties: {
@@ -1140,11 +1140,10 @@ export function register(api: PluginApi): () => void {
                 digest_status: digestStatus,
                 events: entry.events,
             };
-            // Auto-end the session once the agent has seen a terminal
-            // state. Gated on first-delivery so we don't tear down before
-            // the digest payload is handed back: completed/stopped end on
-            // the call that delivers `digest_result`; failed ends on the
-            // call that surfaces `digest_error`.
+            // Auto-end the session once the agent has seen a completed or
+            // stopped digest result. Failed sessions intentionally remain in
+            // the registry so a later stop_run can still hit the global
+            // runner/marker if cleanup is still unwinding.
             let shouldEnd = false;
             if (ad) {
                 payload.digest_started_at = new Date(ad.startedAt).toISOString();
@@ -1153,10 +1152,7 @@ export function register(api: PluginApi): () => void {
                 }
                 if (ad.status === 'failed' && ad.errorMessage) {
                     payload.digest_error = ad.errorMessage;
-                    if (!ad.resultDelivered) {
-                        ad.resultDelivered = true;
-                        shouldEnd = true;
-                    }
+                    if (!ad.resultDelivered) ad.resultDelivered = true;
                 }
                 // Deliver the result exactly once: after the agent has
                 // seen it, clear resultText so subsequent status polls
@@ -1448,27 +1444,23 @@ export function register(api: PluginApi): () => void {
     const stopRun: PluginTool = {
         name: 'stop_run',
         description:
-            'Request a graceful stop of an in-flight run_digest. Writes a stop marker that RunManager picks up at the next phase checkpoint (~30s). The run finalizes and produces a partial digest tagged aborted: true, abortReason: user-stop. Use this when the user says "stop the run" / "cancel the digest" / "I\'ve seen enough".',
+            'Request a graceful stop of an in-flight run_digest. Session id is optional; if omitted or stale, this acts as a global kill switch for the singleton runner by writing the plugin-level stop marker. The run finalizes and produces a partial digest tagged aborted: true, abortReason: user-stop. Use this immediately when the user says "stop the run" / "cancel the digest" / "I\'ve seen enough".',
         parameters: {
             type: 'object',
             properties: {
                 session_id: {
                     type: 'string',
-                    description: 'The id returned by start_session.',
+                    description: 'The id returned by start_session. Optional; omit it when the user asks to stop but the active session id is unavailable or stale.',
                 },
             },
-            required: ['session_id'],
             additionalProperties: false,
         },
         execute: async (_callId, params) => {
-            const sessionId = params.session_id;
-            if (typeof sessionId !== 'string' || !sessionId) {
-                return textResult('stop_run: session_id is required.', true);
-            }
-            const entry = sessions.get(sessionId);
-            if (!entry) {
-                return textResult(`stop_run: session_id ${sessionId} not found.`, true);
-            }
+            const sessionId =
+                typeof params.session_id === 'string' && params.session_id.trim()
+                    ? params.session_id.trim()
+                    : null;
+            const entry = sessionId ? sessions.get(sessionId) : undefined;
 
             // Belt-and-suspenders: write the STOP_REQUESTED marker AND call
             // RunManager.stopRun() directly in-process.
@@ -1481,8 +1473,10 @@ export function register(api: PluginApi): () => void {
             //     tears down any in-flight Anthropic fetch immediately.
             // Either mechanism alone would work; together they give the
             // fastest, most reliable stop.
-            const markerPath = path.join(entry.session.scratchDir, 'STOP_REQUESTED');
+            const markerDir = entry?.session.scratchDir ?? scratchDir;
+            const markerPath = path.join(markerDir, 'STOP_REQUESTED');
             try {
+                fs.mkdirSync(markerDir, { recursive: true });
                 fs.writeFileSync(markerPath, '');
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
@@ -1497,8 +1491,14 @@ export function register(api: PluginApi): () => void {
                 log.warn('[kowalski] stop_run: RunManager.stopRun() threw (marker still written)', { msg });
             }
 
+            const fallbackLine =
+                sessionId && !entry
+                    ? ` The provided session_id (${sessionId}) was not in the registry, so I used the global stop marker instead.`
+                    : !sessionId
+                        ? ' No session_id was provided, so I used the global stop marker.'
+                        : '';
             return textResult(
-                'Stop requested. The run will finalize within ~30 seconds (usually faster, since the stop aborts any in-flight LLM call) and produce a partial digest. Call get_session_status — when digest_status is "stopped" the response includes the partial result.'
+                `Stop requested.${fallbackLine} The run will finalize within ~30 seconds and produce a partial digest if captures exist. Call get_session_status with the session_id if you have it; otherwise wait briefly and start a fresh session after the stop completes.`
             );
         },
     };

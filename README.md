@@ -37,7 +37,7 @@ The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md
 | `clear_api_key` | Clear the stored keychain API key and in-memory cache. Idempotent. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
 | `reset_all` | Dry-run-first factory reset for browser profile, scratch data, output records, and the stored keychain API key. Requires `confirm: true` to actually wipe. |
-| `stop_run` | Write a stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
+| `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
 The canonical happy-path call chain for a digest ask is now just `start_session → get_session_status when the user asks if it is done`. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.

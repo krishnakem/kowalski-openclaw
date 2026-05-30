@@ -202,8 +202,9 @@ Point the user at the PDF path in your reply — it's the easiest thing
 for them to open or share.
 
 `get_session_status` auto-ends the session on the call that first
-delivers a terminal digest result, so do not call `end_session` after
-that response says `session_ended: true`.
+delivers a completed/stopped digest result, so do not call `end_session`
+after that response says `session_ended: true`. Failed sessions remain
+available for inspection or explicit cleanup.
 
 ---
 
@@ -282,20 +283,30 @@ any time during a run, and live polling works normally.
 
 ### "Stop the run" / "Cancel the digest" / "I've seen enough"
 
-Call `stop_run` with the session_id. Because `run_digest` is
-non-blocking, this tool dispatches instantly — no gateway queueing.
-The run will finalize within ~30 seconds (often faster; the stop also
-aborts any in-flight LLM fetch) and produce a partial digest with
-whatever was captured so far. The digest will have `aborted: true` and
-`abortReason: user-stop` in its metadata.
+Call `stop_run` immediately. Because `run_digest` is non-blocking, this
+tool dispatches instantly — no gateway queueing. If you have the
+session_id, pass it. If the user asks to stop and you do not have a
+reliable session_id, call `stop_run` with `{}`; it is also a global stop
+switch and writes the plugin-level marker. Do not poll status first just
+to rediscover a session id when the user asked to stop.
+
+The run will finalize within ~30 seconds and produce a partial digest
+with whatever was captured so far. The digest will have `aborted: true`
+and `abortReason: user-stop` in its metadata.
 
 ```json
 { "name": "stop_run", "arguments": { "session_id": "…" } }
 ```
 
+```json
+{ "name": "stop_run", "arguments": {} }
+```
+
 After `stop_run` returns, poll `get_session_status`; when
 `digest_status` becomes `"stopped"`, the response carries the partial
-`digest_result`. Present that to the user.
+`digest_result`. Present that to the user. If you stopped globally
+because the session id was missing/stale, tell the user the stop marker
+was sent and wait briefly before starting another digest.
 
 **Manual escape hatch (rarely needed now).** The plugin also watches
 for a file marker at `~/.kowalski/scratch/STOP_REQUESTED`, polled on
@@ -316,10 +327,11 @@ Note: `end_session` does NOT interrupt a running digest — use
   Default is `["stories", "feed"]`.
   - "Just feed" / "skip stories" → `phases: ["feed"]`
   - "Just stories" / "only stories" → `phases: ["stories"]`
-- **Every other tool** (except `reset_memory`) takes
-  `{ session_id: string }`. Exceptions: `set_api_key` takes
-  `{ api_key: string }`, `clear_api_key` takes `{}`, and `reset_all`
-  takes optional `{ confirm: boolean }`. `submit_verification_code` also takes
+- **Most other tools** take `{ session_id: string }`.
+  Exceptions: `stop_run` may take `{ session_id?: string }` or `{}` as
+  a global stop switch; `set_api_key` takes `{ api_key: string }`;
+  `clear_api_key` takes `{}`; and `reset_all` takes optional
+  `{ confirm: boolean }`. `submit_verification_code` also takes
   `{ login_id: string, code?: string | null }` — `login_id` comes from
   a prior `login` pending response.
 
@@ -354,7 +366,8 @@ abort upfront if the cost or time isn't acceptable.
 | `submit_verification_code` returns `context_destroyed` | The pending-login browser was closed before the code was submitted (stale entry, Chromium crash, or out-of-band close). | Re-run `login` from scratch. The earlier attempt may have persisted enough cookies that Instagram skips 2FA the second time. |
 | `run_digest` error contains `"OFFLINE"` | Offline watchdog tripped (3 consecutive probe failures). Likely a transient network blip. | Suggest retrying. The partial record is still on disk under `analysis_records/<id>.json` with `aborted: true, abortReason: offline`. |
 | `run_digest` error mentions `"timed out"` / the header mentions `"Stories phase timed out after 15 minutes"` or `"Feed phase timed out after 30 minutes"` | A phase hit its hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
-| `run_digest` returns "another run already in progress" | The previous run is still holding the RunManager singleton. | Call `get_session_status` to see what's happening; if stale, call `end_session` on the old session and retry. |
+| `run_digest` returns "another run already in progress" | The previous run is still holding the RunManager singleton. | Call `get_session_status` to see what's happening; if stale or no reliable session id exists, call `stop_run` with `{}` and wait briefly before retrying. |
+| `stop_run` says it used the global stop marker because session_id was missing/stale | The session registry entry was gone, but the singleton runner may still be active. | Treat this as a successful stop request. Tell the user the global stop marker was sent and wait briefly before starting another digest. |
 | `stop_run` returns successfully but the digest takes longer than 30 s to arrive | Normal — the stop marker is polled every ~3 s, and the agent needs to finish its current step. | Let it finalize. |
 
 ---

@@ -15,7 +15,9 @@
  *      the expected `optional` flag (undefined for all of them).
  *   4. Each tool's `parameters` schema is a well-formed JSON-Schema-ish
  *      object (type: 'object', properties object present).
- *   5. Invoking `start_session.execute()` returns a result matching the
+ *   5. Invoking `stop_run.execute()` without a session_id succeeds and
+ *      writes the global stop marker.
+ *   6. Invoking `start_session.execute()` returns a result matching the
  *      OpenClaw-tool contract: { content: [{ type: 'text', text }] }.
  *
  * Run: `npm run test:plugin`.
@@ -143,13 +145,31 @@ function main(): void {
     }
     console.log('✅ every tool has description + execute + JSON-Schema-ish parameters');
 
-    // (5) Invoke start_session and check the return shape.
-    const startSession = registered.find((r) => r.tool.name === 'start_session');
-    assert(startSession, 'start_session not registered');
-    const result = startSession.tool.execute('smoke-call-1', { phases: ['stories'] });
-    assert(result instanceof Promise, 'start_session.execute must return a Promise');
+    // (5) Invoke stop_run without a session id and check the global marker path.
+    const stopRun = registered.find((r) => r.tool.name === 'stop_run');
+    assert(stopRun, 'stop_run not registered');
+    const stopResult = stopRun.tool.execute('smoke-call-stop', {});
+    assert(stopResult instanceof Promise, 'stop_run.execute must return a Promise');
 
-    result
+    stopResult
+        .then((r) => {
+            assert(r && Array.isArray(r.content), 'stop_run result must have content[]');
+            const first = r.content[0];
+            assert(first.type === 'text' && typeof first.text === 'string',
+                'stop_run result content[0] must be { type: "text", text }');
+            assert(
+                fs.existsSync(path.join(pluginConfig.scratchDir, 'STOP_REQUESTED')),
+                'stop_run without session_id did not write global STOP_REQUESTED marker'
+            );
+            console.log('✅ stop_run without session_id writes global stop marker');
+
+            // (6) Invoke start_session and check the return shape.
+            const startSession = registered.find((rr) => rr.tool.name === 'start_session');
+            assert(startSession, 'start_session not registered');
+            const result = startSession.tool.execute('smoke-call-1', { phases: ['stories'] });
+            assert(result instanceof Promise, 'start_session.execute must return a Promise');
+            return result;
+        })
         .then((r) => {
             assert(r && Array.isArray(r.content), 'execute result must have content[]');
             assert(r.content.length > 0, 'execute result content[] is empty');
@@ -184,7 +204,7 @@ function main(): void {
             else delete process.env.ANTHROPIC_API_KEY;
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;
             if (oldIgPassword !== undefined) process.env.IG_PASSWORD = oldIgPassword;
-            fail(`start_session.execute threw: ${err instanceof Error ? err.message : String(err)}`);
+            fail(`plugin smoke execute threw: ${err instanceof Error ? err.message : String(err)}`);
         });
 }
 
