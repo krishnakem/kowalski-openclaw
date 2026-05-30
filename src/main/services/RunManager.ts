@@ -6,10 +6,11 @@ import { Kowalski } from './Kowalski.js';
 import { DigestGeneration } from './DigestGeneration.js';
 import { Extractor } from './Extractor.js';
 import { isOnline, isNetworkError, startOfflineWatchdog, OFFLINE_ERROR, CREDITS_DEPLETED_ERROR } from './NetworkMonitor.js';
-import { ExtractionBlock } from '../../types/instagram.js';
+import { CapturedPost, ExtractionBlock } from '../../types/instagram.js';
 import type { KowalskiSession } from '../../core/KowalskiSession.js';
 
 type RunStatus = 'idle' | 'running';
+type RunAbortReason = 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop';
 
 // RunManager is kept as a singleton (minimum-diff with Stage 1 call sites);
 // bindSession is called once before startRun. The host is responsible for
@@ -63,7 +64,7 @@ export class RunManager {
     // Why the current run is (or was) aborting. Set at the point of abort so
     // the catch-path partial-record writer can label the record. Cleared at
     // the start of each run.
-    private abortReason: 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop' | null = null;
+    private abortReason: RunAbortReason | null = null;
 
     // Stop-marker file poller. Callers (notably the stop_run tool) drop an
     // empty file at `${scratchDir}/STOP_REQUESTED` and we pick it up at the
@@ -412,7 +413,17 @@ export class RunManager {
             const analysisWithImages = {
                 ...analysis,
                 images: imageMetadata,
-                ...(abortReason ? { aborted: true, abortReason } : {})
+                ...(abortReason
+                    ? {
+                        aborted: true,
+                        abortReason,
+                        metadata: {
+                            ...((analysis as any).metadata ?? {}),
+                            aborted: true,
+                            abortReason,
+                        },
+                    }
+                    : {})
             };
             const previewSource = analysis.markdown
                 ? analysis.markdown.replace(/^#.*$/m, '').replace(/[#*_>`-]/g, '').trim().slice(0, 100)
@@ -488,23 +499,56 @@ export class RunManager {
                 }
             }
 
-            // Write a partial record so aborted / timed-out / offline runs
-            // still produce an artifact under analysis_records/. The success
-            // path above handles the happy case; this path covers every other
-            // exit so a run is never completely lost.
-            if (!this.abortReason) {
-                this.abortReason = offline ? 'offline' : 'external';
+            const abortReason: RunAbortReason =
+                (this.abortReason as RunAbortReason | null) ?? (offline ? 'offline' : 'external');
+            this.abortReason = abortReason;
+
+            const captureCount = this.countCapturedFiles(rawStoriesDir, rawFeedDir);
+
+            // For graceful stops/timeouts, try to turn the captures already
+            // on disk into a real digest. Use a fresh bounded signal because
+            // the run-level signal is already aborted by definition here.
+            const gracefulAbort =
+                abortReason === 'user-stop' ||
+                abortReason === 'timeout-stories' ||
+                abortReason === 'timeout-feed';
+            if (gracefulAbort && captureCount > 0) {
+                try {
+                    const result = await this.writeBestEffortDigestRecord(session, {
+                        rawStoriesDir,
+                        rawFeedDir,
+                        abortReason,
+                        errorMessage: error?.message ?? String(error),
+                    });
+                    if (result) {
+                        this.finishRun();
+                        return result;
+                    }
+                } catch (digestErr) {
+                    console.error('🚀 Best-effort digest failed:', digestErr);
+                }
             }
-            try {
-                await this.writePartialRecord(session, {
-                    rawStoriesDir,
-                    rawFeedDir,
-                    abortReason: this.abortReason,
-                    errorMessage: error?.message ?? String(error),
-                });
-            } catch (writeErr) {
-                console.error('🚀 Failed to write partial record:', writeErr);
+
+            // If digest synthesis failed, still return a record when any
+            // capture exists so the plugin can produce a PDF and surface an
+            // artifact instead of marking the run failed.
+            if (captureCount > 0) {
+                try {
+                    const partial = await this.writePartialRecord(session, {
+                        rawStoriesDir,
+                        rawFeedDir,
+                        abortReason,
+                        errorMessage: error?.message ?? String(error),
+                    });
+                    this.finishRun();
+                    return partial;
+                } catch (writeErr) {
+                    console.error('🚀 Failed to write partial record:', writeErr);
+                }
             }
+
+            // True zero-artifact failures (pre-flight offline, missing key,
+            // credits before capture, etc.) still return null.
         }
 
         this.finishRun();
@@ -517,6 +561,174 @@ export class RunManager {
      * generated — the record just lists what got captured plus an
      * `aborted: true` flag and the `abortReason` tag.
      */
+    private countCapturedFiles(rawStoriesDir: string | null, rawFeedDir: string | null): number {
+        const count = (dir: string | null) => {
+            if (!dir || !fs.existsSync(dir)) return 0;
+            return fs.readdirSync(dir).filter((f: string) => f.endsWith('.jpg')).length;
+        };
+        return count(rawStoriesDir) + count(rawFeedDir);
+    }
+
+    private loadBestCaptures(
+        rawStoriesDir: string | null,
+        rawFeedDir: string | null
+    ): CapturedPost[] {
+        const loadCaptured = (dir: string | null, source: 'story' | 'feed') => {
+            if (!dir || !fs.existsSync(dir)) {
+                return [] as Array<{ screenshot: Buffer; source: 'story' | 'feed'; imagePath: string; extraction?: ExtractionBlock }>;
+            }
+            return fs.readdirSync(dir)
+                .filter((f: string) => f.endsWith('.jpg'))
+                .sort()
+                .map((filename: string) => {
+                    const imagePath = path.join(dir, filename);
+                    const jsonPath = path.join(dir, filename.replace('.jpg', '.json'));
+                    let extraction: ExtractionBlock | undefined;
+                    if (fs.existsSync(jsonPath)) {
+                        try {
+                            const sidecar = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+                            if (sidecar && typeof sidecar.extraction === 'object') {
+                                extraction = sidecar.extraction as ExtractionBlock;
+                            }
+                        } catch {
+                            // ignore malformed sidecar — image still loads
+                        }
+                    }
+                    return {
+                        screenshot: fs.readFileSync(imagePath),
+                        source,
+                        imagePath,
+                        extraction
+                    };
+                });
+        };
+
+        return [...loadCaptured(rawStoriesDir, 'story'), ...loadCaptured(rawFeedDir, 'feed')]
+            .map((cap, index) => ({
+                id: index + 1,
+                screenshot: cap.screenshot,
+                source: cap.source as 'feed' | 'story' | 'profile' | 'carousel',
+                timestamp: Date.now(),
+                scrollPosition: 0,
+                imagePath: cap.imagePath,
+                extraction: cap.extraction
+            }));
+    }
+
+    private countCaptureQuality(captures: CapturedPost[]): { extracted: number; skipped: number; failed: number } {
+        let extracted = 0;
+        let skipped = 0;
+        let failed = 0;
+        for (const capture of captures) {
+            if (!capture.extraction) {
+                failed++;
+            } else if (capture.extraction.usefulness === 'skip') {
+                skipped++;
+            } else {
+                extracted++;
+            }
+        }
+        return { extracted, skipped, failed };
+    }
+
+    private metadataForRecord(record: AnalysisRecord): RunResultMetadata {
+        return {
+            id: record.id,
+            data: {
+                date: record.data.date,
+                title: record.data.title,
+                scheduledTime: record.data.scheduledTime,
+                location: record.data.location
+            },
+            leadStoryPreview: record.leadStoryPreview
+        };
+    }
+
+    private async writeBestEffortDigestRecord(
+        session: KowalskiSession,
+        opts: {
+            rawStoriesDir: string | null;
+            rawFeedDir: string | null;
+            abortReason: 'timeout-stories' | 'timeout-feed' | 'user-stop';
+            errorMessage: string;
+        }
+    ): Promise<RunResult | null> {
+        const bestCaptures = this.loadBestCaptures(opts.rawStoriesDir, opts.rawFeedDir);
+        if (bestCaptures.length === 0) return null;
+
+        const counts = this.countCaptureQuality(bestCaptures);
+        const digestGenerator = new DigestGeneration(session.anthropicApiKey);
+        const digestController = new AbortController();
+        const digestSignal = AbortSignal.any([
+            digestController.signal,
+            AbortSignal.timeout(90_000),
+        ]);
+
+        const analysis = await digestGenerator.generateDigest(bestCaptures, {
+            userName: session.runConfig.userName || 'User',
+            location: session.runConfig.location || ''
+        }, digestSignal);
+
+        const recordId = uuidv4();
+        const recordDir = path.join(session.outputDir, 'analysis_records');
+        const imagesDir = path.join(recordDir, recordId, 'images');
+        await fs.promises.mkdir(imagesDir, { recursive: true });
+
+        const imageMetadata: { id: number; filename: string; source: string }[] = [];
+        for (const capture of bestCaptures) {
+            const filename = `${capture.id}.jpg`;
+            const imagePath = path.join(imagesDir, filename);
+            await fs.promises.writeFile(imagePath, capture.screenshot);
+            imageMetadata.push({
+                id: capture.id,
+                filename,
+                source: capture.source
+            });
+        }
+
+        const analysisWithImages = {
+            ...analysis,
+            images: imageMetadata,
+            aborted: true,
+            abortReason: opts.abortReason,
+            metadata: {
+                ...((analysis as any).metadata ?? {}),
+                aborted: true,
+                abortReason: opts.abortReason,
+                errorMessage: opts.errorMessage,
+            },
+        };
+        const previewSource = analysis.markdown
+            ? analysis.markdown.replace(/^#.*$/m, '').replace(/[#*_>`-]/g, '').trim().slice(0, 100)
+            : analysis.sections[0]?.content[0]?.substring(0, 100);
+        const record: AnalysisRecord = {
+            id: recordId,
+            data: analysisWithImages,
+            leadStoryPreview: (previewSource || 'No preview available.') + (previewSource ? '...' : '')
+        };
+
+        const recordPath = path.join(recordDir, `${recordId}.json`);
+        const tempPath = path.join(recordDir, `${recordId}.tmp`);
+        await fs.promises.writeFile(tempPath, JSON.stringify(record, null, 2));
+        await fs.promises.rename(tempPath, recordPath);
+        console.log(`🚀 Best-effort digest written: ${recordPath} (${opts.abortReason}, ${bestCaptures.length} captures)`);
+
+        const metadata = this.metadataForRecord(record);
+        this.emit('analysis-ready', metadata);
+        return {
+            record,
+            metadata,
+            lastAnalysisDate: new Date().toISOString(),
+            analysisStatus: 'ready',
+            counts,
+            timedOutPhases: opts.abortReason === 'timeout-stories'
+                ? ['stories']
+                : opts.abortReason === 'timeout-feed'
+                    ? ['feed']
+                    : []
+        };
+    }
+
     private async writePartialRecord(
         session: KowalskiSession,
         opts: {
@@ -525,7 +737,7 @@ export class RunManager {
             abortReason: 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop';
             errorMessage: string;
         }
-    ): Promise<void> {
+    ): Promise<RunResult> {
         const listCaptures = (dir: string | null, source: 'story' | 'feed') => {
             if (!dir || !fs.existsSync(dir)) return [] as Array<{ source: string; filename: string; extracted: boolean }>;
             return fs.readdirSync(dir)
@@ -560,9 +772,34 @@ export class RunManager {
             data: {
                 aborted: true,
                 abortReason: opts.abortReason,
+                metadata: {
+                    aborted: true,
+                    abortReason: opts.abortReason,
+                    errorMessage: opts.errorMessage,
+                },
                 errorMessage: opts.errorMessage,
                 date: new Date().toISOString(),
                 title: `Partial digest (${opts.abortReason})`,
+                subtitle: `${captures.length} captures (${extractedCount} extracted)`,
+                location: session.runConfig.location || '',
+                scheduledTime: new Date().toLocaleTimeString('en-US', {
+                    hour: 'numeric',
+                    minute: '2-digit',
+                    hour12: true
+                }),
+                sections: [
+                    {
+                        heading: 'Run stopped before digest synthesis',
+                        content: [
+                            `The run stopped with reason "${opts.abortReason}" after ${captures.length} captures (${extractedCount} extracted).`,
+                            `Original error: ${opts.errorMessage}`,
+                        ],
+                    },
+                ],
+                markdown:
+                    `# Partial digest (${opts.abortReason})\n\n` +
+                    `The run stopped before digest synthesis after ${captures.length} captures (${extractedCount} extracted).\n\n` +
+                    `Original error: ${opts.errorMessage}`,
                 captureCounts: {
                     stories: stories.length,
                     feed: feed.length,
@@ -579,6 +816,25 @@ export class RunManager {
         await fs.promises.writeFile(tempPath, JSON.stringify(record, null, 2));
         await fs.promises.rename(tempPath, recordPath);
         console.log(`🚀 Partial record written: ${recordPath} (${opts.abortReason}, ${captures.length} captures)`);
+
+        const metadata = this.metadataForRecord(record);
+        this.emit('analysis-ready', metadata);
+        return {
+            record,
+            metadata,
+            lastAnalysisDate: new Date().toISOString(),
+            analysisStatus: 'ready',
+            counts: {
+                extracted: extractedCount,
+                skipped: 0,
+                failed: captures.length - extractedCount,
+            },
+            timedOutPhases: opts.abortReason === 'timeout-stories'
+                ? ['stories']
+                : opts.abortReason === 'timeout-feed'
+                    ? ['feed']
+                    : []
+        };
     }
 
     private emitError(message: string, kind: 'offline' | 'credits' | 'general' = 'general') {

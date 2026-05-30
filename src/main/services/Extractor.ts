@@ -195,6 +195,11 @@ export class Extractor {
         const maxRetries = 4;
 
         for (let attempt = 0; attempt < maxRetries; attempt++) {
+            const attemptTimeout = AbortSignal.timeout(60_000);
+            const signal = this.runSignal
+                ? AbortSignal.any([this.runSignal, attemptTimeout])
+                : attemptTimeout;
+
             try {
                 const response = await fetch('https://api.anthropic.com/v1/messages', {
                     method: 'POST',
@@ -221,9 +226,7 @@ export class Extractor {
                             ]
                         }]
                     }),
-                    signal: this.runSignal
-                        ? AbortSignal.any([this.runSignal, AbortSignal.timeout(30_000)])
-                        : AbortSignal.timeout(30_000)
+                    signal
                 });
 
                 if ((response.status === 529 || response.status === 429) && attempt < maxRetries - 1) {
@@ -259,6 +262,12 @@ export class Extractor {
                 const text: string = data.content?.[0]?.text || '';
                 return this.parseExtractionResponse(text);
             } catch (err) {
+                // The run is shutting down intentionally (stop/timeout/offline
+                // abort). Do not misclassify that as a transient network error
+                // or retry with backoff.
+                if (this.runSignal?.aborted) {
+                    throw err;
+                }
                 // Credit exhaustion is unrecoverable — re-throw immediately
                 // so it bubbles to RunManager for the UI to handle.
                 if (err instanceof Error && err.message === CREDITS_DEPLETED_ERROR) {

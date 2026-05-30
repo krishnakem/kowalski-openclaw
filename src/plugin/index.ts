@@ -425,10 +425,12 @@ export function register(api: PluginApi): () => void {
                 let pdfLine = '';
                 try {
                     const aborted = Boolean(
-                        (result.record.data as any)?.metadata?.aborted
+                        (result.record.data as any)?.metadata?.aborted ??
+                        (result.record.data as any)?.aborted
                     );
                     const abortReason =
-                        (result.record.data as any)?.metadata?.abortReason;
+                        (result.record.data as any)?.metadata?.abortReason ??
+                        (result.record.data as any)?.abortReason;
                     const pdfPath = await writeDigestPdf(result.record, {
                         downloadsDir: config.downloadsDir,
                         aborted,
@@ -441,8 +443,13 @@ export function register(api: PluginApi): () => void {
                     pdfLine = `- pdf: (failed to write — ${msg})\n`;
                 }
 
-                const aborted = Boolean((result.record.data as any)?.metadata?.aborted);
-                const abortReason = (result.record.data as any)?.metadata?.abortReason;
+                const aborted = Boolean(
+                    (result.record.data as any)?.metadata?.aborted ??
+                    (result.record.data as any)?.aborted
+                );
+                const abortReason =
+                    (result.record.data as any)?.metadata?.abortReason ??
+                    (result.record.data as any)?.abortReason;
                 const header =
                     `# Kowalski digest\n\n` +
                     `- record id: ${result.record.id}\n` +
