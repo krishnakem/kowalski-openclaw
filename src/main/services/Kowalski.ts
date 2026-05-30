@@ -4,8 +4,8 @@
  * Manages the session lifecycle: page creation, login verification,
  * session memory, and capture collection. No LLM calls — pure coordination.
  *
- * Phase 1: StoriesAgent (Haiku) — bounded stories browsing
- * Phase 2: FeedAgent (Sonnet) — feed browsing with remaining time budget
+ * Phase 1: StoriesAgent — bounded stories browsing
+ * Phase 2: FeedAgent — feed browsing with remaining time budget
  * Phase 3: Digest generation (handled downstream by RunManager)
  */
 
@@ -20,7 +20,6 @@ import { SessionMemory } from './SessionMemory.js';
 import { BrowserManager } from './BrowserManager.js';
 import * as path from 'path';
 import { BrowsingSession } from '../../types/instagram.js';
-import { ModelConfig } from '../../shared/modelConfig.js';
 import type { NavigationLoopConfig } from '../../types/navigation.js';
 import type { SessionSummary } from '../../types/session-memory.js';
 import type { BaseVisionAgent } from './BaseVisionAgent.js';
@@ -173,8 +172,7 @@ export class Kowalski {
             this.screenshotCollector.appendLogRaw(`# Session Log`);
             this.screenshotCollector.appendLogRaw(`**Started:** ${new Date().toISOString()}`);
             this.screenshotCollector.appendLogRaw(`**Budget:** ${targetMinutes} minutes`);
-            this.screenshotCollector.appendLogRaw(`**Stories Model:** ${ModelConfig.stories}`);
-            this.screenshotCollector.appendLogRaw(`**Feed Model:** ${ModelConfig.navigation}`);
+            this.screenshotCollector.appendLogRaw(`**Model Source:** OpenClaw configured provider`);
             this.screenshotCollector.appendLogRaw(`**Mode:** Multi-agent (StoriesAgent → FeedAgent)`);
             this.screenshotCollector.appendLogRaw(`\n---\n`);
 
@@ -197,7 +195,7 @@ export class Kowalski {
                 // the setTimeout is belt-and-braces in case the LLM gets
                 // wedged in a single long decision.
                 const STORIES_PHASE_MAX_MS = config?.storiesTimeoutMs ?? 15 * 60 * 1000;
-                console.log(`\n📖 Phase 1: Stories (hard cap: ${(STORIES_PHASE_MAX_MS / 60000).toFixed(1)} min, model: ${ModelConfig.stories})`);
+                console.log(`\n📖 Phase 1: Stories (hard cap: ${(STORIES_PHASE_MAX_MS / 60000).toFixed(1)} min, model: OpenClaw configured image model)`);
                 this.screenshotCollector.appendLogRaw(`\n## Phase 1: Stories\n`);
                 onPhaseChange?.('stories', { maxDurationMs: STORIES_PHASE_MAX_MS });
 
@@ -253,7 +251,7 @@ export class Kowalski {
                 const feedMaxMs = Math.min(remainingMs, FEED_PHASE_MAX_MS);
 
                 if (feedMaxMs > 30000) { // Only run feed if >30s remaining
-                    console.log(`\n📰 Phase 2: Feed (hard cap: ${(feedMaxMs / 60000).toFixed(1)} min, model: ${ModelConfig.navigation})`);
+                    console.log(`\n📰 Phase 2: Feed (hard cap: ${(feedMaxMs / 60000).toFixed(1)} min, model: OpenClaw configured image model)`);
                     this.screenshotCollector.appendLogRaw(`\n## Phase 2: Feed\n`);
                     onPhaseChange?.('feed', { maxDurationMs: feedMaxMs });
 

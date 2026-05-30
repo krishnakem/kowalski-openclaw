@@ -17,7 +17,7 @@ import { CapturedPost, ImageTag, TaggingResult } from '../../types/instagram.js'
 import { UsageService } from './UsageService.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
 import type { InferenceClient } from './Inference.js';
-import { inferenceUsageToTokenUsage } from './Inference.js';
+import { formatInferenceSource, inferenceUsageToTokenUsage } from './Inference.js';
 import { parseJsonObjectFromText } from './jsonResponse.js';
 
 export class ImageTagger {
@@ -44,7 +44,7 @@ export class ImageTagger {
             return { tags: [], tokensUsed: 0 };
         }
 
-        console.log(`🏷️ Tagging ${captures.length} images with ${ModelConfig.tagging}...`);
+        console.log(`🏷️ Tagging ${captures.length} images with OpenClaw configured image model...`);
 
         try {
             const { tags, tokensUsed } = await this.tagIndividually(captures);
@@ -82,6 +82,9 @@ export class ImageTagger {
                 purpose: 'Kowalski image tagging',
                 expectJson: true,
             });
+            if (result.provider || result.model) {
+                console.log(`🏷️ Runtime model: ${formatInferenceSource(result.provider, result.model)}`);
+            }
             if (result.usage) {
                 tokensUsed += (result.usage.inputTokens || 0) + (result.usage.outputTokens || 0);
                 await this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));

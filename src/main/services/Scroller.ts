@@ -25,6 +25,7 @@ import { ModelConfig } from '../../shared/modelConfig.js';
 // CaptureSource import removed — no longer used (capture handled by filter agent)
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
 import type { InferenceClient, InferenceMessage } from './Inference.js';
+import { formatInferenceSource } from './Inference.js';
 import { parseJsonObjectFromText } from './jsonResponse.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -834,6 +835,11 @@ export class Scroller {
                     purpose: `Kowalski ${this.activeModel} navigation`,
                     expectJson: true,
                 });
+                if (result.provider || result.model) {
+                    const source = formatInferenceSource(result.provider, result.model);
+                    console.log(`  🧠 Runtime model: ${source}`);
+                    this.collector.appendLog(`  🧠 Runtime model: ${source}`);
+                }
 
                 // Log token usage
                 const usage = result.usage;

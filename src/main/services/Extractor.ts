@@ -21,7 +21,7 @@ import * as path from 'path';
 import { ModelConfig } from '../../shared/modelConfig.js';
 import { UsageService } from './UsageService.js';
 import type { InferenceClient } from './Inference.js';
-import { inferenceUsageToTokenUsage } from './Inference.js';
+import { formatInferenceSource, inferenceUsageToTokenUsage } from './Inference.js';
 import { parseJsonObjectFromText } from './jsonResponse.js';
 import { ExtractionBlock, ExtractionContentType, ExtractionUsefulness, ExtractionSkipReason } from '../../types/instagram.js';
 
@@ -210,6 +210,9 @@ export class Extractor {
                 if (result.usage) {
                     this.tokensUsed += (result.usage.inputTokens || 0) + (result.usage.outputTokens || 0);
                     this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
+                }
+                if (result.provider || result.model) {
+                    console.log(`  🧠 Runtime model: ${formatInferenceSource(result.provider, result.model)}`);
                 }
 
                 return this.parseExtractionResponse(result.text);

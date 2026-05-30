@@ -20,6 +20,7 @@ import { HumanScroll } from './HumanScroll.js';
 import { ScreenshotCollector } from './ScreenshotCollector.js';
 import { isOnline, isNetworkError, OFFLINE_ERROR } from './NetworkMonitor.js';
 import type { InferenceClient, InferenceMessage } from './Inference.js';
+import { formatInferenceSource } from './Inference.js';
 import { parseJsonObjectFromText } from './jsonResponse.js';
 import { labelElements, type LabeledElement } from '../../utils/elementLabeler.js';
 
@@ -216,9 +217,8 @@ export abstract class BaseVisionAgent {
         this.viewportWidth = vp?.width || 1080;
         this.viewportHeight = vp?.height || 1920;
 
-        const model = this.getModel();
-        console.log(`\n👁️  ${this.getAgentName()} starting (viewport: ${this.viewportWidth}x${this.viewportHeight}, model: ${model})`);
-        this.collector.appendLog(`👁️ ${this.getAgentName()} starting (viewport: ${this.viewportWidth}x${this.viewportHeight}, model: ${model})`);
+        console.log(`\n👁️  ${this.getAgentName()} starting (viewport: ${this.viewportWidth}x${this.viewportHeight}, model: OpenClaw configured image model)`);
+        this.collector.appendLog(`👁️ ${this.getAgentName()} starting (viewport: ${this.viewportWidth}x${this.viewportHeight}, model: OpenClaw configured image model)`);
 
         // Set up raw screenshot directory
         if (this.config.rawDir) {
@@ -803,6 +803,11 @@ export abstract class BaseVisionAgent {
                     purpose: `${this.getAgentName()} navigation`,
                     expectJson: true,
                 });
+                if (result.provider || result.model) {
+                    const source = formatInferenceSource(result.provider, result.model);
+                    console.log(`  🧠 Runtime model: ${source}`);
+                    this.collector.appendLog(`  🧠 Runtime model: ${source}`);
+                }
 
                 const usage = result.usage;
                 if (usage) {

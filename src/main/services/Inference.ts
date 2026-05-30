@@ -57,6 +57,13 @@ export interface InferenceClient {
     complete(request: InferenceRequest): Promise<InferenceResult>;
 }
 
+export function formatInferenceSource(provider?: string, model?: string): string {
+    if (provider && model) return `${provider}/${model}`;
+    if (model) return model;
+    if (provider) return provider;
+    return 'OpenClaw runtime';
+}
+
 export interface OpenClawRuntimeLike {
     config?: {
         current?: () => unknown;

@@ -171,16 +171,9 @@ support.
 | --- | --- |
 | `IG_USERNAME`, `IG_PASSWORD` | Enable unattended use of the headless agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool returns `pending_credentials`. Credentials are never logged or passed through any LLM payload. |
 | `KOWALSKI_CONNECTIVITY_PROBE_URL` | Optional URL for the generic offline watchdog probe. Defaults to `https://www.gstatic.com/generate_204`. |
-| `KOWALSKI_STORIES_MODEL` | Stories-phase navigation. Default `claude-sonnet-4-6`. |
-| `KOWALSKI_NAV_MODEL` | Feed-phase navigation. Default `claude-sonnet-4-6`. |
-| `KOWALSKI_SPECIALIST_MODEL` | Carousel / stuck recovery. Default `claude-sonnet-4-6`. |
-| `KOWALSKI_VISION_MODEL` | In-loop vision calls. Default `claude-sonnet-4-6`. |
-| `KOWALSKI_EXTRACTION_MODEL` | Per-capture structured extraction. Default `claude-sonnet-4-6`. |
-| `KOWALSKI_TAGGING_MODEL` | Per-image tagging. Default `claude-sonnet-4-6`. |
-| `KOWALSKI_DIGEST_MODEL` | Text-only digest synthesis. Default `claude-haiku-4-5`. |
-| `KOWALSKI_ANALYSIS_MODEL` | Analysis / insights pass. Default `claude-sonnet-4-6`. |
 
-Model defaults live in [src/shared/modelConfig.ts](src/shared/modelConfig.ts).
+Model selection is handled by OpenClaw. Configure the default text and image
+models in OpenClaw, including `agents.defaults.imageModel` for screenshots.
 
 ### Session `runConfig` (threaded through [KowalskiSession](src/core/KowalskiSession.ts))
 
