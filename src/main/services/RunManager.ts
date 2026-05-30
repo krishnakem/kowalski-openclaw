@@ -135,23 +135,26 @@ export class RunManager {
         }
     }
 
-    public stopRun(): void {
+    public stopRun(reason: RunAbortReason = 'external'): void {
         if (this.status !== 'running') {
             console.log('🛑 stopRun: no active run to stop');
             return;
         }
-        if (!this.abortReason) this.abortReason = 'external';
+        if (!this.abortReason) this.abortReason = reason;
         console.log(`🛑 Stopping active run (reason=${this.abortReason})...`);
 
-        // Hard stop: abort any in-flight fetch to Anthropic so the run
-        // can't hang waiting on a slow LLM response. This is the same
-        // mechanism notifyOffline() uses, and it's what makes the
-        // STOP_REQUESTED escape hatch finalize within ~30s instead of
-        // whenever the current LLM turn happens to return.
-        try {
-            this.runAbortController?.abort();
-        } catch (err) {
-            console.warn('🛑 stopRun: abort controller threw (ignored)', err);
+        // User-initiated stops during browsing mirror the desktop app: stop
+        // the active agent cooperatively and let the run unwind into digest
+        // generation with the captures already on disk. Non-user stops, and
+        // stops after browsing has ended, still hard-abort in-flight run-level
+        // LLM work so teardown cannot hang.
+        const shouldHardAbort = this.abortReason !== 'user-stop' || !this.activeScraper;
+        if (shouldHardAbort) {
+            try {
+                this.runAbortController?.abort();
+            } catch (err) {
+                console.warn('🛑 stopRun: abort controller threw (ignored)', err);
+            }
         }
 
         // Cooperative stop for the scraper/extractors — the agent checks
@@ -204,7 +207,7 @@ export class RunManager {
             if (fs.existsSync(stopMarker)) {
                 console.log('🛑 Stop marker detected — requesting graceful stop');
                 if (!this.abortReason) this.abortReason = 'user-stop';
-                this.stopRun();
+                this.stopRun('user-stop');
             }
         }, 3000);
 
@@ -767,6 +770,11 @@ export class RunManager {
         const recordDir = path.join(session.outputDir, 'analysis_records');
         await fs.promises.mkdir(recordDir, { recursive: true });
 
+        const partialText = this.describePartialStop(opts.abortReason, captures.length, extractedCount);
+        const includeOriginalError =
+            opts.abortReason !== 'user-stop' ||
+            !/abort|aborted|operation was aborted/i.test(opts.errorMessage);
+
         const record = {
             id: recordId,
             data: {
@@ -779,7 +787,7 @@ export class RunManager {
                 },
                 errorMessage: opts.errorMessage,
                 date: new Date().toISOString(),
-                title: `Partial digest (${opts.abortReason})`,
+                title: partialText.title,
                 subtitle: `${captures.length} captures (${extractedCount} extracted)`,
                 location: session.runConfig.location || '',
                 scheduledTime: new Date().toLocaleTimeString('en-US', {
@@ -789,17 +797,17 @@ export class RunManager {
                 }),
                 sections: [
                     {
-                        heading: 'Run stopped before digest synthesis',
+                        heading: partialText.heading,
                         content: [
-                            `The run stopped with reason "${opts.abortReason}" after ${captures.length} captures (${extractedCount} extracted).`,
-                            `Original error: ${opts.errorMessage}`,
+                            partialText.body,
+                            ...(includeOriginalError ? [`Original error: ${opts.errorMessage}`] : []),
                         ],
                     },
                 ],
                 markdown:
-                    `# Partial digest (${opts.abortReason})\n\n` +
-                    `The run stopped before digest synthesis after ${captures.length} captures (${extractedCount} extracted).\n\n` +
-                    `Original error: ${opts.errorMessage}`,
+                    `# ${partialText.title}\n\n` +
+                    partialText.body +
+                    (includeOriginalError ? `\n\nOriginal error: ${opts.errorMessage}` : ''),
                 captureCounts: {
                     stories: stories.length,
                     feed: feed.length,
@@ -808,7 +816,7 @@ export class RunManager {
                 },
                 captures,
             },
-            leadStoryPreview: `Run aborted (${opts.abortReason}) after ${captures.length} captures (${extractedCount} extracted).`,
+            leadStoryPreview: partialText.preview,
         };
 
         const recordPath = path.join(recordDir, `${recordId}.json`);
@@ -834,6 +842,45 @@ export class RunManager {
                 : opts.abortReason === 'timeout-feed'
                     ? ['feed']
                     : []
+        };
+    }
+
+    private describePartialStop(
+        abortReason: 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop',
+        captures: number,
+        extracted: number
+    ): { title: string; heading: string; body: string; preview: string } {
+        const countText = `${captures} captures (${extracted} extracted)`;
+        if (abortReason === 'user-stop') {
+            return {
+                title: 'Partial digest (stopped early)',
+                heading: 'Run stopped early by request',
+                body: `The run was stopped by request before digest synthesis after ${countText}.`,
+                preview: `Run stopped early after ${countText}.`,
+            };
+        }
+        if (abortReason === 'timeout-stories' || abortReason === 'timeout-feed') {
+            const phase = abortReason === 'timeout-stories' ? 'stories' : 'feed';
+            return {
+                title: `Partial digest (${phase} timed out)`,
+                heading: `${phase[0].toUpperCase()}${phase.slice(1)} phase timed out`,
+                body: `The ${phase} phase reached its time limit before digest synthesis after ${countText}.`,
+                preview: `${phase[0].toUpperCase()}${phase.slice(1)} phase timed out after ${countText}.`,
+            };
+        }
+        if (abortReason === 'offline') {
+            return {
+                title: 'Partial digest (network interrupted)',
+                heading: 'Network interrupted the run',
+                body: `The run lost network connectivity before digest synthesis after ${countText}.`,
+                preview: `Network interrupted the run after ${countText}.`,
+            };
+        }
+        return {
+            title: 'Partial digest (ended early)',
+            heading: 'Run ended before digest synthesis',
+            body: `The run ended before digest synthesis after ${countText}.`,
+            preview: `Run ended early after ${countText}.`,
         };
     }
 

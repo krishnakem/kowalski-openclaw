@@ -21,9 +21,9 @@ import type { AnalysisObject, ArchivedAnalysis } from '../types/analysis.js';
 export interface DigestPdfOptions {
     /** Override output directory (defaults to ~/Downloads). */
     downloadsDir?: string;
-    /** Set true when the run was aborted/timed-out to add an ABORTED banner. */
+    /** Set true when the run stopped early or timed out to add a partial-run banner. */
     aborted?: boolean;
-    /** Optional abortReason — included in the banner when aborted is true. */
+    /** Optional abortReason — rendered as a user-facing reason when aborted is true. */
     abortReason?: string;
 }
 
@@ -68,12 +68,12 @@ export async function writeDigestPdf(
     const stream = fs.createWriteStream(outPath);
     doc.pipe(stream);
 
-    // --- Banner for aborted runs ---
+    // --- Banner for partial runs ---
     if (opts.aborted) {
         doc.fillColor('#aa2200');
         emitPlain(
             doc,
-            `⚠ PARTIAL DIGEST — run aborted${opts.abortReason ? ` (${opts.abortReason})` : ''}`,
+            `⚠ PARTIAL DIGEST — ${partialRunLabel(opts.abortReason)}`,
             FONT.bodyBold,
             11
         );
@@ -106,6 +106,21 @@ export async function writeDigestPdf(
         stream.on('error', reject);
     });
     return outPath;
+}
+
+function partialRunLabel(reason?: string): string {
+    switch (reason) {
+        case 'user-stop':
+            return 'run stopped early by request';
+        case 'timeout-stories':
+            return 'stories phase timed out';
+        case 'timeout-feed':
+            return 'feed phase timed out';
+        case 'offline':
+            return 'network interrupted the run';
+        default:
+            return reason ? `run ended early (${reason})` : 'run ended early';
+    }
 }
 
 function registerFonts(doc: PDFKit.PDFDocument): void {

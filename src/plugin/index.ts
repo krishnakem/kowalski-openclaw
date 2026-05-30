@@ -1490,7 +1490,7 @@ export function register(api: PluginApi): () => void {
             }
 
             try {
-                RunManager.getInstance().stopRun();
+                RunManager.getInstance().stopRun('user-stop');
             } catch (err) {
                 // Non-fatal: the marker poller is the fallback.
                 const msg = err instanceof Error ? err.message : String(err);
