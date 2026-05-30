@@ -18,6 +18,7 @@ import { UsageService } from './UsageService.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
 import type { InferenceClient } from './Inference.js';
 import { inferenceUsageToTokenUsage } from './Inference.js';
+import { parseJsonObjectFromText } from './jsonResponse.js';
 
 export class ImageTagger {
     private inferenceClient: InferenceClient;
@@ -207,7 +208,7 @@ IMPORTANT: You must return a tag for EVERY image from 1 to ${imageCount}. Do not
      */
     private parseTaggingResponse(content: string, expectedCount: number): ImageTag[] {
         try {
-            const parsed = JSON.parse(content);
+            const parsed = parseJsonObjectFromText<any>(content);
             const rawTags: ImageTag[] = parsed.tags || [];
 
             // Build a map for quick lookup

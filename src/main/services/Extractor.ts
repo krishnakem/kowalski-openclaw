@@ -22,6 +22,7 @@ import { ModelConfig } from '../../shared/modelConfig.js';
 import { UsageService } from './UsageService.js';
 import type { InferenceClient } from './Inference.js';
 import { inferenceUsageToTokenUsage } from './Inference.js';
+import { parseJsonObjectFromText } from './jsonResponse.js';
 import { ExtractionBlock, ExtractionContentType, ExtractionUsefulness, ExtractionSkipReason } from '../../types/instagram.js';
 
 export interface ExtractorStats {
@@ -231,7 +232,8 @@ export class Extractor {
                 }
                 if (attempt < maxRetries - 1) {
                     const delay = 5000 * Math.pow(2, attempt);
-                    console.warn(`  🧠 ⏳ Extractor LLM network error (attempt ${attempt + 1}/${maxRetries - 1}). Retrying in ${(delay / 1000).toFixed(1)}s...`);
+                    const kind = err instanceof SyntaxError ? 'parse error' : 'provider error';
+                    console.warn(`  🧠 ⏳ Extractor LLM ${kind} (attempt ${attempt + 1}/${maxRetries - 1}). Retrying in ${(delay / 1000).toFixed(1)}s...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
                     continue;
                 }
@@ -243,10 +245,7 @@ export class Extractor {
     }
 
     private parseExtractionResponse(text: string): ExtractionBlock {
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error('Extractor returned no JSON');
-
-        const raw = JSON.parse(jsonMatch[0]);
+        const raw = parseJsonObjectFromText<any>(text);
         return this.normalizeExtraction(raw);
     }
 
@@ -337,11 +336,11 @@ OUTPUT — STRICT JSON, NO PROSE, NO CODE FENCES
   },
   "numbers": ["118-112", "LeBron 34 pts", "10-22 FG"],
   "dates": ["Apr 12", "Saturday 8pm"],
-  "narrative": "1-3 sentences, literal description of what is on screen. Use verbatim scores and names. No meta-phrasing.",
+  "narrative": "one short literal sentence. Use verbatim scores and names. No meta-phrasing.",
   "usefulness": "high" | "medium" | "low" | "skip",
   "skipReason": "loading_spinner" | "duplicate_frame" | "ad" | "blank" | "navigation_chrome" | "transitional" | null
 }
 
-Return ONLY the JSON object. No explanation. No code fences.`;
+Keep the JSON compact. Use at most 5 items per array. Return ONLY the JSON object. No explanation. No code fences.`;
     }
 }

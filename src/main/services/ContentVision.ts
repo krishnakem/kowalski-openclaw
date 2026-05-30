@@ -19,6 +19,7 @@ import { UsageService } from './UsageService.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
 import type { InferenceClient } from './Inference.js';
 import { inferenceUsageToTokenUsage } from './Inference.js';
+import { parseJsonObjectFromText } from './jsonResponse.js';
 
 /**
  * Configuration for exponential backoff retry logic.
@@ -221,7 +222,7 @@ If no posts visible, return: {"posts": []}`;
             const content = result.text;
 
             // 4. Parse response
-            const parsed = JSON.parse(content);
+            const parsed = parseJsonObjectFromText<any>(content);
             const posts = Array.isArray(parsed) ? parsed : (parsed.posts || []);
 
             return {
@@ -285,13 +286,7 @@ Return ONLY valid JSON: {"username": "", "caption": "", "visualDescription": ""}
                 await this.usageService.incrementUsage(inferenceUsageToTokenUsage(result.usage));
             }
 
-            // Parse response, stripping any markdown code blocks if present
-            let rawContent = result.text || '{}';
-            if (!rawContent) rawContent = '{}';
-            // Strip ```json ... ``` wrapper if present
-            rawContent = rawContent.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-
-            const content = JSON.parse(rawContent);
+            const content = parseJsonObjectFromText<any>(result.text || '{}');
 
             return {
                 username: content.username || 'unknown',

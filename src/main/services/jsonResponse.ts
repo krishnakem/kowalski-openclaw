@@ -82,7 +82,7 @@ function repairTruncatedObject(text: string): string | null {
     const fence = candidate.indexOf('```');
     if (fence >= 0) candidate = candidate.slice(0, fence).trim();
 
-    let depth = 0;
+    const closers: string[] = [];
     let inString = false;
     let escaped = false;
 
@@ -100,15 +100,22 @@ function repairTruncatedObject(text: string): string | null {
         }
 
         if (ch === '"') inString = true;
-        else if (ch === '{') depth++;
-        else if (ch === '}') depth--;
+        else if (ch === '{') closers.push('}');
+        else if (ch === '[') closers.push(']');
+        else if ((ch === '}' || ch === ']') && closers[closers.length - 1] === ch) closers.pop();
     }
 
     if (inString) candidate += '"';
-    while (depth > 0) {
-        candidate += '}';
-        depth--;
+
+    candidate = candidate.trimEnd();
+    while (candidate.endsWith(',')) {
+        candidate = candidate.slice(0, -1).trimEnd();
     }
+    if (candidate.endsWith(':')) {
+        candidate += ' null';
+    }
+
+    for (let i = closers.length - 1; i >= 0; i--) candidate += closers[i];
 
     return candidate;
 }

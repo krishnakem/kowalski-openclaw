@@ -17,6 +17,7 @@ import { UsageService } from './UsageService.js';
 import { ModelConfig } from '../../shared/modelConfig.js';
 import type { InferenceClient } from './Inference.js';
 import { inferenceUsageToTokenUsage } from './Inference.js';
+import { parseJsonObjectFromText } from './jsonResponse.js';
 
 // Token management constants
 const MAX_CAPTION_LENGTH = 280;  // Tweet-length limit per caption
@@ -308,7 +309,7 @@ Return valid JSON:
         }
 
         try {
-            const parsed = JSON.parse(content);
+            const parsed = parseJsonObjectFromText<any>(content);
 
             // Validate structure
             if (!parsed.title || !parsed.sections || !Array.isArray(parsed.sections)) {
