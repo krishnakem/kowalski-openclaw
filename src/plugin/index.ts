@@ -1,11 +1,12 @@
 /**
  * OpenClaw plugin entrypoint for Kowalski.
  *
- * Exposes six tools that drive the Kowalski pipeline: start_session,
- * login, run_digest, get_session_status, reset_memory, end_session.
- * See REFACTOR_NOTES.md › Stage 3 for the design rationale (why
- * run_digest is a single blocking tool, why this uses the plain
- * default-export plugin shape instead of `definePluginEntry`, etc.).
+ * Exposes nine tools that drive the Kowalski pipeline. `start_session`
+ * is the preferred entrypoint: it probes cookies, starts login if needed,
+ * and starts the digest automatically once Instagram auth is verified.
+ * See REFACTOR_NOTES.md for the stage-by-stage refactor history and why
+ * this uses the plain default-export plugin shape instead of
+ * `definePluginEntry`.
  *
  * The module is loaded once per gateway boot and `register(api)` is
  * called exactly once. All per-session state lives in the `sessions`
@@ -215,21 +216,223 @@ export function register(api: PluginApi): () => void {
         }
     }
 
+    async function startDigestForEntry(
+        sessionId: string,
+        entry: SessionEntry,
+        triggeredBy: string,
+        extraPayload: Record<string, unknown> = {}
+    ): Promise<AgentToolResult> {
+        // Guard against concurrent runs. If there's already an active
+        // digest that isn't finished, reject — the user should either
+        // wait, poll get_session_status, or call stop_run first.
+        if (entry.activeDigest && entry.activeDigest.status === 'running') {
+            return jsonTextResult({
+                status: 'already_running',
+                session_id: sessionId,
+                triggered_by: triggeredBy,
+                started_at: new Date(entry.activeDigest.startedAt).toISOString(),
+                message:
+                    'A digest is already running on this session. Poll get_session_status for progress, or call stop_run to abort.',
+                ...extraPayload,
+            });
+        }
+
+        // Re-bind the singletons to this session — another session may have
+        // been the last to bind. Cheap and safe.
+        BrowserManager.getInstance().bindSession(entry.session);
+        RunManager.getInstance().bindSession(entry.session);
+        UsageService.getInstance().configure(entry.session.scratchDir);
+
+        const STORIES_CAP_MS = entry.session.runConfig.storiesTimeoutMs ?? 15 * 60_000;
+        const FEED_CAP_MS = entry.session.runConfig.feedTimeoutMs ?? 30 * 60_000;
+        const runStartedAt = Date.now();
+        let currentPhase: 'stories' | 'feed' | 'idle' = 'idle';
+        let phaseStartedAt = runStartedAt;
+
+        const fmt = (ms: number): string => {
+            if (ms < 0) ms = 0;
+            const s = Math.floor(ms / 1000);
+            const m = Math.floor(s / 60);
+            const secs = s - m * 60;
+            return `${m}m${secs.toString().padStart(2, '0')}s`;
+        };
+
+        log.info(
+            `run_digest started by ${triggeredBy} (non-blocking) — phases=${JSON.stringify(entry.session.runConfig.phases)} storiesCap=${fmt(STORIES_CAP_MS)} feedCap=${fmt(FEED_CAP_MS)} · ticks every 5 min + on phase transitions. Say "stop" any time to abort.`
+        );
+
+        const onPhase = (payload: { phase?: 'stories' | 'feed' }): void => {
+            if (payload?.phase === 'stories' || payload?.phase === 'feed') {
+                const previous = currentPhase;
+                currentPhase = payload.phase;
+                phaseStartedAt = Date.now();
+                const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
+                if (previous === 'idle') {
+                    log.info(`⏱ phase=${currentPhase} STARTED — cap=${fmt(cap)}`);
+                } else {
+                    log.info(
+                        `⏱ phase ${previous} DONE → ${currentPhase} STARTED — ${currentPhase} cap=${fmt(cap)}  totalElapsed=${fmt(Date.now() - runStartedAt)}`
+                    );
+                }
+            }
+        };
+        entry.session.events.on('run-phase', onPhase);
+
+        const TICK_INTERVAL_MS = 5 * 60_000;
+        const tick = setInterval(() => {
+            const now = Date.now();
+            const totalElapsed = now - runStartedAt;
+            if (currentPhase === 'idle') {
+                log.info(
+                    `⏱ phase=idle  totalElapsed=${fmt(totalElapsed)} (waiting for first phase to start…)`
+                );
+                return;
+            }
+            const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
+            const phaseElapsed = now - phaseStartedAt;
+            const remaining = cap - phaseElapsed;
+            log.info(
+                `⏱ phase=${currentPhase}  elapsed=${fmt(phaseElapsed)}/${fmt(cap)}  remaining=${fmt(remaining)}  totalElapsed=${fmt(totalElapsed)}`
+            );
+        }, TICK_INTERVAL_MS);
+
+        // Initialise ActiveDigest so get_session_status + stop_run can
+        // see a run is in flight.
+        entry.activeDigest = {
+            startedAt: runStartedAt,
+            status: 'running',
+            tickerHandle: tick,
+            detachPhaseListener: () => {
+                try { entry.session.events.off('run-phase', onPhase); } catch { /* ignore */ }
+            },
+        };
+
+        // Fire-and-forget: run the pipeline in the background. The
+        // promise writes its outcome back into entry.activeDigest and
+        // tears down the ticker/listeners when done.
+        (async () => {
+            try {
+                const result = await RunManager.getInstance().startRun({
+                    phases: entry.session.runConfig.phases,
+                });
+                if (!result) {
+                    entry.activeDigest!.status = 'failed';
+                    entry.activeDigest!.errorMessage =
+                        'RunManager returned null (another run already in progress, or the run aborted before producing a digest).';
+                    log.warn(`❌ run_digest: RunManager returned null (no result)`);
+                    return;
+                }
+
+                const recordPath = path.join(
+                    entry.session.outputDir,
+                    'analysis_records',
+                    `${result.record.id}.json`
+                );
+
+                let timeoutSummary = '';
+                const timedOut = result.timedOutPhases ?? [];
+                if (timedOut.length > 0) {
+                    const storyCaps = result.record.data?.images?.filter((i: any) => i.source === 'story').length ?? 0;
+                    const feedCaps = result.record.data?.images?.filter((i: any) => i.source === 'feed').length ?? 0;
+                    const parts: string[] = [];
+                    if (timedOut.includes('stories')) parts.push('Stories phase timed out after 15 minutes');
+                    if (timedOut.includes('feed')) parts.push('Feed phase timed out after 30 minutes');
+                    if (timedOut.includes('stories') && !timedOut.includes('feed')) {
+                        parts.push('feed phase ran to completion');
+                    } else if (timedOut.includes('feed') && !timedOut.includes('stories')) {
+                        parts.push('stories phase ran to completion');
+                    }
+                    timeoutSummary =
+                        `- ⚠️ ${parts.join('; ')}. ` +
+                        `Digest saved with ${storyCaps} story captures + ${feedCaps} feed captures.\n`;
+                }
+
+                let pdfLine = '';
+                try {
+                    const aborted = Boolean(
+                        (result.record.data as any)?.metadata?.aborted
+                    );
+                    const abortReason =
+                        (result.record.data as any)?.metadata?.abortReason;
+                    const pdfPath = await writeDigestPdf(result.record, {
+                        downloadsDir: config.downloadsDir,
+                        aborted,
+                        abortReason,
+                    });
+                    pdfLine = `- pdf: ${pdfPath}\n`;
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    log.warn('[kowalski] PDF export failed (non-fatal)', { msg });
+                    pdfLine = `- pdf: (failed to write — ${msg})\n`;
+                }
+
+                const aborted = Boolean((result.record.data as any)?.metadata?.aborted);
+                const abortReason = (result.record.data as any)?.metadata?.abortReason;
+                const header =
+                    `# Kowalski digest\n\n` +
+                    `- record id: ${result.record.id}\n` +
+                    `- saved to: ${recordPath}\n` +
+                    pdfLine +
+                    `- captures: extracted=${result.counts.extracted}, skipped=${result.counts.skipped}, failed=${result.counts.failed}\n` +
+                    timeoutSummary +
+                    `- lead story: ${result.record.leadStoryPreview || '(none)'}\n\n`;
+                const body = '```json\n' + JSON.stringify(result.record.data, null, 2) + '\n```\n';
+
+                entry.activeDigest!.resultText = header + body;
+                entry.activeDigest!.status =
+                    aborted && abortReason === 'user-stop' ? 'stopped' : 'completed';
+                log.info(
+                    `✅ run_digest complete — totalElapsed=${fmt(Date.now() - runStartedAt)} record=${result.record.id} status=${entry.activeDigest!.status}`
+                );
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                entry.activeDigest!.status = 'failed';
+                entry.activeDigest!.errorMessage = msg;
+                log.warn(
+                    `❌ run_digest failed — totalElapsed=${fmt(Date.now() - runStartedAt)} error=${msg}`
+                );
+            } finally {
+                if (entry.activeDigest?.tickerHandle) {
+                    clearInterval(entry.activeDigest.tickerHandle);
+                    entry.activeDigest.tickerHandle = null;
+                }
+                try {
+                    entry.activeDigest?.detachPhaseListener?.();
+                } catch { /* ignore */ }
+                if (entry.activeDigest) {
+                    entry.activeDigest.detachPhaseListener = null;
+                }
+            }
+        })();
+
+        return jsonTextResult({
+            status: 'started',
+            session_id: sessionId,
+            triggered_by: triggeredBy,
+            started_at: new Date(runStartedAt).toISOString(),
+            stories_cap_ms: STORIES_CAP_MS,
+            feed_cap_ms: FEED_CAP_MS,
+            message:
+                'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. Progress ticks stream to the TUI log pane every 5 min. To fetch the final digest, call get_session_status; when digest_status is "completed" or "stopped" the response includes the full result and auto-ends the session.',
+            ...extraPayload,
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Tool: start_session
     //
     // Creates a KowalskiSession bound to the plugin's paths + API key,
-    // binds it to the BrowserManager / RunManager singletons, and probes
-    // the Instagram sessionid cookie so the agent knows whether to call
-    // `login` first.
+    // binds it to the BrowserManager / RunManager singletons, probes the
+    // Instagram sessionid cookie, and immediately advances the workflow:
+    // valid cookie -> start digest; missing/unknown cookie -> run login.
     //
     // Input:  { phases?: Array<"stories" | "feed"> }
-    // Output: JSON text block { session_id, logged_in, message, phases }
+    // Output: JSON text block for digest-started or login-pending state.
     // -----------------------------------------------------------------------
     const startSession: PluginTool = {
         name: 'start_session',
         description:
-            'Create a new Kowalski session and probe whether the persistent browser profile is still logged into Instagram. Always call this first. Returns a session_id used by all other tools, and a logged_in flag — if logged_in is false, call the login tool next before run_digest.',
+            'Create a Kowalski session and automatically continue the workflow. If the persistent browser profile has a valid Instagram cookie, this starts run_digest immediately. If not, this automatically starts the headless login flow; when credentials/2FA/device approval are needed it returns the relevant pending_* payload. Once login succeeds, the digest is started automatically.',
         parameters: {
             type: 'object',
             properties: {
@@ -287,19 +490,20 @@ export function register(api: PluginApi): () => void {
             sessions.set(sessionId, entry);
 
             const probe = probeInstagramLogin(browserProfileDir);
-            const message =
-                probe.logged_in === true
-                    ? 'Session ready. Instagram sessionid cookie is valid — call run_digest when you want to capture.'
-                    : probe.logged_in === false
-                      ? 'Session ready, but the profile is not logged into Instagram. Call the login tool next; it will ask for Instagram credentials in chat if needed and log in automatically in a headless browser.'
-                      : 'Session ready, but the login probe could not be completed. Recommend calling login first before run_digest.';
-
             log.info('start_session', { sessionId, logged_in: probe.logged_in });
-            return jsonTextResult({
+
+            if (probe.logged_in === true) {
+                return startDigestForEntry(sessionId, entry, 'start_session', {
+                    logged_in: true,
+                    phases,
+                });
+            }
+
+            return loginTool.execute('start_session:auto-login', {
+                ...params,
                 session_id: sessionId,
-                logged_in: probe.logged_in,
-                phases,
-                message,
+                triggered_by: 'start_session',
+                login_probe: probe.logged_in,
             });
         },
     };
@@ -351,7 +555,7 @@ export function register(api: PluginApi): () => void {
     const loginTool: PluginTool = {
         name: 'login',
         description:
-            'Log into Instagram using the headless agentic flow only. Canonical flow: ask the user for their IG username and password in the TUI on first login, then call this tool with `username` and `password` params; the headless login loop fills the form, handles "Remember me", and can return `pending_2fa` or `pending_device_approval` payloads which you resolve via `submit_verification_code`. If called without params and no IG_USERNAME/IG_PASSWORD env vars are set on the host, returns `pending_credentials` so you can prompt the user and call back. If Instagram shows an unsolvable challenge (suspicious-login checkpoint, stuck detection), returns `login_failed_needs_manual` for the agent to relay. Only call when `start_session` reports `logged_in: false`.',
+            'Continue the automatic Kowalski workflow through Instagram login. This tool resolves credentials, drives the headless LoginAgent, returns pending_credentials / pending_2fa / pending_device_approval when user input is needed, and automatically starts run_digest as soon as login is verified.',
         parameters: {
             type: 'object',
             properties: {
@@ -385,6 +589,16 @@ export function register(api: PluginApi): () => void {
                     true
                 );
             }
+            const triggeredBy =
+                typeof params.triggered_by === 'string' ? params.triggered_by : 'login';
+
+            const alreadyLoggedIn = probeInstagramLogin(browserProfileDir);
+            if (alreadyLoggedIn.logged_in === true) {
+                return startDigestForEntry(sessionId, entry, triggeredBy, {
+                    logged_in: true,
+                    login_status: 'already_logged_in',
+                });
+            }
 
             // ----- Resolve credentials: params > session cache > env -----
             const paramUsername =
@@ -408,8 +622,10 @@ export function register(api: PluginApi): () => void {
                 return jsonTextResult({
                     status: 'pending_credentials',
                     session_id: sessionId,
+                    triggered_by: triggeredBy,
+                    logged_in: alreadyLoggedIn.logged_in,
                     message:
-                        'No Instagram credentials available. Ask the user in the TUI for their Instagram username (or email/phone) and password, then call `login` again with `username` and `password` params. Never guess or reuse old creds. If the user declines to share credentials in chat, login cannot continue because this plugin is headless-only.',
+                        'No Instagram credentials available. Ask the user in the TUI for their Instagram username (or email/phone) and password, then call `login` again with this session_id plus `username` and `password` params. When login succeeds, run_digest will start automatically. Never guess or reuse old creds. If the user declines to share credentials in chat, login cannot continue because this plugin is headless-only.',
                 });
             }
             // Persist resolved creds on the session so submit_verification_code
@@ -453,7 +669,10 @@ export function register(api: PluginApi): () => void {
                 if (status === 'success') {
                     try { collector.flushSessionLog(); } catch { /* ignore */ }
                     try { await context.close(); } catch { /* ignore */ }
-                    return textResult(`Logged in agentically. Cookies persisted to ${browserProfileDir}.`);
+                    return startDigestForEntry(sessionId, entry, triggeredBy, {
+                        logged_in: true,
+                        login_status: 'success',
+                    });
                 }
 
                 if (status === 'pending_2fa' || status === 'pending_device_approval') {
@@ -508,15 +727,19 @@ export function register(api: PluginApi): () => void {
                     if (status === 'pending_2fa') {
                         return jsonTextResult({
                             status: 'pending_2fa',
+                            session_id: sessionId,
                             login_id: loginId,
-                            message: 'Ask the user for their Instagram 2FA code, then call submit_verification_code with that login_id and the code.',
+                            triggered_by: triggeredBy,
+                            message: 'Ask the user for their Instagram 2FA code, then call submit_verification_code with that login_id and the code. When verification succeeds, run_digest will start automatically.',
                         });
                     }
                     return jsonTextResult({
                         status: 'pending_device_approval',
+                        session_id: sessionId,
                         login_id: loginId,
                         device_description: agent.pendingDescription ?? 'another device',
-                        message: 'Ask the user to approve the login on the device Instagram named, then call submit_verification_code with login_id and code: null — the tool will poll the page for the approval.',
+                        triggered_by: triggeredBy,
+                        message: 'Ask the user to approve the login on the device Instagram named, then call submit_verification_code with login_id and code: null — the tool will poll the page for the approval. When approval succeeds, run_digest will start automatically.',
                     });
                 }
 
@@ -661,7 +884,17 @@ export function register(api: PluginApi): () => void {
                     const status = resumed.finaliseStatus();
                     if (status === 'success') {
                         await cleanup();
-                        return textResult(`Logged in agentically (2FA accepted). Cookies persisted to ${browserProfileDir}.`);
+                        const sessionEntry = sessions.get(entry.sessionId);
+                        if (!sessionEntry) {
+                            return textResult(
+                                `Logged in agentically (2FA accepted), but session ${entry.sessionId} is gone. Start a new session to run the digest.`,
+                                true
+                            );
+                        }
+                        return startDigestForEntry(entry.sessionId, sessionEntry, 'submit_verification_code', {
+                            logged_in: true,
+                            login_status: 'success_2fa',
+                        });
                     }
                     if (status === 'pending_2fa') {
                         // Code rejected — update the entry and tell the agent.
@@ -669,8 +902,9 @@ export function register(api: PluginApi): () => void {
                         entry.createdAt = Date.now();
                         return jsonTextResult({
                             status: 'pending_2fa',
+                            session_id: entry.sessionId,
                             login_id: loginId,
-                            message: 'The previous code did not work. Ask the user for a fresh code and call submit_verification_code again.',
+                            message: 'The previous code did not work. Ask the user for a fresh code and call submit_verification_code again. When verification succeeds, run_digest will start automatically.',
                         });
                     }
                     // Escalation or an unexpected pending state means the
@@ -690,7 +924,17 @@ export function register(api: PluginApi): () => void {
                 while (Date.now() < deadline) {
                     if (probeInstagramLogin(browserProfileDir).logged_in === true) {
                         await cleanup();
-                        return textResult(`Logged in agentically (device approval). Cookies persisted to ${browserProfileDir}.`);
+                        const sessionEntry = sessions.get(entry.sessionId);
+                        if (!sessionEntry) {
+                            return textResult(
+                                `Logged in agentically (device approval), but session ${entry.sessionId} is gone. Start a new session to run the digest.`,
+                                true
+                            );
+                        }
+                        return startDigestForEntry(entry.sessionId, sessionEntry, 'submit_verification_code', {
+                            logged_in: true,
+                            login_status: 'success_device_approval',
+                        });
                     }
                     await new Promise((r) => setTimeout(r, 3000));
                 }
@@ -698,8 +942,9 @@ export function register(api: PluginApi): () => void {
                 entry.createdAt = Date.now();
                 return jsonTextResult({
                     status: 'pending_device_approval',
+                    session_id: entry.sessionId,
                     login_id: loginId,
-                    message: 'Still waiting for device approval after 120 seconds. Ask the user if they saw the notification, then call submit_verification_code again with code: null to poll for another 120s.',
+                    message: 'Still waiting for device approval after 120 seconds. Ask the user if they saw the notification, then call submit_verification_code again with code: null to poll for another 120s. When approval succeeds, run_digest will start automatically.',
                 });
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
@@ -731,7 +976,7 @@ export function register(api: PluginApi): () => void {
     const runDigest: PluginTool = {
         name: 'run_digest',
         description:
-            'Kick off the Kowalski pipeline (stories + feed capture, extraction, digest generation) in the background. Returns IMMEDIATELY with `{status: "started"}` — does NOT block. The actual run takes 10–30 min (worst case ~45 min) and costs ~$1–3 in Anthropic spend; always warn the user before calling. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`. After `run_digest` returns, tell the user the run is in flight and they can (a) say "stop" any time — `stop_run` now dispatches instantly, (b) ask "how much time is left?" — read the most recent ⏱ line from the TUI log pane and report it, (c) ask "is it done?" or wait for the user to prompt — call `get_session_status`; when `digest_status === "completed"` the response includes the full digest payload. The plugin streams a ⏱ line to the TUI log pane every 5 minutes plus on every phase transition. Call only after verifying `start_session` reported `logged_in: true`.',
+            'Manually kick off the Kowalski pipeline (stories + feed capture, extraction, digest generation) in the background. Normally start_session/login/submit_verification_code starts this automatically once Instagram auth is verified. Returns IMMEDIATELY with `{status: "started"}` — does NOT block. The actual run takes 10–30 min (worst case ~45 min) and costs ~$1–3 in Anthropic spend; warn the user before starting any digest workflow. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`. After a started response, tell the user the run is in flight and call `get_session_status` when they ask whether it is done.',
         parameters: {
             type: 'object',
             properties: {
@@ -755,208 +1000,7 @@ export function register(api: PluginApi): () => void {
                     true
                 );
             }
-
-            // Guard against concurrent runs. If there's already an active
-            // digest that isn't finished, reject — the user should either
-            // wait, poll get_session_status, or call stop_run first.
-            if (entry.activeDigest && entry.activeDigest.status === 'running') {
-                return jsonTextResult({
-                    status: 'already_running',
-                    session_id: sessionId,
-                    started_at: new Date(entry.activeDigest.startedAt).toISOString(),
-                    message:
-                        'A digest is already running on this session. Poll get_session_status for progress, or call stop_run to abort.',
-                });
-            }
-
-            // Re-bind the singletons to this session — another session may have
-            // been the last to bind. Cheap and safe.
-            BrowserManager.getInstance().bindSession(entry.session);
-            RunManager.getInstance().bindSession(entry.session);
-            UsageService.getInstance().configure(entry.session.scratchDir);
-
-            // ---- Live progress ticks to the TUI via api.logger ------------
-            // See tool description above — the plugin emits a compact ⏱
-            // line every 5 min + on phase transitions so the user sees
-            // progress in the TUI log pane while run_digest is off doing
-            // its thing in the background.
-            const STORIES_CAP_MS = entry.session.runConfig.storiesTimeoutMs ?? 15 * 60_000;
-            const FEED_CAP_MS = entry.session.runConfig.feedTimeoutMs ?? 30 * 60_000;
-            const runStartedAt = Date.now();
-            let currentPhase: 'stories' | 'feed' | 'idle' = 'idle';
-            let phaseStartedAt = runStartedAt;
-
-            const fmt = (ms: number): string => {
-                if (ms < 0) ms = 0;
-                const s = Math.floor(ms / 1000);
-                const m = Math.floor(s / 60);
-                const secs = s - m * 60;
-                return `${m}m${secs.toString().padStart(2, '0')}s`;
-            };
-
-            log.info(
-                `run_digest started (non-blocking) — phases=${JSON.stringify(entry.session.runConfig.phases)} storiesCap=${fmt(STORIES_CAP_MS)} feedCap=${fmt(FEED_CAP_MS)} · ticks every 5 min + on phase transitions. Say "stop" any time to abort.`
-            );
-
-            const onPhase = (payload: { phase?: 'stories' | 'feed' }): void => {
-                if (payload?.phase === 'stories' || payload?.phase === 'feed') {
-                    const previous = currentPhase;
-                    currentPhase = payload.phase;
-                    phaseStartedAt = Date.now();
-                    const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
-                    if (previous === 'idle') {
-                        log.info(`⏱ phase=${currentPhase} STARTED — cap=${fmt(cap)}`);
-                    } else {
-                        log.info(
-                            `⏱ phase ${previous} DONE → ${currentPhase} STARTED — ${currentPhase} cap=${fmt(cap)}  totalElapsed=${fmt(Date.now() - runStartedAt)}`
-                        );
-                    }
-                }
-            };
-            entry.session.events.on('run-phase', onPhase);
-
-            const TICK_INTERVAL_MS = 5 * 60_000;
-            const tick = setInterval(() => {
-                const now = Date.now();
-                const totalElapsed = now - runStartedAt;
-                if (currentPhase === 'idle') {
-                    log.info(
-                        `⏱ phase=idle  totalElapsed=${fmt(totalElapsed)} (waiting for first phase to start…)`
-                    );
-                    return;
-                }
-                const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
-                const phaseElapsed = now - phaseStartedAt;
-                const remaining = cap - phaseElapsed;
-                log.info(
-                    `⏱ phase=${currentPhase}  elapsed=${fmt(phaseElapsed)}/${fmt(cap)}  remaining=${fmt(remaining)}  totalElapsed=${fmt(totalElapsed)}`
-                );
-            }, TICK_INTERVAL_MS);
-
-            // Initialise ActiveDigest so get_session_status + stop_run can
-            // see a run is in flight.
-            entry.activeDigest = {
-                startedAt: runStartedAt,
-                status: 'running',
-                tickerHandle: tick,
-                detachPhaseListener: () => {
-                    try { entry.session.events.off('run-phase', onPhase); } catch { /* ignore */ }
-                },
-            };
-
-            // Fire-and-forget: run the pipeline in the background. The
-            // promise writes its outcome back into entry.activeDigest and
-            // tears down the ticker/listeners when done. We deliberately
-            // do NOT await it — this whole tool returns in <100ms so the
-            // gateway dispatcher is free for stop_run / status / etc.
-            (async () => {
-                try {
-                    const result = await RunManager.getInstance().startRun({
-                        phases: entry.session.runConfig.phases,
-                    });
-                    if (!result) {
-                        entry.activeDigest!.status = 'failed';
-                        entry.activeDigest!.errorMessage =
-                            'RunManager returned null (another run already in progress, or the run aborted before producing a digest).';
-                        log.warn(`❌ run_digest: RunManager returned null (no result)`);
-                        return;
-                    }
-
-                    const recordPath = path.join(
-                        entry.session.outputDir,
-                        'analysis_records',
-                        `${result.record.id}.json`
-                    );
-
-                    let timeoutSummary = '';
-                    const timedOut = result.timedOutPhases ?? [];
-                    if (timedOut.length > 0) {
-                        const storyCaps = result.record.data?.images?.filter((i: any) => i.source === 'story').length ?? 0;
-                        const feedCaps = result.record.data?.images?.filter((i: any) => i.source === 'feed').length ?? 0;
-                        const parts: string[] = [];
-                        if (timedOut.includes('stories')) parts.push('Stories phase timed out after 15 minutes');
-                        if (timedOut.includes('feed')) parts.push('Feed phase timed out after 30 minutes');
-                        if (timedOut.includes('stories') && !timedOut.includes('feed')) {
-                            parts.push('feed phase ran to completion');
-                        } else if (timedOut.includes('feed') && !timedOut.includes('stories')) {
-                            parts.push('stories phase ran to completion');
-                        }
-                        timeoutSummary =
-                            `- ⚠️ ${parts.join('; ')}. ` +
-                            `Digest saved with ${storyCaps} story captures + ${feedCaps} feed captures.\n`;
-                    }
-
-                    let pdfLine = '';
-                    try {
-                        const aborted = Boolean(
-                            (result.record.data as any)?.metadata?.aborted
-                        );
-                        const abortReason =
-                            (result.record.data as any)?.metadata?.abortReason;
-                        const pdfPath = await writeDigestPdf(result.record, {
-                            downloadsDir: config.downloadsDir,
-                            aborted,
-                            abortReason,
-                        });
-                        pdfLine = `- pdf: ${pdfPath}\n`;
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        log.warn('[kowalski] PDF export failed (non-fatal)', { msg });
-                        pdfLine = `- pdf: (failed to write — ${msg})\n`;
-                    }
-
-                    const aborted = Boolean((result.record.data as any)?.metadata?.aborted);
-                    const abortReason = (result.record.data as any)?.metadata?.abortReason;
-                    const header =
-                        `# Kowalski digest\n\n` +
-                        `- record id: ${result.record.id}\n` +
-                        `- saved to: ${recordPath}\n` +
-                        pdfLine +
-                        `- captures: extracted=${result.counts.extracted}, skipped=${result.counts.skipped}, failed=${result.counts.failed}\n` +
-                        timeoutSummary +
-                        `- lead story: ${result.record.leadStoryPreview || '(none)'}\n\n`;
-                    const body = '```json\n' + JSON.stringify(result.record.data, null, 2) + '\n```\n';
-
-                    entry.activeDigest!.resultText = header + body;
-                    // user-stop and timeout-* are legitimate completions
-                    // that still produce a (partial) digest — tag with
-                    // 'stopped' when user-stop, 'completed' otherwise so
-                    // the agent can message differently.
-                    entry.activeDigest!.status =
-                        aborted && abortReason === 'user-stop' ? 'stopped' : 'completed';
-                    log.info(
-                        `✅ run_digest complete — totalElapsed=${fmt(Date.now() - runStartedAt)} record=${result.record.id} status=${entry.activeDigest!.status}`
-                    );
-                } catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    entry.activeDigest!.status = 'failed';
-                    entry.activeDigest!.errorMessage = msg;
-                    log.warn(
-                        `❌ run_digest failed — totalElapsed=${fmt(Date.now() - runStartedAt)} error=${msg}`
-                    );
-                } finally {
-                    if (entry.activeDigest?.tickerHandle) {
-                        clearInterval(entry.activeDigest.tickerHandle);
-                        entry.activeDigest.tickerHandle = null;
-                    }
-                    try {
-                        entry.activeDigest?.detachPhaseListener?.();
-                    } catch { /* ignore */ }
-                    if (entry.activeDigest) {
-                        entry.activeDigest.detachPhaseListener = null;
-                    }
-                }
-            })();
-
-            return jsonTextResult({
-                status: 'started',
-                session_id: sessionId,
-                started_at: new Date(runStartedAt).toISOString(),
-                stories_cap_ms: STORIES_CAP_MS,
-                feed_cap_ms: FEED_CAP_MS,
-                message:
-                    'Digest started in the background. Tell the user the run is in flight (10–30 min typical, ~45 min worst case) and they can say "stop" any time — stop_run now dispatches instantly. Progress ⏱ ticks stream to the TUI log pane every 5 min. To fetch the final digest, call get_session_status; when digest_status is "completed" or "stopped" the response includes the full result AND auto-ends the session (`session_ended: true` in the same payload). Don\'t call end_session afterwards.',
-            });
+            return startDigestForEntry(sessionId, entry, 'run_digest');
         },
     };
 

@@ -38,171 +38,114 @@ Do NOT trigger on:
 
 ## Canonical sequence for a digest request
 
-Follow these steps exactly. Each step depends on the previous.
+Follow these steps exactly. `start_session` is now the workflow entrypoint:
+it creates the session, checks cookies, starts login if needed, and starts
+`run_digest` automatically once Instagram login is verified.
 
 ### 1. `start_session`
 
-Call with no args unless the user specified phases (see Parameter notes).
+Before calling, tell the user something like:
+
+_"Kicking off the digest now — this takes 10–30 minutes (hard caps:
+15 min stories + 30 min feed, so worst case ~45 minutes) and costs
+roughly $1–3 in API spend. The run goes in the background once login
+is verified. Say "stop" any time to abort, or ask me "is it done?"
+and I'll check."_
+
+Then call with no args unless the user specified phases (see Parameter
+notes).
 
 ```json
 { "name": "start_session", "arguments": {} }
 ```
 
-The tool returns JSON:
+`start_session` can return any of these shapes:
 
 ```json
-{ "session_id": "…", "logged_in": true|false|null, "phases": […], "message": "…" }
+{ "status": "started", "session_id": "…", "triggered_by": "start_session", "message": "…" }
 ```
 
-Save the `session_id` — every subsequent tool call needs it.
-
-### 2. Check `logged_in`
-
-- `true` → jump to step 4.
-- `false` or `null` → go to step 3.
-
-### 3. `login` (only if needed)
-
-Call `login` with the `session_id`. There are five possible outcomes —
-you MUST route each one correctly:
-
-```json
-{ "name": "login", "arguments": { "session_id": "…" } }
-```
-
-**a. Success (text response)** — e.g. `"Logged in agentically. Cookies
-persisted to …"`. Jump to step 4.
-
-**a1. `pending_credentials` (JSON response)** — no IG username/password is
-available (neither passed as params, nor set as IG_USERNAME/IG_PASSWORD env
-vars on the host). Response shape:
+Digest has started. Tell the user the run is in flight and save the
+`session_id` for status/stop calls.
 
 ```json
 { "status": "pending_credentials", "session_id": "…", "message": "…" }
 ```
 
-Ask the user in the TUI: _"To log in to Instagram, I need your username
-(or email/phone) and password. What are they?"_ When they reply, call
-`login` again with those values:
+No Instagram credentials are available. Ask the user in the TUI for their
+Instagram username (or email/phone) and password. When they reply, call
+`login` with those values. If the user refuses to type their password
+into chat, stop the login flow politely; this plugin is headless-only.
 
 ```json
 { "name": "login",
   "arguments": { "session_id": "…", "username": "…", "password": "…" } }
 ```
 
-If the user refuses to type their password into chat, do not continue
-the login attempt. This plugin is headless-only and has no manual
-browser-window path.
-
-**b. `pending_2fa` (JSON response)** — the agentic login reached a 2FA
-screen and paused. Response shape:
+`login` automatically resumes the workflow. If credentials are accepted
+and no challenge appears, it returns `status: "started"` and the digest is
+already running.
 
 ```json
-{ "status": "pending_2fa", "login_id": "…", "message": "…" }
+{ "status": "pending_2fa", "session_id": "…", "login_id": "…", "message": "…" }
 ```
 
-Tell the user: _"Instagram asked for a 2FA code — what's the 6-digit
-code from your authenticator app (or the SMS Instagram just sent)?"_
-When they reply with the code, call:
+Instagram asked for a 2FA code. Ask the user for the 6-digit code from
+their authenticator app or SMS, then call:
 
 ```json
 { "name": "submit_verification_code",
   "arguments": { "login_id": "…", "code": "123456" } }
 ```
 
-The `submit_verification_code` response has the same core shapes as
-`login`: text-success, pending_2fa again (code was rejected — ask for a
-fresh code), or `login_failed_needs_manual`. A fourth shape,
-`context_destroyed`, can appear if the login browser got closed before
-the code arrived (rare — e.g. another tool call nuked it, or Chromium
-crashed). Re-run `login` from scratch; Instagram may not ask for 2FA
-again if cookies partially persisted during the first attempt.
-
-**c. `pending_device_approval` (JSON response)** — IG pushed a login
-notification to another of the user's devices. Response shape:
+If verification succeeds, `submit_verification_code` automatically starts
+the digest and returns `status: "started"`. If it returns `pending_2fa`
+again, the code was rejected or expired; ask for a fresh code and call the
+same tool again.
 
 ```json
-{ "status": "pending_device_approval", "login_id": "…",
+{ "status": "pending_device_approval", "session_id": "…", "login_id": "…",
   "device_description": "…", "message": "…" }
 ```
 
-Tell the user: _"Instagram sent a login-approval notification to your
-`<device_description>`. Open that device, tap Approve, then tell me
-once you've done it."_ When they confirm, call:
+Instagram sent a login-approval notification to another device. Tell the
+user which device Instagram named, ask them to approve it, then call:
 
 ```json
 { "name": "submit_verification_code",
   "arguments": { "login_id": "…", "code": null } }
 ```
 
-(Note: `code` is `null` for device approval — the tool polls the page
-for up to 120s waiting for the post-approval transition.) If the
-response is `still pending`, ask the user to try the notification
-again and call the same tool with `code: null` a second time.
-
-**d. `login_failed_needs_manual` (JSON error response)** — the agentic
-flow escalated because Instagram showed a challenge the automated login
-cannot clear headlessly (for example suspicious-login review,
-checkpoint_required, or stuck detection). Response shape:
+If approval succeeds, `submit_verification_code` automatically starts the
+digest. If it returns `pending_device_approval` again, ask whether the
+notification appeared and call the same tool with `code: null` for another
+120-second poll.
 
 ```json
-{ "status": "login_failed_needs_manual",
-  "reason": "…",
-  "message": "Instagram showed a challenge the automated login can't clear headlessly (e.g. a suspicious-login check). Try again later, or approve/clear the challenge from the Instagram app on your phone, then retry login." }
+{ "status": "login_failed_needs_manual", "reason": "…", "message": "…" }
 ```
 
-Relay the `message` to the user. Suggest they clear or approve the
-challenge from the Instagram app on their phone, then retry `login`
-afterward.
-
-**Credentials note.** The canonical path is: on first login, you ask
-the user for their IG username and password in the TUI, then pass them
-to the `login` tool as `username` and `password` params. The plugin
-caches them on the session for the duration of the login round trip
-(including 2FA follow-ups) so you only ask once — and they are never
-logged, never returned in any response, never included in any prompt
-sent to Claude. If the user declines to type their password into chat,
-stop the login flow politely; there is no visible-browser fallback.
-Alternatively, power users can set `IG_USERNAME` and `IG_PASSWORD` env
-vars before launching `openclaw gateway run` for unattended/scheduled
-runs, in which case the first `login` call skips `pending_credentials`
-and goes straight to the agentic flow.
-
-### 4. Warn about cost + duration, then call `run_digest`
-
-Before calling, tell the user something like:
-
-_"Kicking off the digest now — this takes 10–30 minutes (hard caps:
-15 min stories + 30 min feed, so worst case ~45 minutes) and costs
-roughly $1–3 in API spend. The run goes in the background; you'll
-see ⏱ progress ticks in the OpenClaw log pane every 5 minutes plus
-on phase transitions. Say "stop" any time to abort, or ask me "how
-much time is left?" / "is it done?" and I'll check."_
-
-Then invoke:
+Relay the message. Ask the user to approve or clear the challenge from
+the Instagram app on their phone, then retry later.
 
 ```json
-{ "name": "run_digest", "arguments": { "session_id": "…" } }
+{ "status": "context_destroyed", "login_id": "…", "message": "…" }
 ```
 
-**This returns IMMEDIATELY** with `{ "status": "started", … }`. The
-run continues in the background. Critically, because `run_digest` no
-longer blocks the gateway, `stop_run` and `get_session_status` now
-dispatch instantly — so "stop" in the TUI actually stops the run, and
-status polls actually fire.
+The pending-login browser was closed before the code arrived. Re-run
+`login` with the same `session_id`; Instagram may not ask for 2FA again
+if cookies partially persisted.
 
-After run_digest returns, tell the user the run is in flight and wait
-for them to prompt with "how's it going?", "stop", or similar. Do NOT
-autonomously loop on `get_session_status` — let the user drive the
-check-ins.
+### 2. While The Run Is Active
+
+After a `status: "started"` response, tell the user the digest is running
+in the background and wait for them to prompt with "how's it going?",
+"stop", or similar. Do NOT autonomously loop on `get_session_status`.
 
 **Answering "how much time is left?" mid-run.** Read the most recent
-`⏱` line from the TUI log pane scrollback and report the numbers
-verbatim — e.g. _"Feed phase, 12m34s in, 17m26s left against the
-30min cap; total elapsed 27m15s."_ Don't estimate or extrapolate.
-If the most recent tick is more than ~5 minutes old, check for a
-phase-transition line above it. You can also call `get_session_status`
-to read `digest_elapsed_ms`.
+progress line from the TUI log pane scrollback and report the numbers
+verbatim. You can also call `get_session_status` to read
+`digest_elapsed_ms`.
 
 **Answering "is it done?" / "show me the digest".** Call:
 
@@ -215,18 +158,17 @@ The response includes `digest_status`:
 - `"running"` — still in flight. Report elapsed time, remind user
   they can say "stop".
 - `"completed"` — digest is ready. The response also carries
-  `digest_result` (the full header + JSON body). Present it to the
-  user (see step 5).
+  `digest_result` (the full header + JSON body). Present it to the user.
 - `"stopped"` — user-stop aborted it partway. `digest_result` carries
   the partial digest.
 - `"failed"` — run errored out. `digest_error` explains why.
 - `"idle"` — no digest has been started on this session yet.
 
-### 5. Present the result
+### 3. Present The Result
 
 When `get_session_status` returns `digest_status: "completed"` or
 `"stopped"`, its `digest_result` field is a text block with a header
-(record id, save path, **PDF path**, capture counts, optional timeout
+(record id, save path, PDF path, capture counts, optional timeout
 summary, lead-story preview) followed by a JSON body containing the
 digest sections. Show this directly to the user. Three artifacts get
 written every run:
@@ -240,13 +182,9 @@ written every run:
 Point the user at the PDF path in your reply — it's the easiest thing
 for them to open or share.
 
-### 6. `end_session`
-
-When the user is done, call:
-
-```json
-{ "name": "end_session", "arguments": { "session_id": "…" } }
-```
+`get_session_status` auto-ends the session on the call that first
+delivers a terminal digest result, so do not call `end_session` after
+that response says `session_ended: true`.
 
 ---
 
@@ -283,7 +221,7 @@ dir (session memory, stop markers, run temp), and the output dir (every
 delete digest PDFs already written to Downloads, and it does NOT clear
 OpenClaw plugin config — the user's API key, `downloadsDir`, `userName`,
 and `location` stay put. After resetting, the next `start_session` will
-report `logged_in: false` and the user will need to `login` again.
+automatically begin the login flow before it can start a digest.
 
 Always ask before calling with `confirm: true`. If the user asks to
 "reset everything" or "wipe Kowalski", do the dry-run first, show them
@@ -350,7 +288,7 @@ Note: `end_session` does NOT interrupt a running digest — use
 - **Hard caps:** stories phase 15 min, feed phase 30 min.
 - **Worst case:** ~45 min total, ~$3.
 
-Always mention this range before calling `run_digest` so the user can
+Always mention this range before calling `start_session` so the user can
 abort upfront if the cost or time isn't acceptable.
 
 ---
@@ -359,8 +297,9 @@ abort upfront if the cost or time isn't acceptable.
 
 | Trigger | What happened | How to respond |
 | --- | --- | --- |
-| `start_session` returns `logged_in: false` | Persistent profile has no valid sessionid cookie. | Call `login` next — don't panic. |
-| `login` returns `pending_credentials` | No creds available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, stop the login flow politely. |
+| `start_session` returns `pending_credentials` | Persistent profile has no valid cookie, and no creds are available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` with the returned `session_id` and those params. If they refuse, stop the login flow politely. |
+| `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight and save the `session_id`. |
+| `login` returns `pending_credentials` | No creds available after an explicit login retry. | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, stop the login flow politely. |
 | `login` returns `login_failed_needs_manual` | Instagram showed a challenge the automated login cannot clear headlessly. | Relay the message, ask the user to approve or clear the challenge in the Instagram app on their phone, then retry login later. |
 | `login` returns `pending_2fa` | Agentic flow hit a 2FA screen. | Ask the user for their code, call `submit_verification_code` with it. Do NOT guess the code. |
 | `login` returns `pending_device_approval` | Agentic flow hit a device-push challenge. | Tell the user which device IG pinged (from `device_description`), then call `submit_verification_code` with `code: null` after they say they've approved it. |
@@ -376,13 +315,15 @@ abort upfront if the cost or time isn't acceptable.
 
 ## Don'ts
 
-- **Don't call `login` speculatively.** Only call it when `start_session`
-  reports `logged_in: false`.
+- **Don't call `login` immediately after `start_session` returns
+  `status: "started"`.** The digest is already running.
 - **Don't autonomously loop on `get_session_status`.** Wait for the
   user to prompt ("is it done?", "how's it going?", "stop"). Polling
   in a tight loop burns agent turns needlessly.
-- **Don't call `run_digest` without a valid `session_id`.** Every run
-  must be preceded by a `start_session` in the same agent turn-chain.
+- **Don't call `run_digest` after a successful `start_session`, `login`,
+  or `submit_verification_code` response.** Those tools now start the
+  digest automatically when auth is verified. `run_digest` is only a
+  manual recovery/control-plane tool.
 - **Don't call `run_digest` again while one is running** — you'll get
   `status: "already_running"`. Either wait or call `stop_run` first.
 - **Don't ask the user for their Instagram password outside the login
@@ -408,9 +349,7 @@ agent: Starting the Kowalski digest — takes 10–30 min, costs $1–3.
   I'll kick it off in the background; say "stop" any time to abort,
   or ask "is it done?" and I'll check.
   → start_session()
-  ← { session_id: "abc…", logged_in: true, … }
-  → run_digest({ session_id: "abc…" })
-  ← { status: "started", started_at: "…", message: "…" }
+  ← { status: "started", session_id: "abc…", triggered_by: "start_session", … }
 
 agent: Digest running in the background. You'll see ⏱ progress ticks
   in the log pane every 5 min. Tell me when to check or to stop.
@@ -418,8 +357,7 @@ agent: Digest running in the background. You'll see ⏱ progress ticks
 user: is it done?
 
 agent: → get_session_status({ session_id: "abc…" })
-  ← { digest_status: "completed", digest_result: "# Kowalski digest…", … }
-  → end_session({ session_id: "abc…" })
+  ← { digest_status: "completed", digest_result: "# Kowalski digest…", session_ended: true, … }
 
 agent: Yep, done! Here's what's on your feed today: …
 ```

@@ -24,20 +24,21 @@ The heavy lifting is all local — real Playwright-controlled Chromium against a
 
 ## What the plugin exposes
 
-The plugin registers **eight tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent which tools to call in which order for typical requests.
+The plugin registers **nine tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
 
 | Tool | Purpose |
 | --- | --- |
-| `start_session` | Create a Kowalski session, probe whether the persistent browser profile is still logged in, return a `session_id` used by every other tool. |
-| `login` | Log into Instagram with the headless agentic [LoginAgent](src/main/services/LoginAgent.ts) loop. If credentials are not already available from params or `IG_USERNAME` / `IG_PASSWORD`, returns `pending_credentials` so the agent can ask in chat. Can return `pending_2fa`, `pending_device_approval`, or `login_failed_needs_manual`. |
-| `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code and resumes the agent, or polls for device approval when `code: null`. |
-| `run_digest` | Single blocking call that runs stories + feed capture, extraction, and digest generation. Returns the digest markdown. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
-| `get_session_status` | Latest run phase + the last ~20 pipeline events. Useful between runs (OpenClaw typically serializes tool calls per session, so live polling during `run_digest` won't fire until the run returns). |
+| `start_session` | Create a Kowalski session and automatically continue: valid cookie starts `run_digest`; missing/unknown cookie starts the headless login flow and returns the relevant pending state if user input is needed. |
+| `login` | Continue the automatic headless login flow. If credentials are missing, returns `pending_credentials`; if Instagram asks for 2FA/device approval, returns `pending_2fa` / `pending_device_approval`; when login is verified, starts `run_digest` automatically. |
+| `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts `run_digest` automatically. |
+| `run_digest` | Manually start the non-blocking stories + feed capture, extraction, and digest generation run. Normally `start_session` or successful login starts this for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
+| `get_session_status` | Latest run phase + the last ~20 pipeline events. Also delivers the final digest once `digest_status` is `completed` or `stopped`. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
+| `reset_all` | Dry-run-first factory reset for browser profile, scratch data, and output records. Requires `confirm: true` to actually wipe. |
 | `stop_run` | Write a stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
-The canonical happy-path call chain for a digest ask: `start_session → login (if logged_in: false) → run_digest → end_session`.
+The canonical happy-path call chain for a digest ask is now just `start_session → get_session_status when the user asks if it is done`. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
 
 ---
 
@@ -49,7 +50,7 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
         ┌──────────────────────────────────────────────────────────────────┐
         │  OpenClaw agent (in chat)                                        │
         │    ↓ calls tools                                                 │
-        │  src/plugin/index.ts  ──────────  registers 8 tools              │
+        │  src/plugin/index.ts  ──────────  registers 9 tools              │
         └──────────────────────────┬───────────────────────────────────────┘
                                    │ (session_id + runConfig)
                                    ▼
@@ -100,9 +101,9 @@ The defining piece of the project is that **login itself is driven by a vision a
 
 **Credentials never touch the LLM.** The prompt emits `fill_username` / `fill_password` actions; the executor reads the values from `session.runConfig.igUsername` / `igPassword` (which came from env vars) and types them into the focused field character-by-character with 80–220 ms jitter. The model payload for that turn contains only the action name.
 
-**2FA round-trip.** When the agent sees a 2FA screen, it emits `emit_pending_2fa`, halts, and the `login` tool returns `{ status: 'pending_2fa', login_id }` with a `PendingLogin` keeping the Playwright page alive. The OpenClaw agent asks the user for their code in chat, the user replies, the agent calls `submit_verification_code(login_id, code)`, and the `LoginAgent` resumes against the same page with the code threaded into its user prompt.
+**2FA round-trip.** When the agent sees a 2FA screen, it emits `emit_pending_2fa`, halts, and the `login` tool returns `{ status: 'pending_2fa', login_id }` with a `PendingLogin` keeping the Playwright page alive. The OpenClaw agent asks the user for their code in chat, the user replies, the agent calls `submit_verification_code(login_id, code)`, and the `LoginAgent` resumes against the same page with the code threaded into its user prompt. When verification succeeds, the digest starts automatically.
 
-**Device-approval round-trip.** For "we sent a notification to your other device" challenges, the agent emits `emit_pending_device_approval` (quoting which device IG named). `submit_verification_code` with `code: null` polls `probeInstagramLogin` every 3s for up to 120s, waiting for the post-approval transition.
+**Device-approval round-trip.** For "we sent a notification to your other device" challenges, the agent emits `emit_pending_device_approval` (quoting which device IG named). `submit_verification_code` with `code: null` polls `probeInstagramLogin` every 3s for up to 120s, waiting for the post-approval transition. When approval succeeds, the digest starts automatically.
 
 **Manual-needed outcome.** When agentic login can't resolve the flow — suspicious-login challenge, three consecutive stuck turns, or another checkpoint that cannot be cleared headlessly — the plugin closes the headless context and returns `login_failed_needs_manual`. The agent should ask the user to approve or clear the challenge from the Instagram app on their phone, then retry login later.
 
