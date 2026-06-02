@@ -623,8 +623,9 @@ export function register(api: PluginApi): () => void {
                 });
                 entry.activeDigest!.status =
                     aborted && abortReason === 'user-stop' ? 'stopped' : 'completed';
+                const pdfLine = pdfPath ? ` pdf=${pdfPath}` : '';
                 log.info(
-                    `✅ run_digest complete — totalElapsed=${fmt(Date.now() - runStartedAt)} record=${result.record.id} status=${entry.activeDigest!.status}`
+                    `✅ run_digest complete — totalElapsed=${fmt(Date.now() - runStartedAt)} record=${result.record.id} status=${entry.activeDigest!.status}${pdfLine}`
                 );
             } catch (err) {
                 const msg = err instanceof Error ? err.message : String(err);
@@ -655,13 +656,13 @@ export function register(api: PluginApi): () => void {
             started_at: new Date(runStartedAt).toISOString(),
             stories_cap_ms: STORIES_CAP_MS,
             feed_cap_ms: FEED_CAP_MS,
-            recommended_initial_print_poll_ms: 30 * 60_000,
+            recommended_initial_print_poll_ms: 30_000,
             recommended_repeat_print_poll_ms: 30_000,
             vision_model_warning: entry.session.inferenceClient.backend === 'openclaw'
                 ? 'Kowalski requires a vision-capable OpenClaw image model. If screenshots cannot be understood, configure agents.defaults.imageModel to a vision-capable model.'
                 : undefined,
             message:
-                'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. Schedule the first silent print_digest check for 30 minutes from now; if it returns pending, schedule another silent print_digest check every 30 seconds until it returns the display-ready markdown.',
+                'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. Schedule the first silent print_digest check for 30 seconds from now; if it returns pending, schedule another silent print_digest check every 30 seconds until it returns the display-ready markdown.',
             ...extraPayload,
         });
     }
@@ -1225,7 +1226,7 @@ export function register(api: PluginApi): () => void {
     const runDigest: PluginTool = {
         name: 'run_digest',
         description:
-            'Manually kick off the Kowalski pipeline (stories + feed capture, extraction, digest generation) in the background. Normally start_session/login/submit_verification_code starts this automatically once Instagram auth is verified. Returns IMMEDIATELY with `{status: "started"}` — does NOT block. The actual run takes 10–30 min (worst case ~45 min); cost depends on the configured OpenClaw provider. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`. After a started response, tell the user the run is in flight and schedule the first silent print_digest check for 30 minutes from now; if pending, recheck every 30 seconds.',
+            'Manually kick off the Kowalski pipeline (stories + feed capture, extraction, digest generation) in the background. Normally start_session/login/submit_verification_code starts this automatically once Instagram auth is verified. Returns IMMEDIATELY with `{status: "started"}` — does NOT block. The actual run takes 10–30 min (worst case ~45 min); cost depends on the configured OpenClaw provider. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`. After a started response, tell the user the run is in flight and schedule the first silent print_digest check for 30 seconds from now; if pending, recheck every 30 seconds.',
         parameters: {
             type: 'object',
             properties: {

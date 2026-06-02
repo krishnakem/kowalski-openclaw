@@ -8,22 +8,34 @@
  * inference backend.
  */
 
-const PROBE_URL = process.env.KOWALSKI_CONNECTIVITY_PROBE_URL || 'https://www.gstatic.com/generate_204';
-const PROBE_TIMEOUT_MS = 2000;
+const DEFAULT_PROBE_URLS = [
+    'https://www.gstatic.com/generate_204',
+    'https://www.cloudflare.com/cdn-cgi/generate_204',
+    'https://www.instagram.com/',
+];
+const PROBE_URLS = (process.env.KOWALSKI_CONNECTIVITY_PROBE_URLS || process.env.KOWALSKI_CONNECTIVITY_PROBE_URL || '')
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean);
+const CONNECTIVITY_PROBE_URLS = PROBE_URLS.length > 0 ? PROBE_URLS : DEFAULT_PROBE_URLS;
+const PROBE_TIMEOUT_MS = Number(process.env.KOWALSKI_CONNECTIVITY_PROBE_TIMEOUT_MS || 4000);
 
 export async function isOnline(): Promise<boolean> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
-    try {
-        // Any HTTP response proves DNS + TCP + TLS reached the network. Only network-layer failures
-        // (DNS, connection refused, timeout) mean we're truly offline.
-        await fetch(PROBE_URL, { method: 'HEAD', signal: controller.signal });
-        return true;
-    } catch {
-        return false;
-    } finally {
-        clearTimeout(timer);
+    for (const url of CONNECTIVITY_PROBE_URLS) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+        try {
+            // Any HTTP response proves DNS + TCP + TLS reached the network. Only
+            // network-layer failures on every probe mean we're truly offline.
+            await fetch(url, { method: 'HEAD', signal: controller.signal });
+            return true;
+        } catch {
+            // Try the next probe before declaring the whole host offline.
+        } finally {
+            clearTimeout(timer);
+        }
     }
+    return false;
 }
 
 /**
@@ -36,15 +48,14 @@ export async function isOnline(): Promise<boolean> {
  */
 export function startOfflineWatchdog(
     onOffline: () => void,
-    intervalMs = 1000
+    intervalMs = 5000
 ): () => void {
     let stopped = false;
     let consecutiveFailures = 0;
-    // Require three consecutive failures before tripping. Stage 3.5 had a live
-    // run aborted by a single dropped probe mid-feed-phase; three checks
-    // (~200ms apart once failing) still fire in under a second but survive a
-    // lone packet loss or a WiFi stutter.
-    const REQUIRED_FAILURES = 3;
+    // Require a sustained outage before tripping. Browse/model traffic can be
+    // healthy while a single generic probe endpoint is slow or blocked; the
+    // agent and extractor still throw immediately on their own network errors.
+    const REQUIRED_FAILURES = Number(process.env.KOWALSKI_OFFLINE_WATCHDOG_FAILURES || 6);
 
     const tick = async () => {
         while (!stopped) {
@@ -60,10 +71,7 @@ export function startOfflineWatchdog(
                     onOffline();
                     return;
                 }
-                // Don't wait the full interval between failures — when the OS
-                // reports no route, DNS fails in <100ms, so a quick re-probe
-                // confirms within ~200ms rather than ~1s.
-                await new Promise(r => setTimeout(r, 200));
+                await new Promise(r => setTimeout(r, intervalMs));
             }
         }
     };

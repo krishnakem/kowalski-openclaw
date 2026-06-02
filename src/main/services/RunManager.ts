@@ -193,10 +193,9 @@ export class RunManager {
         const phases = options?.phases ?? session.runConfig.phases ?? ['stories', 'feed'];
         console.log(`🚀 Run started (phases: ${phases.join(', ')})`);
 
-        // Background watchdog: probes generic connectivity every 1s and trips notifyOffline
-        // after three consecutive failures (~1-3s to detect a real outage).
-        // Three-strike threshold guards against a single dropped probe while
-        // still firing well before fetch retry loops burn attempts.
+        // Background watchdog: probes multiple generic endpoints every few
+        // seconds and trips only after a sustained outage. Actual model/browser
+        // network errors still surface immediately from their own call sites.
         this.stopOfflineWatchdog = startOfflineWatchdog(() => {
             console.log('🌐 Offline watchdog: connectivity lost');
             this.notifyOffline();

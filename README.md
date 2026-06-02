@@ -39,7 +39,7 @@ The plugin registers **ten tools** on the OpenClaw agent surface. A [SKILL.md](s
 | `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
-The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-minute silent print_digest check → print_digest every 30 seconds until ready`. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
+The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-second silent print_digest check → print_digest every 30 seconds until ready`. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
 
 ---
 

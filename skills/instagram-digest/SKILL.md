@@ -151,7 +151,7 @@ if cookies partially persisted.
 After a `status: "started"` response, tell the user the digest is running
 in the background, save the returned `session_id` as the current active
 digest session, replacing any older login/session IDs, and schedule a silent
-automatic print check for 30 minutes from now using OpenClaw's `cron` tool.
+automatic print check for 30 seconds from now using OpenClaw's `cron` tool.
 
 The scheduled check should call `print_digest` directly:
 
@@ -354,7 +354,7 @@ Always mention the time range and provider-cost caveat before calling
 | Trigger | What happened | How to respond |
 | --- | --- | --- |
 | `start_session` returns `pending_credentials` | Persistent profile has no valid cookie, and no env credentials/session cookie are available. | Tell the user to set `IG_USERNAME` + `IG_PASSWORD`, or `IG_SESSIONID` / `INSTAGRAM_SESSIONID`, outside chat and restart the gateway. Do not collect passwords in chat or tool params. |
-| `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight, save the `session_id`, and schedule the 30-minute silent `print_digest` check. |
+| `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight, save the `session_id`, and schedule the first 30-second silent `print_digest` check. |
 | `login` returns `pending_credentials` | No env credentials are available after an explicit login retry. | Tell the user to set `IG_USERNAME` + `IG_PASSWORD`, or `IG_SESSIONID` / `INSTAGRAM_SESSIONID`, outside chat and restart the gateway. Do not collect passwords in chat or tool params. |
 | `login` returns `login_failed_needs_manual` | Instagram showed a challenge the automated login cannot clear headlessly. | Relay the message, ask the user to approve or clear the challenge in the Instagram app on their phone, then retry login later. |
 | `login` returns `pending_2fa` | Agentic flow hit a 2FA screen. | Ask the user for their code, call `submit_verification_code` with it. Do NOT guess the code. |
@@ -362,7 +362,7 @@ Always mention the time range and provider-cost caveat before calling
 | `submit_verification_code` returns `pending_2fa` again | Code was rejected. | Ask for a fresh code (the previous one may have timed out). |
 | `submit_verification_code` returns `still pending` for device approval | User hasn't approved yet. | Ask if they saw the notification and call again with `code: null`. |
 | `submit_verification_code` returns `context_destroyed` | The pending-login browser was closed before the code was submitted (stale entry, Chromium crash, or out-of-band close). | Re-run `login` from scratch. The earlier attempt may have persisted enough cookies that Instagram skips 2FA the second time. |
-| `run_digest` error contains `"OFFLINE"` | Offline watchdog tripped (3 consecutive probe failures). Likely a transient network blip. | Suggest retrying. The partial record is still on disk under `analysis_records/<id>.json` with `aborted: true, abortReason: offline`. |
+| `run_digest` error contains `"OFFLINE"` | Offline watchdog or a real network-layer model/browser error tripped. | Suggest retrying. The partial record is still on disk under `analysis_records/<id>.json` with `aborted: true, abortReason: offline`. |
 | Tool error says `Bundled Chromium is missing` | The plugin-local Playwright browser was not installed or was deleted. | Tell the user to run `npm run setup:browser` in the kowalski-openclaw plugin directory, then retry. Do not suggest installing system Chrome. |
 | `run_digest` error mentions `"timed out"` / the header mentions `"Stories phase timed out after 15 minutes"` or `"Feed phase timed out after 30 minutes"` | A phase hit its hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
 | `run_digest` returns "another run already in progress" | The previous run is still holding the RunManager singleton. | Call `get_session_status` to see what's happening; if stale or no reliable session id exists, call `stop_run` with `{}` and wait briefly before retrying. |
@@ -377,7 +377,7 @@ Always mention the time range and provider-cost caveat before calling
   `status: "started"`.** The digest is already running.
 - **Don't autonomously loop on `get_session_status`.** The only automatic
   loop for a running digest is the scheduled silent `print_digest` loop:
-  first check after 30 minutes, then every 30 seconds only while
+  first check after 30 seconds, then every 30 seconds only while
   `print_digest` returns `status: "pending"` and `silent: true`.
 - **Don't call `run_digest` after a successful `start_session`, `login`,
   or `submit_verification_code` response.** Those tools now start the
@@ -408,12 +408,12 @@ agent: Starting the Kowalski digest — takes 10–30 min, costs $1–3.
   ← { status: "started", session_id: "abc…", triggered_by: "start_session", … }
 
 agent: Digest running in the background. You'll see ⏱ progress ticks
-  in the log pane every 5 min. I'll check automatically after 30 minutes
+  in the log pane every 5 min. I'll check automatically after 30 seconds
   and then every 30 seconds until the digest is ready.
 
-agent: → cron({ action: "add", job: { name: "Kowalski digest print check", schedule: { kind: "at", at: "<30-minutes-from-now ISO timestamp>" }, payload: { kind: "agentTurn", message: "Kowalski digest print check for session abc…. Call print_digest with that session_id. If it returns markdown, show it to the user verbatim. If it returns JSON with status pending and silent true, schedule another one-shot cron check for 30 seconds later and produce no user-visible reply. If it returns status failed, tell the user the digest failed and include the error." }, sessionTarget: "current", delivery: { mode: "none" }, enabled: true } })
+agent: → cron({ action: "add", job: { name: "Kowalski digest print check", schedule: { kind: "at", at: "<30-seconds-from-now ISO timestamp>" }, payload: { kind: "agentTurn", message: "Kowalski digest print check for session abc…. Call print_digest with that session_id. If it returns markdown, show it to the user verbatim. If it returns JSON with status pending and silent true, schedule another one-shot cron check for 30 seconds later and produce no user-visible reply. If it returns status failed, tell the user the digest failed and include the error." }, sessionTarget: "current", delivery: { mode: "none" }, enabled: true } })
 
-...30 minutes later...
+...30 seconds later...
 
 agent: → print_digest({ session_id: "abc…" })
   ← { status: "pending", digest_status: "running", silent: true, recommended_next_poll_ms: 30000, … }
