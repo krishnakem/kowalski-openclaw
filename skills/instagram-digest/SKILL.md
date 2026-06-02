@@ -15,9 +15,9 @@ Kowalski requires a vision-capable model. If screenshot understanding fails,
 tell the user to configure `agents.defaults.imageModel` to a model with image
 input.
 
-The plugin exposes nine tools: `start_session`, `login`,
+The plugin exposes ten tools: `start_session`, `login`,
 `submit_verification_code`, `run_digest`, `get_session_status`,
-`reset_memory`, `reset_all`, `stop_run`, `end_session`.
+`print_digest`, `reset_memory`, `reset_all`, `stop_run`, `end_session`.
 
 ---
 
@@ -144,8 +144,30 @@ if cookies partially persisted.
 ### 2. While The Run Is Active
 
 After a `status: "started"` response, tell the user the digest is running
-in the background and wait for them to prompt with "how's it going?",
-"stop", or similar. Do NOT autonomously loop on `get_session_status`.
+in the background, save the `session_id`, and schedule a silent automatic
+print check for 30 minutes from now using OpenClaw's `cron` tool.
+
+The scheduled check should call `print_digest` directly:
+
+```json
+{ "name": "print_digest", "arguments": { "session_id": "…" } }
+```
+
+If `print_digest` returns display-ready markdown, show that markdown to the
+user verbatim. If it returns JSON with `status: "pending"` and
+`silent: true`, do not show anything to the user; schedule another one-shot
+cron check for 30 seconds later. Repeat this 30-second silent recheck until
+`print_digest` returns markdown, `status: "failed"`, or the user says stop.
+
+Use one-shot cron jobs, not a permanent recurring job. The cron prompt can be:
+
+```text
+Kowalski digest print check for session <session_id>. Call print_digest with
+that session_id. If it returns markdown, show it to the user verbatim. If it
+returns JSON with status "pending" and silent true, schedule another one-shot
+cron check for 30 seconds later and produce no user-visible reply. If it
+returns status "failed", tell the user the digest failed and include the error.
+```
 
 **Answering "how much time is left?" mid-run.** Read the most recent
 progress line from the TUI log pane scrollback and report the numbers
@@ -162,21 +184,31 @@ The response includes `digest_status`:
 
 - `"running"` — still in flight. Report elapsed time, remind user
   they can say "stop".
-- `"completed"` — digest is ready. The response also carries
-  `digest_result` (the full header + JSON body). Present it to the user.
-- `"stopped"` — user-stop aborted it partway. `digest_result` carries
-  the partial digest.
+- `"completed"` — digest is ready. Immediately call `print_digest` with
+  the returned `session_id` and `digest_record_id`, then present the
+  returned markdown to the user verbatim.
+- `"stopped"` — user-stop aborted it partway. Immediately call
+  `print_digest` with the returned `session_id` and `digest_record_id`,
+  then present the returned partial markdown to the user verbatim.
 - `"failed"` — run errored out. `digest_error` explains why.
 - `"idle"` — no digest has been started on this session yet.
 
 ### 3. Present The Result
 
 When `get_session_status` returns `digest_status: "completed"` or
-`"stopped"`, its `digest_result` field is a text block with a header
-(record id, save path, PDF path, capture counts, optional timeout
-summary, lead-story preview) followed by a JSON body containing the
-digest sections. Show this directly to the user. Three artifacts get
-written every run:
+`"stopped"`, call:
+
+```json
+{ "name": "print_digest",
+  "arguments": { "session_id": "…", "record_id": "…" } }
+```
+
+`print_digest` is safe to call before completion. While the digest is still
+running, it returns JSON with `status: "pending"` and `silent: true`; do not
+show that pending payload to the user. Once ready, it returns a plain text
+tool result containing the digest markdown exactly as it should appear in
+chat/TUI, including emoji, followed by artifact paths. Show the ready result
+to the user verbatim. Three artifacts get written every run:
 
 - JSON record — `~/.kowalski/output/analysis_records/<id>.json`
 - Text-only PDF — `~/Downloads/kowalski-digest-<id>.pdf` (or whatever
@@ -187,10 +219,9 @@ written every run:
 Point the user at the PDF path in your reply — it's the easiest thing
 for them to open or share.
 
-`get_session_status` auto-ends the session on the call that first
-delivers a completed/stopped digest result, so do not call `end_session`
-after that response says `session_ended: true`. Failed sessions remain
-available for inspection or explicit cleanup.
+`print_digest` auto-ends the session after it returns the completed/stopped
+digest, so do not call `end_session` after a successful print. Failed
+sessions remain available for inspection or explicit cleanup.
 
 ---
 
@@ -240,9 +271,10 @@ the preview, and wait for explicit confirmation before the real call.
 
 Returns `digest_status` (`running` | `completed` | `stopped` | `failed`
 | `idle`), last phase, recent ~20 pipeline events, and — when the
-digest is done — a `digest_result` field with the full header + JSON
-body. Because `run_digest` is non-blocking, this tool can be called at
-any time during a run, and live polling works normally.
+digest is done — `digest_ready: true` plus the `digest_record_id` and
+`next_tool` payload for `print_digest`. Because `run_digest` is
+non-blocking, this tool can be called at any time during a run, and live
+polling works normally.
 
 ### "Stop the run" / "Cancel the digest" / "I've seen enough"
 
@@ -266,10 +298,11 @@ and `abortReason: user-stop` in its metadata.
 ```
 
 After `stop_run` returns, poll `get_session_status`; when
-`digest_status` becomes `"stopped"`, the response carries the partial
-`digest_result`. Present that to the user. If you stopped globally
-because the session id was missing/stale, tell the user the stop marker
-was sent and wait briefly before starting another digest.
+`digest_status` becomes `"stopped"`, immediately call `print_digest`
+with the returned `session_id` and `digest_record_id`, then present
+that partial markdown to the user. If you stopped globally because the
+session id was missing/stale, tell the user the stop marker was sent
+and wait briefly before starting another digest.
 
 **Manual escape hatch (rarely needed now).** The plugin also watches
 for a file marker at `~/.kowalski/scratch/STOP_REQUESTED`, polled on
@@ -315,7 +348,7 @@ Always mention the time range and provider-cost caveat before calling
 | Trigger | What happened | How to respond |
 | --- | --- | --- |
 | `start_session` returns `pending_credentials` | Persistent profile has no valid cookie, and no creds are available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` with the returned `session_id` and those params. If they refuse, stop the login flow politely. |
-| `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight and save the `session_id`. |
+| `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight, save the `session_id`, and schedule the 30-minute silent `print_digest` check. |
 | `login` returns `pending_credentials` | No creds available after an explicit login retry. | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, stop the login flow politely. |
 | `login` returns `login_failed_needs_manual` | Instagram showed a challenge the automated login cannot clear headlessly. | Relay the message, ask the user to approve or clear the challenge in the Instagram app on their phone, then retry login later. |
 | `login` returns `pending_2fa` | Agentic flow hit a 2FA screen. | Ask the user for their code, call `submit_verification_code` with it. Do NOT guess the code. |
@@ -336,9 +369,10 @@ Always mention the time range and provider-cost caveat before calling
 
 - **Don't call `login` immediately after `start_session` returns
   `status: "started"`.** The digest is already running.
-- **Don't autonomously loop on `get_session_status`.** Wait for the
-  user to prompt ("is it done?", "how's it going?", "stop"). Polling
-  in a tight loop burns agent turns needlessly.
+- **Don't autonomously loop on `get_session_status`.** The only automatic
+  loop for a running digest is the scheduled silent `print_digest` loop:
+  first check after 30 minutes, then every 30 seconds only while
+  `print_digest` returns `status: "pending"` and `silent: true`.
 - **Don't call `run_digest` after a successful `start_session`, `login`,
   or `submit_verification_code` response.** Those tools now start the
   digest automatically when auth is verified. `run_digest` is only a
@@ -371,12 +405,22 @@ agent: Starting the Kowalski digest — takes 10–30 min, costs $1–3.
   ← { status: "started", session_id: "abc…", triggered_by: "start_session", … }
 
 agent: Digest running in the background. You'll see ⏱ progress ticks
-  in the log pane every 5 min. Tell me when to check or to stop.
+  in the log pane every 5 min. I'll check automatically after 30 minutes
+  and then every 30 seconds until the digest is ready.
 
-user: is it done?
+agent: → cron({ action: "add", job: { name: "Kowalski digest print check", schedule: { kind: "at", at: "<30-minutes-from-now ISO timestamp>" }, payload: { kind: "agentTurn", message: "Kowalski digest print check for session abc…. Call print_digest with that session_id. If it returns markdown, show it to the user verbatim. If it returns JSON with status pending and silent true, schedule another one-shot cron check for 30 seconds later and produce no user-visible reply. If it returns status failed, tell the user the digest failed and include the error." }, sessionTarget: "current", delivery: { mode: "none" }, enabled: true } })
 
-agent: → get_session_status({ session_id: "abc…" })
-  ← { digest_status: "completed", digest_result: "# Kowalski digest…", session_ended: true, … }
+...30 minutes later...
+
+agent: → print_digest({ session_id: "abc…" })
+  ← { status: "pending", digest_status: "running", silent: true, recommended_next_poll_ms: 30000, … }
+
+agent: → cron({ action: "add", job: { name: "Kowalski digest print recheck", schedule: { kind: "at", at: "<30-seconds-from-now ISO timestamp>" }, payload: { kind: "agentTurn", message: "Kowalski digest print check for session abc…. Call print_digest with that session_id. If it returns markdown, show it to the user verbatim. If it returns JSON with status pending and silent true, schedule another one-shot cron check for 30 seconds later and produce no user-visible reply. If it returns status failed, tell the user the digest failed and include the error." }, sessionTarget: "current", delivery: { mode: "none" }, enabled: true } })
+
+...later...
+
+agent: → print_digest({ session_id: "abc…" })
+  ← "# Play-In Night\n\n## 🏀 Top Story: …"
 
 agent: Yep, done! Here's what's on your feed today: …
 ```

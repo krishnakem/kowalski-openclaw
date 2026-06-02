@@ -8,16 +8,18 @@
  *      on both the named export and the default export.
  *   2. `register` accepts a minimal PluginApi with pluginConfig + a mock
  *      registerTool collector, and does not throw.
- *   3. All nine expected tools are registered in the expected order
+ *   3. All ten expected tools are registered in the expected order
  *      (start_session, login, submit_verification_code, run_digest,
- *      get_session_status, reset_memory, reset_all, stop_run, end_session) with
- *      the expected `optional` flag (undefined for all of them).
+ *      get_session_status, print_digest, reset_memory, reset_all, stop_run,
+ *      end_session) with the expected `optional` flag (undefined for all of them).
  *   4. Each tool's `parameters` schema is a well-formed JSON-Schema-ish
  *      object (type: 'object', properties object present).
  *   5. Invoking `stop_run.execute()` without a session_id succeeds and
  *      writes the global stop marker.
  *   6. Invoking `start_session.execute()` returns a result matching the
  *      OpenClaw-tool contract: { content: [{ type: 'text', text }] }.
+ *   7. Invoking `print_digest.execute()` against a saved record returns
+ *      display-ready markdown with emoji preserved.
  *
  * Run: `npm run test:plugin`.
  */
@@ -111,13 +113,14 @@ function main(): void {
     }
     console.log('✅ register(api) completed');
 
-    // (3) All nine tools got registered, in order, with the right `optional` flag.
+    // (3) All ten tools got registered, in order, with the right `optional` flag.
     const expected = [
         { name: 'start_session', optional: undefined },
         { name: 'login', optional: undefined },
         { name: 'submit_verification_code', optional: undefined },
         { name: 'run_digest', optional: undefined },
         { name: 'get_session_status', optional: undefined },
+        { name: 'print_digest', optional: undefined },
         { name: 'reset_memory', optional: undefined },
         { name: 'reset_all', optional: undefined },
         { name: 'stop_run', optional: undefined },
@@ -181,7 +184,7 @@ function main(): void {
             assert(result instanceof Promise, 'start_session.execute must return a Promise');
             return result;
         })
-        .then((r) => {
+        .then(async (r) => {
             assert(r && Array.isArray(r.content), 'execute result must have content[]');
             assert(r.content.length > 0, 'execute result content[] is empty');
             const first = r.content[0];
@@ -194,6 +197,45 @@ function main(): void {
                 'start_session result missing session_id');
             assert(typeof parsed.message === 'string', 'start_session result missing message');
             console.log('✅ start_session without IG creds returns pending_credentials');
+
+            // (7) Invoke print_digest against a saved record and ensure the
+            // markdown/emoji come back as plain text, not nested JSON.
+            const printDigest = registered.find((rr) => rr.tool.name === 'print_digest');
+            assert(printDigest, 'print_digest not registered');
+            const pendingPrint = await printDigest.tool.execute('smoke-call-print-pending', {
+                session_id: parsed.session_id,
+            });
+            const pendingText = pendingPrint.content[0]?.text;
+            assert(typeof pendingText === 'string', 'pending print_digest result missing text');
+            const pendingParsed = JSON.parse(pendingText);
+            assert(pendingParsed.status === 'pending', `pending print_digest status mismatch: ${pendingParsed.status}`);
+            assert(pendingParsed.silent === true, 'pending print_digest should be marked silent');
+            assert(pendingParsed.recommended_next_poll_ms === 30000,
+                'pending print_digest should recommend 30s poll interval');
+            console.log('✅ print_digest pending result is silent and pollable');
+
+            const recordId = uuidv4();
+            const recordDir = path.join(pluginConfig.outputDir, 'analysis_records');
+            fs.mkdirSync(recordDir, { recursive: true });
+            fs.writeFileSync(
+                path.join(recordDir, `${recordId}.json`),
+                JSON.stringify({
+                    id: recordId,
+                    data: {
+                        title: 'Smoke Digest',
+                        markdown: '# Smoke Digest\n\n## 🏀 Top Story\nEmoji made it through.',
+                    },
+                    leadStoryPreview: 'Emoji made it through.',
+                })
+            );
+            const printResult = await printDigest.tool.execute('smoke-call-print', {
+                record_id: recordId,
+            });
+            const printText = printResult.content[0]?.text;
+            assert(typeof printText === 'string', 'print_digest result missing text');
+            assert(printText.includes('## 🏀 Top Story'), 'print_digest did not preserve emoji markdown');
+            assert(!printText.trim().startsWith('{'), 'print_digest should return plain text, not JSON');
+            console.log('✅ print_digest returns display-ready markdown with emoji preserved');
 
             // Teardown — and also clean up the tmp dirs so repeat runs stay clean.
             teardown?.();

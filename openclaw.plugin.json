@@ -12,6 +12,7 @@
             "submit_verification_code",
             "run_digest",
             "get_session_status",
+            "print_digest",
             "reset_memory",
             "reset_all",
             "stop_run",

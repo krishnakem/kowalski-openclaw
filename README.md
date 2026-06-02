@@ -24,7 +24,7 @@ The heavy lifting is all local — real Playwright-controlled Chromium against a
 
 ## What the plugin exposes
 
-The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
+The plugin registers **ten tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
 
 | Tool | Purpose |
 | --- | --- |
@@ -32,13 +32,14 @@ The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md
 | `login` | Continue the automatic headless login flow. If credentials are missing, returns `pending_credentials`; if Instagram asks for 2FA/device approval, returns `pending_2fa` / `pending_device_approval`; when login is verified, starts `run_digest` automatically. |
 | `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts `run_digest` automatically. |
 | `run_digest` | Manually start the non-blocking stories + feed capture, extraction, and digest generation run. Normally `start_session` or successful login starts this for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
-| `get_session_status` | Latest run phase + the last ~20 pipeline events. Also delivers the final digest once `digest_status` is `completed` or `stopped`. |
+| `get_session_status` | Latest run phase + the last ~20 pipeline events. When the digest is ready, tells the agent to call `print_digest`. |
+| `print_digest` | Polls for the completed/stopped digest. While still running, returns a silent pending payload; once ready, returns display-ready markdown, preserving emoji, and auto-ends the session after printing. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
 | `reset_all` | Dry-run-first factory reset for browser profile, scratch data, and output records. Requires `confirm: true` to actually wipe. |
 | `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
-The canonical happy-path call chain for a digest ask is now just `start_session → get_session_status when the user asks if it is done`. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
+The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-minute silent print_digest check → print_digest every 30 seconds until ready`. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
 
 ---
 
@@ -50,7 +51,7 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
         ┌──────────────────────────────────────────────────────────────────┐
         │  OpenClaw agent (in chat)                                        │
         │    ↓ calls tools                                                 │
-        │  src/plugin/index.ts  ──────────  registers 9 tools              │
+        │  src/plugin/index.ts  ──────────  registers 10 tools             │
         └──────────────────────────┬───────────────────────────────────────┘
                                    │ (session_id + runConfig)
                                    ▼
@@ -200,7 +201,7 @@ src/
 │   └── KowalskiSession.ts          # Host-supplied session handle
 │                                   # (paths, inference client, runConfig, events, abort signal)
 ├── plugin/                         # OpenClaw plugin surface
-│   ├── index.ts                    # register(api) — the 9 tools
+│   ├── index.ts                    # register(api) — the 10 tools
 │   ├── cookie-probe.ts             # Read Instagram sessionid out of Chromium cookies DB
 │   └── session-registry.ts         # Per-session event buffer for get_session_status
 ├── main/
@@ -307,7 +308,7 @@ npm run check:browser   # Confirm plugin-local Chromium exists
 npx tsc --noEmit        # Typecheck
 
 npm run test:browser-resolver
-npm run test:plugin     # Plugin surface — asserts 9 tools registered in order
+npm run test:plugin     # Plugin surface — asserts 10 tools registered in order
 npm run test:login      # LoginAgent against a local fake-IG fixture
                         # (scripted callLLM — no provider calls)
 npm run test:extract    # Skips: extraction requires OpenClaw plugin runtime

@@ -33,8 +33,14 @@ export interface BufferedEvent {
 export interface ActiveDigest {
     startedAt: number;
     status: 'running' | 'completed' | 'failed' | 'stopped';
-    /** The header+JSON text block the tool used to return synchronously. */
+    /** Display-ready markdown returned by `print_digest`. */
     resultText?: string;
+    /** Record id for the completed/stopped digest. */
+    recordId?: string;
+    /** Path to the persisted JSON analysis record. */
+    recordPath?: string;
+    /** Path to the exported text-only PDF, when PDF export succeeds. */
+    pdfPath?: string;
     /** Error message when status === 'failed'. */
     errorMessage?: string;
     /** True once the digest result has been delivered to the agent at least once. */
