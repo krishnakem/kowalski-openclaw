@@ -313,6 +313,12 @@ The run will finalize within ~30 seconds and produce a partial digest
 with whatever was captured so far. The digest will have `aborted: true`
 and `abortReason: user-stop` in its metadata.
 
+Stopping means "stop collecting more Instagram content", not "discard the
+digest". Do not remove, cancel, or silence the queued print watcher. If no
+print watcher is queued, schedule one for 30 seconds from now. The TUI and
+PDF should still receive the partial digest from whatever has already been
+captured.
+
 ```json
 { "name": "stop_run", "arguments": { "session_id": "…" } }
 ```
@@ -328,6 +334,10 @@ present that markdown to the user verbatim. If it is `"stopped"`, call it a
 partial digest. If you stopped globally because the session id was
 missing/stale, tell the user the stop marker was sent and wait briefly for
 finalization before printing.
+
+If a cron print check fires after a stop, let it run. It should call
+`print_digest`; if the partial digest is ready, print it in the TUI. If it is
+still pending, schedule another one-shot check 30 seconds later.
 
 **Manual escape hatch (rarely needed now).** The plugin also watches
 for a file marker at `~/.kowalski/scratch/STOP_REQUESTED`, polled on
@@ -385,8 +395,8 @@ Always mention the time range and provider-cost caveat before calling
 | Tool error says `Bundled Chromium is missing` | The plugin-local Playwright browser was not installed or was deleted. | Tell the user to run `npm run setup:browser` in the kowalski-openclaw plugin directory, then retry. Do not suggest installing system Chrome. |
 | `run_digest` error mentions `"timed out"` / the header mentions `"Stories phase timed out after 15 minutes"` or `"Feed phase timed out after 30 minutes"` | A phase hit its hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
 | `run_digest` returns "another run already in progress" | The previous run is still holding the RunManager singleton. | Call `get_session_status` to see what's happening; if stale or no reliable session id exists, call `stop_run` with `{}` and wait briefly before retrying. |
-| `stop_run` says it used the global stop marker because session_id was missing/stale | The session registry entry was gone, but the singleton runner may still be active. | Treat this as a successful stop request. Tell the user the global stop marker was sent and wait briefly before starting another digest. |
-| `stop_run` returns successfully but the digest takes longer than 30 s to arrive | Normal — the stop marker is polled every ~3 s, and the agent needs to finish its current step. | Let it finalize. |
+| `stop_run` says it used the global stop marker because session_id was missing/stale | The session registry entry was gone, but the singleton runner may still be active. | Treat this as a successful stop request. Keep or schedule the print watcher so the partial digest is still delivered. |
+| `stop_run` returns successfully but the digest takes longer than 30 s to arrive | Normal — the stop marker is polled every ~3 s, and the agent needs to finish its current step. | Let it finalize; do not cancel the queued print watcher. |
 
 ---
 
