@@ -377,6 +377,83 @@ export function register(api: PluginApi): () => void {
         return { loginId: fallbackLoginId, entry: fallbackEntry };
     }
 
+    function findLatestDigestSession(excludeSessionId?: string | null): SessionEntry | null {
+        let best: SessionEntry | null = null;
+        const rank = (entry: SessionEntry): number => {
+            const status = entry.activeDigest?.status;
+            if (status === 'running') return 3;
+            if (status === 'completed' || status === 'stopped') return 2;
+            if (status === 'failed') return 1;
+            return 0;
+        };
+
+        for (const candidate of sessions.values()) {
+            if (excludeSessionId && candidate.sessionId === excludeSessionId) continue;
+            if (!candidate.activeDigest) continue;
+            if (!best) {
+                best = candidate;
+                continue;
+            }
+            const candidateRank = rank(candidate);
+            const bestRank = rank(best);
+            if (
+                candidateRank > bestRank ||
+                (candidateRank === bestRank &&
+                    candidate.activeDigest.startedAt > best.activeDigest!.startedAt)
+            ) {
+                best = candidate;
+            }
+        }
+        return best;
+    }
+
+    function buildSessionStatusPayload(
+        entry: SessionEntry,
+        redirectedFromSessionId?: string | null
+    ): Record<string, unknown> {
+        const ad = entry.activeDigest;
+        const digestStatus = ad ? ad.status : 'idle';
+        const payload: Record<string, unknown> = {
+            session_id: entry.sessionId,
+            created_at: new Date(entry.createdAt).toISOString(),
+            last_phase: entry.lastPhase,
+            digest_status: digestStatus,
+            events: entry.events,
+        };
+        if (redirectedFromSessionId) {
+            payload.redirected_from_session_id = redirectedFromSessionId;
+            payload.message =
+                `The requested session (${redirectedFromSessionId}) has no active digest, but session ${entry.sessionId} does. Use this session_id for future status, stop, and print_digest calls.`;
+        }
+        if (ad) {
+            payload.digest_started_at = new Date(ad.startedAt).toISOString();
+            if (ad.status === 'running') {
+                payload.digest_elapsed_ms = Date.now() - ad.startedAt;
+            }
+            if (ad.status === 'failed' && ad.errorMessage) {
+                payload.digest_error = ad.errorMessage;
+            }
+            if ((ad.status === 'completed' || ad.status === 'stopped') && ad.resultText) {
+                payload.digest_ready = true;
+                payload.digest_record_id = ad.recordId;
+                payload.digest_record_path = ad.recordPath;
+                payload.digest_pdf_path = ad.pdfPath;
+                payload.next_tool = {
+                    name: 'print_digest',
+                    arguments: {
+                        session_id: entry.sessionId,
+                        record_id: ad.recordId,
+                    },
+                };
+                payload.message =
+                    redirectedFromSessionId
+                        ? `The requested session (${redirectedFromSessionId}) has no active digest, but session ${entry.sessionId} is ready. Immediately call print_digest with this session_id and record_id, then present the returned markdown to the user verbatim.`
+                        : 'Digest is ready. Immediately call print_digest with this session_id and record_id, then present the returned markdown to the user verbatim.';
+            }
+        }
+        return payload;
+    }
+
     async function startDigestForEntry(
         sessionId: string,
         entry: SessionEntry,
@@ -1209,47 +1286,21 @@ export function register(api: PluginApi): () => void {
             }
             const entry = sessions.get(sessionId);
             if (!entry) {
-                return textResult(
-                    `get_session_status: session_id ${sessionId} not found.`,
-                    true
-                );
+                const fallback = findLatestDigestSession(sessionId);
+                if (fallback) {
+                    return jsonTextResult(buildSessionStatusPayload(fallback, sessionId));
+                }
+                return textResult(`get_session_status: session_id ${sessionId} not found.`, true);
             }
 
-            const ad = entry.activeDigest;
-            const digestStatus = ad ? ad.status : 'idle';
-            const payload: Record<string, unknown> = {
-                session_id: entry.sessionId,
-                created_at: new Date(entry.createdAt).toISOString(),
-                last_phase: entry.lastPhase,
-                digest_status: digestStatus,
-                events: entry.events,
-            };
-            if (ad) {
-                payload.digest_started_at = new Date(ad.startedAt).toISOString();
-                if (ad.status === 'running') {
-                    payload.digest_elapsed_ms = Date.now() - ad.startedAt;
-                }
-                if (ad.status === 'failed' && ad.errorMessage) {
-                    payload.digest_error = ad.errorMessage;
-                }
-                if ((ad.status === 'completed' || ad.status === 'stopped') && ad.resultText) {
-                    payload.digest_ready = true;
-                    payload.digest_record_id = ad.recordId;
-                    payload.digest_record_path = ad.recordPath;
-                    payload.digest_pdf_path = ad.pdfPath;
-                    payload.next_tool = {
-                        name: 'print_digest',
-                        arguments: {
-                            session_id: entry.sessionId,
-                            record_id: ad.recordId,
-                        },
-                    };
-                    payload.message =
-                        'Digest is ready. Immediately call print_digest with this session_id and record_id, then present the returned markdown to the user verbatim.';
+            if (!entry.activeDigest) {
+                const fallback = findLatestDigestSession(sessionId);
+                if (fallback) {
+                    return jsonTextResult(buildSessionStatusPayload(fallback, sessionId));
                 }
             }
 
-            return jsonTextResult(payload);
+            return jsonTextResult(buildSessionStatusPayload(entry));
         },
     };
 
@@ -1294,11 +1345,76 @@ export function register(api: PluginApi): () => void {
                 const entry = sessions.get(sessionId);
                 if (!entry) {
                     if (!recordId) {
-                        return textResult(`print_digest: session_id ${sessionId} not found.`, true);
+                        const fallback = findLatestDigestSession(sessionId);
+                        if (!fallback) {
+                            return textResult(`print_digest: session_id ${sessionId} not found.`, true);
+                        }
+                        const ad = fallback.activeDigest!;
+                        if (ad.status === 'failed') {
+                            return jsonTextResult({
+                                status: 'failed',
+                                digest_status: 'failed',
+                                session_id: fallback.sessionId,
+                                redirected_from_session_id: sessionId,
+                                silent: false,
+                                digest_error: ad.errorMessage ?? 'Digest failed.',
+                                message: 'Digest failed. Tell the user this error instead of scheduling another print_digest poll.',
+                            }, true);
+                        }
+                        if (ad.status !== 'completed' && ad.status !== 'stopped') {
+                            return jsonTextResult({
+                                status: 'pending',
+                                digest_status: ad.status,
+                                session_id: fallback.sessionId,
+                                redirected_from_session_id: sessionId,
+                                digest_started_at: new Date(ad.startedAt).toISOString(),
+                                digest_elapsed_ms: Date.now() - ad.startedAt,
+                                silent: true,
+                                recommended_next_poll_ms: 30_000,
+                                message: 'The requested session has no active digest, but this session is still running. Use this session_id for the next silent print_digest poll in 30 seconds.',
+                            });
+                        }
+                        text = ad.resultText;
+                        entryToEnd = fallback;
                     }
                 } else {
                     const ad = entry.activeDigest;
                     if (!ad) {
+                        const fallback = findLatestDigestSession(sessionId);
+                        if (fallback) {
+                            const fallbackAd = fallback.activeDigest!;
+                            if (fallbackAd.status === 'failed') {
+                                return jsonTextResult({
+                                    status: 'failed',
+                                    digest_status: 'failed',
+                                    session_id: fallback.sessionId,
+                                    redirected_from_session_id: sessionId,
+                                    silent: false,
+                                    digest_error: fallbackAd.errorMessage ?? 'Digest failed.',
+                                    message: 'Digest failed. Tell the user this error instead of scheduling another print_digest poll.',
+                                }, true);
+                            }
+                            if (
+                                fallbackAd.status !== 'completed' &&
+                                fallbackAd.status !== 'stopped'
+                            ) {
+                                return jsonTextResult({
+                                    status: 'pending',
+                                    digest_status: fallbackAd.status,
+                                    session_id: fallback.sessionId,
+                                    redirected_from_session_id: sessionId,
+                                    digest_started_at: new Date(fallbackAd.startedAt).toISOString(),
+                                    digest_elapsed_ms: Date.now() - fallbackAd.startedAt,
+                                    silent: true,
+                                    recommended_next_poll_ms: 30_000,
+                                    message: 'The requested session has no active digest, but this session is still running. Use this session_id for the next silent print_digest poll in 30 seconds.',
+                                });
+                            }
+                            text = fallbackAd.resultText;
+                            entryToEnd = fallback;
+                        }
+                    }
+                    if (!ad && !text) {
                         return jsonTextResult({
                             status: 'pending',
                             digest_status: 'idle',
@@ -1308,36 +1424,38 @@ export function register(api: PluginApi): () => void {
                             message: 'No digest has started on this session yet. Stay silent and poll again only if the workflow has already started.',
                         });
                     }
-                    if (ad.status === 'failed') {
-                        return jsonTextResult({
-                            status: 'failed',
-                            digest_status: 'failed',
-                            session_id: sessionId,
-                            silent: false,
-                            digest_error: ad.errorMessage ?? 'Digest failed.',
-                            message: 'Digest failed. Tell the user this error instead of scheduling another print_digest poll.',
-                        }, true);
+                    if (ad) {
+                        if (ad.status === 'failed') {
+                            return jsonTextResult({
+                                status: 'failed',
+                                digest_status: 'failed',
+                                session_id: sessionId,
+                                silent: false,
+                                digest_error: ad.errorMessage ?? 'Digest failed.',
+                                message: 'Digest failed. Tell the user this error instead of scheduling another print_digest poll.',
+                            }, true);
+                        }
+                        if (ad.status !== 'completed' && ad.status !== 'stopped') {
+                            return jsonTextResult({
+                                status: 'pending',
+                                digest_status: ad.status,
+                                session_id: sessionId,
+                                digest_started_at: new Date(ad.startedAt).toISOString(),
+                                digest_elapsed_ms: Date.now() - ad.startedAt,
+                                silent: true,
+                                recommended_next_poll_ms: 30_000,
+                                message: 'Digest is still running. Stay silent and schedule another print_digest poll in 30 seconds.',
+                            });
+                        }
+                        if (recordId && ad.recordId && recordId !== ad.recordId) {
+                            return textResult(
+                                `print_digest: record_id mismatch for session ${sessionId}; expected ${ad.recordId}, got ${recordId}.`,
+                                true
+                            );
+                        }
+                        text = ad.resultText;
+                        entryToEnd = entry;
                     }
-                    if (ad.status !== 'completed' && ad.status !== 'stopped') {
-                        return jsonTextResult({
-                            status: 'pending',
-                            digest_status: ad.status,
-                            session_id: sessionId,
-                            digest_started_at: new Date(ad.startedAt).toISOString(),
-                            digest_elapsed_ms: Date.now() - ad.startedAt,
-                            silent: true,
-                            recommended_next_poll_ms: 30_000,
-                            message: 'Digest is still running. Stay silent and schedule another print_digest poll in 30 seconds.',
-                        });
-                    }
-                    if (recordId && ad.recordId && recordId !== ad.recordId) {
-                        return textResult(
-                            `print_digest: record_id mismatch for session ${sessionId}; expected ${ad.recordId}, got ${recordId}.`,
-                            true
-                        );
-                    }
-                    text = ad.resultText;
-                    entryToEnd = entry;
                 }
             }
 

@@ -106,7 +106,10 @@ their authenticator app or SMS, then call:
 ```
 
 If verification succeeds, `submit_verification_code` automatically starts
-the digest and returns `status: "started"`. If it returns `pending_2fa`
+the digest and returns `status: "started"`. Treat the returned
+`session_id` as authoritative: replace any older pending-login or
+pending-2FA session ID in memory, and use this newest `session_id` for
+status, stop, cron, and `print_digest` calls. If it returns `pending_2fa`
 again, the code was rejected or expired; ask for a fresh code and call the
 same tool again.
 
@@ -146,8 +149,9 @@ if cookies partially persisted.
 ### 2. While The Run Is Active
 
 After a `status: "started"` response, tell the user the digest is running
-in the background, save the `session_id`, and schedule a silent automatic
-print check for 30 minutes from now using OpenClaw's `cron` tool.
+in the background, save the returned `session_id` as the current active
+digest session, replacing any older login/session IDs, and schedule a silent
+automatic print check for 30 minutes from now using OpenClaw's `cron` tool.
 
 The scheduled check should call `print_digest` directly:
 
