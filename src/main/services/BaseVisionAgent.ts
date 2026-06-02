@@ -256,8 +256,8 @@ export abstract class BaseVisionAgent {
             // === MAIN LOOP: execute decision, observe result, get next ===
             while (true) {
                 if (this.stopped) {
-                    console.log(`🛑 ${this.getAgentName()}: stopped by user`);
-                    this.collector.appendLog(`🛑 ${this.getAgentName()}: stopped by user (Cmd+Shift+K)`);
+                    console.log(`🛑 ${this.getAgentName()}: stopped/paused`);
+                    this.collector.appendLog(`🛑 ${this.getAgentName()}: stopped/paused`);
                     break;
                 }
 

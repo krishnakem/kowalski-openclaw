@@ -8,9 +8,10 @@
  * this uses the plain default-export plugin shape instead of
  * `definePluginEntry`.
  *
- * The module is loaded once per gateway boot and `register(api)` is
- * called exactly once. All per-session state lives in the `sessions`
- * map captured in module scope.
+ * OpenClaw may call `register(api)` more than once in one gateway process
+ * (for example around agent/session refreshes). Per-session state therefore
+ * lives in a process-global map so a pending 2FA browser survives plugin
+ * re-registration until submit_verification_code resumes it.
  */
 
 import fs from 'node:fs';
@@ -36,7 +37,6 @@ import { writeDigestPdf } from './digest-pdf.js';
 import { createInferenceClient, type OpenClawRuntimeLike } from '../main/services/Inference.js';
 import {
     attachEventBuffer,
-    createRegistry,
     type SessionEntry,
 } from './session-registry.js';
 
@@ -89,6 +89,43 @@ export interface PluginConfig {
      * expanded here — set an absolute path if you want anything else.
      */
     downloadsDir?: string;
+}
+
+interface PendingLogin {
+    loginId: string;
+    sessionId: string;
+    context: BrowserContext;
+    page: Page;
+    status: Exclude<LoginPendingStatus, 'success' | 'escalate_to_human'>;
+    description: string;
+    agent: LoginAgent;
+    collector: ScreenshotCollector;
+    ghost: GhostMouse;
+    scroll: HumanScroll;
+    runDir: string;
+    createdAt: number;
+}
+
+interface KowalskiPluginGlobalState {
+    sessions: Map<string, SessionEntry>;
+    pendingLogins: Map<string, PendingLogin>;
+    registrations: number;
+}
+
+const GLOBAL_STATE_KEY = '__kowalskiOpenClawPluginState';
+
+function getPluginGlobalState(): KowalskiPluginGlobalState {
+    const root = globalThis as typeof globalThis & {
+        [GLOBAL_STATE_KEY]?: KowalskiPluginGlobalState;
+    };
+    if (!root[GLOBAL_STATE_KEY]) {
+        root[GLOBAL_STATE_KEY] = {
+            sessions: new Map<string, SessionEntry>(),
+            pendingLogins: new Map<string, PendingLogin>(),
+            registrations: 0,
+        };
+    }
+    return root[GLOBAL_STATE_KEY];
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +257,10 @@ export function register(api: PluginApi): () => void {
         fs.mkdirSync(dir, { recursive: true });
     }
 
-    const sessions = createRegistry();
+    const globalState = getPluginGlobalState();
+    globalState.registrations += 1;
+    const sessions = globalState.sessions;
+    const pendingLogins = globalState.pendingLogins;
     const log = api.logger ?? {
         info: (...a: unknown[]) => console.log('[kowalski]', ...a),
         warn: (...a: unknown[]) => console.warn('[kowalski]', ...a),
@@ -261,24 +301,10 @@ export function register(api: PluginApi): () => void {
      * Pending-login registry. When LoginAgent pauses on 2FA or device
      * approval, we keep the Playwright page + context alive here so
      * submit_verification_code can resume against the same browser
-     * session. Entries older than 15 minutes are GC'd on every login /
-     * submit_verification_code call.
+     * session. This map is process-global because OpenClaw can re-register
+     * plugins between chat turns; entries older than 15 minutes are GC'd on
+     * every login / submit_verification_code call.
      */
-    interface PendingLogin {
-        loginId: string;
-        sessionId: string;
-        context: BrowserContext;
-        page: Page;
-        status: Exclude<LoginPendingStatus, 'success' | 'escalate_to_human'>;
-        description: string;
-        agent: LoginAgent;
-        collector: ScreenshotCollector;
-        ghost: GhostMouse;
-        scroll: HumanScroll;
-        runDir: string;
-        createdAt: number;
-    }
-    const pendingLogins = new Map<string, PendingLogin>();
     const PENDING_TTL_MS = 15 * 60 * 1000;
 
     async function gcPendingLogins(): Promise<void> {
@@ -1658,6 +1684,16 @@ export function register(api: PluginApi): () => void {
                 log.warn('end_session: browser context close failed', err);
             }
 
+            for (const [id, pending] of pendingLogins) {
+                if (pending.sessionId !== sessionId) continue;
+                try {
+                    await pending.context.close();
+                } catch {
+                    /* ignore */
+                }
+                pendingLogins.delete(id);
+            }
+
             sessions.delete(sessionId);
             return textResult('Session ended.');
         },
@@ -1680,22 +1716,18 @@ export function register(api: PluginApi): () => void {
         outputDir,
         tools: 10,
         envCredentialsPresent: Boolean(envIgUsername && envIgPassword),
+        activeSessions: sessions.size,
+        pendingLogins: pendingLogins.size,
+        registrations: globalState.registrations,
     });
 
     return () => {
-        for (const entry of sessions.values()) {
-            try {
-                entry.controller.abort();
-            } catch {
-                /* ignore */
-            }
-        }
-        sessions.clear();
-        // Close any pending-login browsers left over at teardown.
-        for (const [, pending] of pendingLogins) {
-            pending.context.close().catch(() => { /* ignore */ });
-        }
-        pendingLogins.clear();
+        globalState.registrations = Math.max(0, globalState.registrations - 1);
+        log.info('[kowalski] plugin teardown: preserving process-global session state', {
+            activeSessions: sessions.size,
+            pendingLogins: pendingLogins.size,
+            registrations: globalState.registrations,
+        });
     };
 }
 
