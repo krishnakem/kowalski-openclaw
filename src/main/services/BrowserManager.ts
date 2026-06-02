@@ -1,4 +1,3 @@
-import path from 'path';
 import fs from 'fs';
 import { chromium, BrowserContext, Page, CDPSession } from 'playwright';
 import { resolveBundledBrowserExecutable } from './BundledBrowserResolver.js';
@@ -206,22 +205,27 @@ export class BrowserManager {
                 console.warn('📐 Could not verify viewport:', viewportErr);
             }
 
-            // Optional cookie-injection path. Plugin hosts can drop a session.json
-            // alongside the browser profile to pre-seed cookies; otherwise this is
-            // a no-op.
+            // Optional cookie-injection path. The Instagram session cookie must
+            // come from the process environment via session.runConfig; we do not
+            // read plaintext session.json files from disk.
             try {
-                const sessionPath = path.join(session.browserProfileDir, 'session.json');
-                if (fs.existsSync(sessionPath)) {
-                    console.log('🍪 BrowserManager: Found session.json from Onboarding. Injecting cookies...');
-                    const sessionData = JSON.parse(fs.readFileSync(sessionPath, 'utf-8'));
-
-                    if (sessionData && Array.isArray(sessionData.cookies)) {
-                        await this.browserContext.addCookies(sessionData.cookies);
-                        console.log(`✅ BrowserManager: Injected ${sessionData.cookies.length} cookies from session.json`);
-                    }
+                const igSessionId = session.runConfig.igSessionId?.trim();
+                if (igSessionId) {
+                    await this.browserContext.addCookies([
+                        {
+                            name: 'sessionid',
+                            value: igSessionId,
+                            domain: '.instagram.com',
+                            path: '/',
+                            httpOnly: true,
+                            secure: true,
+                            sameSite: 'Lax',
+                        },
+                    ]);
+                    console.log('✅ BrowserManager: Injected Instagram session cookie from environment');
                 }
             } catch (err) {
-                console.error('⚠️ BrowserManager: Failed to sync session.json cookies:', err);
+                console.error('⚠️ BrowserManager: Failed to inject environment session cookie:', err);
                 // Non-critical, continue launching
             }
 

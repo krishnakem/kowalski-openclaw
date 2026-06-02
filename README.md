@@ -100,7 +100,7 @@ The defining piece of the project is that **login itself is driven by a vision a
 
 **Scene classification.** Every turn starts by identifying the scene: `logged_out_landing`, `save_info_interstitial`, `two_factor_code`, `device_approval`, `suspicious_login_challenge`, `home_feed`, etc. Branching happens in the prompt based on what the agent sees.
 
-**Credentials never touch the LLM.** The prompt emits `fill_username` / `fill_password` actions; the executor reads the values from `session.runConfig.igUsername` / `igPassword` (which came from env vars) and types them into the focused field character-by-character with 80–220 ms jitter. The model payload for that turn contains only the action name.
+**Credential values never touch the LLM.** The prompt emits `fill_username` / `fill_password` actions; the executor reads values seeded from `IG_USERNAME` / `IG_PASSWORD` environment variables into `session.runConfig.igUsername` / `igPassword` and types them into the focused field character-by-character with 80–220 ms jitter. The model payload for that turn contains only the action name, and the `login` tool does not accept username/password parameters.
 
 **2FA round-trip.** When the agent sees a 2FA screen, it emits `emit_pending_2fa`, halts, and the `login` tool returns `{ status: 'pending_2fa', login_id }` with a `PendingLogin` keeping the Playwright page alive. The OpenClaw agent asks the user for their code in chat, the user replies, the agent calls `submit_verification_code(login_id, code)`, and the `LoginAgent` resumes against the same page with the code threaded into its user prompt. When verification succeeds, the digest starts automatically.
 
@@ -128,9 +128,14 @@ npm install -g openclaw
 openclaw configure
 
 # 3. (Optional) Set IG credentials for agentic login. If unset, the
-#    `login` tool returns pending_credentials so the agent can ask in chat.
+#    `login` tool returns pending_credentials with env setup instructions.
 export IG_USERNAME="your.instagram.handle"
 export IG_PASSWORD="your.password"
+
+#    Optional alternative: inject an existing Instagram session cookie without
+#    passing it through chat/tool params. Use either the raw value or
+#    "sessionid=..." copied from a Cookie header.
+export IG_SESSIONID="your.instagram.sessionid"
 
 # 4. Install plugin dependencies and the plugin-local Playwright browser.
 cd /absolute/path/to/Kowalski-OpenClaw
@@ -175,7 +180,8 @@ support.
 
 | Variable | Purpose |
 | --- | --- |
-| `IG_USERNAME`, `IG_PASSWORD` | Enable unattended use of the headless agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool returns `pending_credentials`. Credentials are never logged or passed through any LLM payload. |
+| `IG_USERNAME`, `IG_PASSWORD` | Enable the headless agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool returns `pending_credentials`. Credentials are never logged, accepted as tool params, or passed through any LLM payload. |
+| `IG_SESSIONID`, `INSTAGRAM_SESSIONID` | Optional existing Instagram `sessionid` cookie. If present, Kowalski injects it into the Playwright browser context from env instead of reading plaintext cookie JSON from disk. |
 | `KOWALSKI_CONNECTIVITY_PROBE_URL` | Optional URL for the generic offline watchdog probe. Defaults to `https://www.gstatic.com/generate_204`. |
 
 Model selection is handled by OpenClaw. Configure the default text and image

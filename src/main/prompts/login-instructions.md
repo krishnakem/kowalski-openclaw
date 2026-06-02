@@ -51,7 +51,7 @@ HAPPY-PATH SEQUENCE (scene: `logged_out_landing`)
 7. Wait ~2 seconds for IG to process.
 8. Re-observe. Classify the new scene and branch.
 
-If the logged_out_landing persists with a visible error ("Sorry, your password was incorrect", "The username you entered doesn't belong to an account"), emit `escalate_to_human` — credentials are bad and the host needs to ask the user.
+If the logged_out_landing persists with a visible error ("Sorry, your password was incorrect", "The username you entered doesn't belong to an account"), emit `escalate_to_human` — credentials are bad and the host needs the operator to update `IG_USERNAME` / `IG_PASSWORD` outside chat, then restart the gateway.
 
 ---
 

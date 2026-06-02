@@ -77,14 +77,16 @@ Digest has started. Tell the user the run is in flight and save the
 { "status": "pending_credentials", "session_id": "…", "message": "…" }
 ```
 
-No Instagram credentials are available. Ask the user in the TUI for their
-Instagram username (or email/phone) and password. When they reply, call
-`login` with those values. If the user refuses to type their password
-into chat, stop the login flow politely; this plugin is headless-only.
+No Instagram credentials are available in the gateway environment. Do not ask
+for the Instagram username/password in chat and do not pass credentials through
+tool parameters. Tell the user to set `IG_USERNAME` and `IG_PASSWORD` outside
+the LLM/tool-call path, restart the OpenClaw gateway, then run `start_session`
+again. If they have an existing Instagram cookie, they can instead set
+`IG_SESSIONID` or `INSTAGRAM_SESSIONID`.
 
 ```json
 { "name": "login",
-  "arguments": { "session_id": "…", "username": "…", "password": "…" } }
+  "arguments": { "session_id": "…" } }
 ```
 
 `login` automatically resumes the workflow. If credentials are accepted
@@ -347,9 +349,9 @@ Always mention the time range and provider-cost caveat before calling
 
 | Trigger | What happened | How to respond |
 | --- | --- | --- |
-| `start_session` returns `pending_credentials` | Persistent profile has no valid cookie, and no creds are available (no params, no env). | Ask the user in the TUI for their IG username + password, then call `login` with the returned `session_id` and those params. If they refuse, stop the login flow politely. |
+| `start_session` returns `pending_credentials` | Persistent profile has no valid cookie, and no env credentials/session cookie are available. | Tell the user to set `IG_USERNAME` + `IG_PASSWORD`, or `IG_SESSIONID` / `INSTAGRAM_SESSIONID`, outside chat and restart the gateway. Do not collect passwords in chat or tool params. |
 | `start_session` / `login` / `submit_verification_code` returns `status: "started"` | Login was already valid or has just been verified. | The digest is already running. Tell the user it is in flight, save the `session_id`, and schedule the 30-minute silent `print_digest` check. |
-| `login` returns `pending_credentials` | No creds available after an explicit login retry. | Ask the user in the TUI for their IG username + password, then call `login` again with those params. If they refuse, stop the login flow politely. |
+| `login` returns `pending_credentials` | No env credentials are available after an explicit login retry. | Tell the user to set `IG_USERNAME` + `IG_PASSWORD`, or `IG_SESSIONID` / `INSTAGRAM_SESSIONID`, outside chat and restart the gateway. Do not collect passwords in chat or tool params. |
 | `login` returns `login_failed_needs_manual` | Instagram showed a challenge the automated login cannot clear headlessly. | Relay the message, ask the user to approve or clear the challenge in the Instagram app on their phone, then retry login later. |
 | `login` returns `pending_2fa` | Agentic flow hit a 2FA screen. | Ask the user for their code, call `submit_verification_code` with it. Do NOT guess the code. |
 | `login` returns `pending_device_approval` | Agentic flow hit a device-push challenge. | Tell the user which device IG pinged (from `device_description`), then call `submit_verification_code` with `code: null` after they say they've approved it. |
@@ -379,14 +381,11 @@ Always mention the time range and provider-cost caveat before calling
   manual recovery/control-plane tool.
 - **Don't call `run_digest` again while one is running** — you'll get
   `status: "already_running"`. Either wait or call `stop_run` first.
-- **Don't ask the user for their Instagram password outside the login
-  flow.** You ask exactly once, when `login` returns `pending_credentials`
-  (or before the very first `login` call if you already know no env vars
-  are set). If they already gave them to you earlier in the conversation,
-  re-use what's cached on the session — don't ask again. Never echo
-  the password back to them, never log it, never include it in any
-  summary. If they refuse to share the password, stop the login flow
-  politely because the plugin has no visible-browser fallback.
+- **Don't ask the user for their Instagram password in chat or tool
+  parameters.** When `login` returns `pending_credentials`, tell the user
+  to set `IG_USERNAME` + `IG_PASSWORD`, or `IG_SESSIONID` /
+  `INSTAGRAM_SESSIONID`, outside the LLM/tool-call path and restart the
+  gateway. Never echo, log, summarize, or pass credentials in tool params.
 - **Don't guess 2FA codes.** If you don't have a code from the user,
   don't make one up — Instagram locks accounts on repeated wrong
   codes. Return `pending_2fa` handling back to the user.

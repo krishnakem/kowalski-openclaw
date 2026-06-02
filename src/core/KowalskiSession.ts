@@ -32,16 +32,19 @@ export interface KowalskiSession {
         // for now — not surfaced as a tool parameter.
         storiesTimeoutMs?: number;
         feedTimeoutMs?: number;
-        // Instagram credentials for the Stage 6 agentic LoginAgent. Plumbed
-        // through session.runConfig (not a global singleton) so the plugin
-        // can gate on the env vars at register() time without threading a
-        // new arg down the service graph. Never pass these fields into any
-        // LLM payload — the LoginAgent executor reads them directly during
-        // fill_username / fill_password action dispatch. If either is
-        // absent, the plugin's `login` tool asks the host agent to collect
-        // credentials in chat and then continues headlessly.
+        // Instagram credentials for the Stage 6 agentic LoginAgent. These
+        // are seeded only from process environment variables at plugin
+        // registration time, then kept in-memory for the current login round
+        // trip. Never pass these fields into tool params, tool responses,
+        // logs, or any LLM payload — the LoginAgent executor reads them
+        // directly during fill_username / fill_password action dispatch.
         igUsername?: string;
         igPassword?: string;
+        // Optional Instagram `sessionid` cookie value, also sourced only from
+        // the process environment. BrowserManager injects it directly into
+        // the Playwright context; plaintext session.json injection is not
+        // supported.
+        igSessionId?: string;
     };
 
     browser?: {

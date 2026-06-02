@@ -117,6 +117,26 @@ function readStringField(obj: unknown, key: string): string | undefined {
     return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function readEnvSecret(name: string): string | undefined {
+    const value = process.env[name];
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function readInstagramSessionIdEnv(): { value?: string; source?: string } {
+    for (const name of ['IG_SESSIONID', 'INSTAGRAM_SESSIONID']) {
+        const raw = readEnvSecret(name);
+        if (!raw) continue;
+
+        const cookiePair = raw
+            .split(';')
+            .map((part) => part.trim())
+            .find((part) => part.startsWith('sessionid='));
+        const value = cookiePair ? cookiePair.slice('sessionid='.length).trim() : raw;
+        if (value) return { value, source: name };
+    }
+    return {};
+}
+
 function markdownFromRecordData(data: unknown): string {
     const markdown = readStringField(data, 'markdown');
     if (markdown) return markdown;
@@ -210,32 +230,31 @@ export function register(api: PluginApi): () => void {
     // -----------------------------------------------------------------------
     // Stage 6 — agentic login wiring.
     //
-    // Credential resolution order for the LoginAgent, highest-priority first:
-    //   1. `username` / `password` params on the `login` tool call itself.
-    //      The canonical path: the agent prompts the user in the TUI and
-    //      forwards whatever they type back into the tool.
-    //   2. `IG_USERNAME` / `IG_PASSWORD` process env vars set at gateway
-    //      launch. Power-user convenience for unattended scheduled runs.
-    //   3. Neither — the `login` tool returns `pending_credentials` and the
-    //      agent is expected to ask the user in the TUI, then call `login`
-    //      again with the params. There is no manual browser-window fallback;
-    //      every login attempt stays headless.
+    // Credential resolution for the LoginAgent:
+    //   - `IG_USERNAME` / `IG_PASSWORD` process env vars set at gateway launch.
+    //   - Neither — the `login` tool returns `pending_credentials` and tells
+    //     the host to set env vars outside the LLM/tool-call path. There is no
+    //     manual browser-window fallback; every login attempt stays headless.
     //
     // Credentials are cached in-memory per session (on KowalskiSession.runConfig)
     // so the agentic flow can resume across pending_2fa round trips without
     // asking the user a second time. They are NEVER logged, NEVER serialised
-    // into tool responses, and NEVER passed into any LLM payload (the
-    // LoginAgent's executor reads them during action dispatch, not via the
-    // prompt).
+    // into tool responses, accepted as tool params, or passed into any LLM
+    // payload (the LoginAgent's executor reads them during action dispatch,
+    // not via the prompt).
     // -----------------------------------------------------------------------
-    const envIgUsername = process.env.IG_USERNAME;
-    const envIgPassword = process.env.IG_PASSWORD;
+    const envIgUsername = readEnvSecret('IG_USERNAME');
+    const envIgPassword = readEnvSecret('IG_PASSWORD');
+    const envIgSessionId = readInstagramSessionIdEnv();
     if (envIgUsername && envIgPassword) {
-        log.info('[kowalski] IG_USERNAME / IG_PASSWORD found in env; agentic login will use them unless login is called with username/password params.');
+        log.info('[kowalski] IG_USERNAME / IG_PASSWORD found in env; agentic login can use them.');
     } else {
         log.info(
-            '[kowalski] IG_USERNAME / IG_PASSWORD not set in env; login tool will request credentials from the agent via pending_credentials on first call.'
+            '[kowalski] IG_USERNAME / IG_PASSWORD not set in env; login tool will return pending_credentials with env setup instructions.'
         );
+    }
+    if (envIgSessionId.value) {
+        log.info(`[kowalski] ${envIgSessionId.source} found in env; browser context will inject the Instagram session cookie.`);
     }
 
     /**
@@ -271,6 +290,65 @@ export function register(api: PluginApi): () => void {
                 log.warn(`[kowalski] pendingLogin ${id} expired after 15min, closed browser`);
             }
         }
+    }
+
+    function resolvePendingLogin(
+        loginId: string | null,
+        sessionId: string | null
+    ): { loginId: string; entry: PendingLogin } | { error: AgentToolResult } {
+        if (loginId) {
+            const direct = pendingLogins.get(loginId);
+            if (direct) return { loginId, entry: direct };
+
+            const candidates = [...pendingLogins.entries()].filter(
+                ([, pending]) => !sessionId || pending.sessionId === sessionId
+            );
+            if (candidates.length === 1) {
+                const [fallbackLoginId, fallbackEntry] = candidates[0];
+                log.warn('[kowalski] submit_verification_code received stale login_id; using only pending login fallback', {
+                    requestedLoginId: loginId,
+                    fallbackLoginId,
+                    sessionId: fallbackEntry.sessionId,
+                });
+                return { loginId: fallbackLoginId, entry: fallbackEntry };
+            }
+
+            return {
+                error: textResult(
+                    `submit_verification_code: login_id ${loginId} not found (expired, already resolved, or replaced).`,
+                    true
+                ),
+            };
+        }
+
+        const candidates = [...pendingLogins.entries()].filter(
+            ([, pending]) => !sessionId || pending.sessionId === sessionId
+        );
+        if (candidates.length === 0) {
+            return {
+                error: textResult(
+                    sessionId
+                        ? `submit_verification_code: no active pending login found for session ${sessionId}.`
+                        : 'submit_verification_code: no active pending login found.',
+                    true
+                ),
+            };
+        }
+        if (candidates.length > 1) {
+            return {
+                error: textResult(
+                    'submit_verification_code: multiple pending logins are active. Pass the login_id returned by login, or pass session_id to disambiguate.',
+                    true
+                ),
+            };
+        }
+
+        const [fallbackLoginId, fallbackEntry] = candidates[0];
+        log.info('[kowalski] submit_verification_code using sole pending login fallback', {
+            loginId: fallbackLoginId,
+            sessionId: fallbackEntry.sessionId,
+        });
+        return { loginId: fallbackLoginId, entry: fallbackEntry };
     }
 
     async function startDigestForEntry(
@@ -544,14 +622,13 @@ export function register(api: PluginApi): () => void {
                     userName: config.userName,
                     location: config.location,
                     phases,
-                    // Seed with env-sourced Instagram credentials if the
-                    // host set them. The login tool will override these on
-                    // a per-call basis if the agent passes username/password
-                    // params (which is the canonical TUI-prompt path).
-                    // Never pass these through any structured response or
-                    // log payload (see redaction note above).
+                    // Seed sensitive Instagram values only from env. These
+                    // stay in process memory for the active session and are
+                    // never accepted through tool params or emitted in
+                    // responses/logs.
                     igUsername: envIgUsername,
                     igPassword: envIgPassword,
+                    igSessionId: envIgSessionId.value,
                 },
             });
 
@@ -581,8 +658,14 @@ export function register(api: PluginApi): () => void {
                 });
             }
 
+            if (envIgSessionId.value) {
+                return startDigestForEntry(sessionId, entry, 'start_session', {
+                    logged_in: 'env_sessionid',
+                    phases,
+                });
+            }
+
             return loginTool.execute('start_session:auto-login', {
-                ...params,
                 session_id: sessionId,
                 triggered_by: 'start_session',
                 login_probe: probe.logged_in,
@@ -637,21 +720,13 @@ export function register(api: PluginApi): () => void {
     const loginTool: PluginTool = {
         name: 'login',
         description:
-            'Continue the automatic Kowalski workflow through Instagram login. This tool resolves credentials, drives the headless LoginAgent, returns pending_credentials / pending_2fa / pending_device_approval when user input is needed, and automatically starts run_digest as soon as login is verified.',
+            'Continue the automatic Kowalski workflow through Instagram login. Credentials must be supplied via IG_USERNAME / IG_PASSWORD environment variables; this tool does not accept secrets as parameters. It drives the headless LoginAgent, returns pending_credentials / pending_2fa / pending_device_approval when user input is needed, and automatically starts run_digest as soon as login is verified.',
         parameters: {
             type: 'object',
             properties: {
                 session_id: {
                     type: 'string',
                     description: 'The id returned by start_session. Required so pending_2fa / pending_device_approval payloads can be routed back.',
-                },
-                username: {
-                    type: 'string',
-                    description: 'Instagram username or email. Ask the user in the TUI on first login — do NOT hardcode or guess. Cached on the session for the rest of the login round trip so you only need to ask once. Optional; if omitted, falls back to IG_USERNAME env var, and if that is also unset the tool returns pending_credentials.',
-                },
-                password: {
-                    type: 'string',
-                    description: 'Instagram password. Ask the user in the TUI on first login — do NOT hardcode or guess. Cached on the session for the rest of the login round trip. Optional; if omitted, falls back to IG_PASSWORD env var, and if that is also unset the tool returns pending_credentials.',
                 },
             },
             required: ['session_id'],
@@ -682,23 +757,9 @@ export function register(api: PluginApi): () => void {
                 });
             }
 
-            // ----- Resolve credentials: params > session cache > env -----
-            const paramUsername =
-                typeof params.username === 'string' && params.username.trim()
-                    ? params.username.trim()
-                    : undefined;
-            const paramPassword =
-                typeof params.password === 'string' && params.password
-                    ? params.password
-                    : undefined;
-
-            if (paramUsername) entry.session.runConfig.igUsername = paramUsername;
-            if (paramPassword) entry.session.runConfig.igPassword = paramPassword;
-
-            const effectiveUsername =
-                entry.session.runConfig.igUsername ?? envIgUsername;
-            const effectivePassword =
-                entry.session.runConfig.igPassword ?? envIgPassword;
+            // ----- Resolve credentials from env-seeded session state only -----
+            const effectiveUsername = entry.session.runConfig.igUsername;
+            const effectivePassword = entry.session.runConfig.igPassword;
 
             if (!effectiveUsername || !effectivePassword) {
                 return jsonTextResult({
@@ -707,13 +768,9 @@ export function register(api: PluginApi): () => void {
                     triggered_by: triggeredBy,
                     logged_in: alreadyLoggedIn.logged_in,
                     message:
-                        'No Instagram credentials available. Ask the user in the TUI for their Instagram username (or email/phone) and password, then call `login` again with this session_id plus `username` and `password` params. When login succeeds, run_digest will start automatically. Never guess or reuse old creds. If the user declines to share credentials in chat, login cannot continue because this plugin is headless-only.',
+                        'No Instagram credentials are available in the gateway environment. Set IG_USERNAME and IG_PASSWORD outside the LLM/tool-call path, restart the OpenClaw gateway so the plugin can read them from process.env, then call start_session again. Alternatively set IG_SESSIONID or INSTAGRAM_SESSIONID to an existing Instagram sessionid cookie value.',
                 });
             }
-            // Persist resolved creds on the session so submit_verification_code
-            // can pick them up too.
-            entry.session.runConfig.igUsername = effectiveUsername;
-            entry.session.runConfig.igPassword = effectivePassword;
 
             // Re-bind the singleton — another session may have been the
             // last to bind. Same pattern run_digest uses.
@@ -853,7 +910,7 @@ export function register(api: PluginApi): () => void {
     // login on their other device).
     //
     // Input:
-    //   { login_id: string, code?: string | null }
+    //   { login_id?: string, session_id?: string, code?: string | null }
     //
     // Behavior:
     //   - pending_2fa   → `code` is required; the LoginAgent is resumed
@@ -869,36 +926,42 @@ export function register(api: PluginApi): () => void {
     const submitVerificationCode: PluginTool = {
         name: 'submit_verification_code',
         description:
-            'Second leg of the login 2FA / device-approval round trip. Call after `login` returned pending_2fa (pass the user\'s code) or pending_device_approval (pass code: null — the tool polls for the user approving on their other device). Returns success, failure, or still-pending.',
+            'Second leg of the login 2FA / device-approval round trip. Call immediately when the user sends a 6-digit Instagram 2FA code after `login` returned pending_2fa. Prefer passing the login_id from that pending_2fa result, but if it is unavailable, pass the code alone; the tool will resume the only active pending login. For pending_device_approval, pass login_id or session_id with code: null so the tool polls for the user approving on their other device. Returns success, failure, or still-pending.',
         parameters: {
             type: 'object',
             properties: {
                 login_id: {
                     type: 'string',
-                    description: 'The login_id returned by the pending login tool call.',
+                    description: 'The login_id returned by the pending login tool call. Optional when exactly one pending login is active.',
+                },
+                session_id: {
+                    type: 'string',
+                    description: 'Optional session_id returned by start_session/login. Used to find the pending login if login_id was lost.',
                 },
                 code: {
                     type: ['string', 'null'],
                     description: 'The 2FA code for pending_2fa. Null or omitted for pending_device_approval.',
                 },
             },
-            required: ['login_id'],
+            required: [],
             additionalProperties: false,
         },
         execute: async (_callId, params) => {
             await gcPendingLogins();
 
-            const loginId = params.login_id;
-            if (typeof loginId !== 'string' || !loginId) {
-                return textResult('submit_verification_code: login_id is required.', true);
-            }
-            const entry = pendingLogins.get(loginId);
-            if (!entry) {
-                return textResult(
-                    `submit_verification_code: login_id ${loginId} not found (expired or already resolved).`,
-                    true
-                );
-            }
+            const rawLoginId = params.login_id;
+            const requestedLoginId =
+                typeof rawLoginId === 'string' && rawLoginId.trim()
+                    ? rawLoginId.trim()
+                    : null;
+            const rawSessionId = params.session_id;
+            const requestedSessionId =
+                typeof rawSessionId === 'string' && rawSessionId.trim()
+                    ? rawSessionId.trim()
+                    : null;
+            const resolvedPending = resolvePendingLogin(requestedLoginId, requestedSessionId);
+            if ('error' in resolvedPending) return resolvedPending.error;
+            const { loginId, entry } = resolvedPending;
 
             const rawCode = params.code;
             const code = typeof rawCode === 'string' && rawCode.trim() ? rawCode.trim() : null;

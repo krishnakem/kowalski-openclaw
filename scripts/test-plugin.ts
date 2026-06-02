@@ -49,8 +49,12 @@ function main(): void {
     // auto-enters login and would launch Chromium if IG creds were set.
     const oldIgUsername = process.env.IG_USERNAME;
     const oldIgPassword = process.env.IG_PASSWORD;
+    const oldIgSessionId = process.env.IG_SESSIONID;
+    const oldInstagramSessionId = process.env.INSTAGRAM_SESSIONID;
     delete process.env.IG_USERNAME;
     delete process.env.IG_PASSWORD;
+    delete process.env.IG_SESSIONID;
+    delete process.env.INSTAGRAM_SESSIONID;
 
     // Sandbox paths under tmpdir so the test never touches ~/.kowalski.
     const tmpRoot = path.join(os.tmpdir(), `kowalski-plugin-smoke-${uuidv4()}`);
@@ -157,6 +161,16 @@ function main(): void {
             `tool ${tool.name} parameters.properties must be an object`
         );
     }
+    const login = registered.find((r) => r.tool.name === 'login');
+    assert(login, 'login not registered');
+    assert(
+        !('username' in login.tool.parameters.properties),
+        'login schema must not expose a username parameter'
+    );
+    assert(
+        !('password' in login.tool.parameters.properties),
+        'login schema must not expose a password parameter'
+    );
     console.log('✅ every tool has description + execute + JSON-Schema-ish parameters');
 
     // (5) Invoke stop_run without a session id and check the global marker path.
@@ -241,6 +255,8 @@ function main(): void {
             teardown?.();
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;
             if (oldIgPassword !== undefined) process.env.IG_PASSWORD = oldIgPassword;
+            if (oldIgSessionId !== undefined) process.env.IG_SESSIONID = oldIgSessionId;
+            if (oldInstagramSessionId !== undefined) process.env.INSTAGRAM_SESSIONID = oldInstagramSessionId;
             try {
                 fs.rmSync(tmpRoot, { recursive: true, force: true });
             } catch {
@@ -253,6 +269,8 @@ function main(): void {
         .catch((err) => {
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;
             if (oldIgPassword !== undefined) process.env.IG_PASSWORD = oldIgPassword;
+            if (oldIgSessionId !== undefined) process.env.IG_SESSIONID = oldIgSessionId;
+            if (oldInstagramSessionId !== undefined) process.env.INSTAGRAM_SESSIONID = oldInstagramSessionId;
             fail(`plugin smoke execute threw: ${err instanceof Error ? err.message : String(err)}`);
         });
 }
