@@ -1891,7 +1891,7 @@ export function register(api: PluginApi): () => void {
                         ? ' No session_id was provided, so I used the global stop marker.'
                         : '';
             return textResult(
-                `Stop requested.${fallbackLine} The run will finalize within ~30 seconds and produce a partial digest/PDF if captures exist. Do not cancel any queued print_digest watcher; stopping only stops further collection, not delivery. Keep polling print_digest/get_session_status until the stopped or completed digest is ready, then print the returned markdown in the TUI.`
+                `Stop requested.${fallbackLine} The run will finalize within ~30 seconds and produce a partial digest/PDF if captures exist. Do not cancel any queued print_digest watcher; stopping only stops further collection, not delivery. If a print watcher was removed, re-add a one-shot print_digest check for 30 seconds from now. Keep polling print_digest/get_session_status until the stopped or completed digest is ready, then print the returned markdown in the TUI without requiring the user to ask again.`
             );
         },
     };

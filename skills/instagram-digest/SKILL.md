@@ -319,6 +319,13 @@ print watcher is queued, schedule one for 30 seconds from now. The TUI and
 PDF should still receive the partial digest from whatever has already been
 captured.
 
+Never say "I removed the queued print watcher", "I won't auto-post it unless
+you ask", or anything equivalent after a stop request. That is wrong for this
+workflow. If you already removed or canceled the queued print watcher, add a
+new one immediately for 30 seconds from now. "Auto-post" means the watcher
+will call `print_digest` and show the partial digest in the TUI without the
+user asking again.
+
 ```json
 { "name": "stop_run", "arguments": { "session_id": "…" } }
 ```
