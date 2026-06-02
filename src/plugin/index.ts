@@ -454,16 +454,137 @@ export function register(api: PluginApi): () => void {
         return payload;
     }
 
+    async function readSavedDigest(recordId: string): Promise<string | { error: AgentToolResult }> {
+        const recordPath = path.join(outputDir, 'analysis_records', `${recordId}.json`);
+        try {
+            const raw = await fs.promises.readFile(recordPath, 'utf-8');
+            const parsed = JSON.parse(raw) as {
+                id?: unknown;
+                data?: unknown;
+                leadStoryPreview?: unknown;
+            };
+            if (typeof parsed.id !== 'string') {
+                return {
+                    error: textResult(`print_digest: record ${recordId} is missing a string id.`, true),
+                };
+            }
+            return buildPrintableDigest({
+                record: {
+                    id: parsed.id,
+                    data: parsed.data,
+                    leadStoryPreview:
+                        typeof parsed.leadStoryPreview === 'string'
+                            ? parsed.leadStoryPreview
+                            : undefined,
+                },
+                recordPath,
+            });
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return {
+                error: textResult(`print_digest: failed to read record ${recordId}: ${msg}`, true),
+            };
+        }
+    }
+
+    async function findLatestSavedRecordId(): Promise<string | null> {
+        const recordDir = path.join(outputDir, 'analysis_records');
+        try {
+            const entries = await fs.promises.readdir(recordDir, { withFileTypes: true });
+            const files = await Promise.all(entries
+                .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+                .map(async (entry) => {
+                    const fullPath = path.join(recordDir, entry.name);
+                    const stat = await fs.promises.stat(fullPath);
+                    return {
+                        recordId: entry.name.slice(0, -'.json'.length),
+                        mtimeMs: stat.mtimeMs,
+                    };
+                }));
+            files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+            return files[0]?.recordId ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    async function returnCompletedDigest(
+        sessionId: string,
+        entry: SessionEntry
+    ): Promise<AgentToolResult> {
+        const ad = entry.activeDigest;
+        if (!ad) {
+            return jsonTextResult({
+                status: 'pending',
+                digest_status: 'idle',
+                session_id: sessionId,
+                silent: true,
+                recommended_next_poll_ms: 30_000,
+                message: 'No digest has started on this session yet.',
+            });
+        }
+
+        if (ad.status === 'running' && ad.completionPromise) {
+            await ad.completionPromise;
+        }
+
+        if (ad.status === 'failed') {
+            return jsonTextResult({
+                status: 'failed',
+                digest_status: 'failed',
+                session_id: sessionId,
+                silent: false,
+                digest_error: ad.errorMessage ?? 'Digest failed.',
+                message: 'Digest failed. Tell the user this error.',
+            }, true);
+        }
+
+        if (ad.status !== 'completed' && ad.status !== 'stopped') {
+            return jsonTextResult({
+                status: 'pending',
+                digest_status: ad.status,
+                session_id: sessionId,
+                digest_started_at: new Date(ad.startedAt).toISOString(),
+                digest_elapsed_ms: Date.now() - ad.startedAt,
+                silent: true,
+                recommended_next_poll_ms: 30_000,
+                message: 'Digest is still running.',
+            });
+        }
+
+        if (!ad.resultText) {
+            return textResult(
+                `run_digest: digest ${sessionId} completed but no printable result was stored.`,
+                true
+            );
+        }
+
+        ad.resultDelivered = true;
+        try { entry.controller.abort(); } catch { /* ignore */ }
+        try {
+            const ctx = entry.session.browser?.context;
+            if (ctx) await ctx.close();
+        } catch (err) {
+            log.warn('run_digest: auto-end browser close failed', err);
+        }
+        sessions.delete(entry.sessionId);
+        return textResult(ad.resultText);
+    }
+
     async function startDigestForEntry(
         sessionId: string,
         entry: SessionEntry,
         triggeredBy: string,
-        extraPayload: Record<string, unknown> = {}
+        extraPayload: Record<string, unknown> = {},
+        options: { waitForCompletion?: boolean } = {}
     ): Promise<AgentToolResult> {
         // Guard against concurrent runs. If there's already an active
         // digest that isn't finished, reject — the user should either
         // wait, poll get_session_status, or call stop_run first.
         if (entry.activeDigest && entry.activeDigest.status === 'running') {
+            if (options.waitForCompletion) {
+                return returnCompletedDigest(sessionId, entry);
+            }
             return jsonTextResult({
                 status: 'already_running',
                 session_id: sessionId,
@@ -495,8 +616,9 @@ export function register(api: PluginApi): () => void {
             return `${m}m${secs.toString().padStart(2, '0')}s`;
         };
 
+        const mode = options.waitForCompletion ? 'blocking' : 'non-blocking';
         log.info(
-            `run_digest started by ${triggeredBy} (non-blocking) — phases=${JSON.stringify(entry.session.runConfig.phases)} storiesCap=${fmt(STORIES_CAP_MS)} feedCap=${fmt(FEED_CAP_MS)} · ticks every 5 min + on phase transitions. Say "stop" any time to abort.`
+            `run_digest started by ${triggeredBy} (${mode}) — phases=${JSON.stringify(entry.session.runConfig.phases)} storiesCap=${fmt(STORIES_CAP_MS)} feedCap=${fmt(FEED_CAP_MS)} · ticks every 5 min + on phase transitions. Say "stop" any time to abort.`
         );
 
         const onPhase = (payload: { phase?: 'stories' | 'feed' }): void => {
@@ -548,7 +670,7 @@ export function register(api: PluginApi): () => void {
         // Fire-and-forget: run the pipeline in the background. The
         // promise writes its outcome back into entry.activeDigest and
         // tears down the ticker/listeners when done.
-        (async () => {
+        const completionPromise = (async () => {
             try {
                 const result = await RunManager.getInstance().startRun({
                     phases: entry.session.runConfig.phases,
@@ -647,6 +769,11 @@ export function register(api: PluginApi): () => void {
                 }
             }
         })();
+        entry.activeDigest.completionPromise = completionPromise;
+
+        if (options.waitForCompletion) {
+            return returnCompletedDigest(sessionId, entry);
+        }
 
         return jsonTextResult({
             status: 'started',
@@ -1208,25 +1335,21 @@ export function register(api: PluginApi): () => void {
     // -----------------------------------------------------------------------
     // Tool: run_digest
     //
-    // Kicks off the Kowalski pipeline in the background and returns
-    // IMMEDIATELY with `{status: "started"}`. The actual digest is
-    // fetched later via `get_session_status` (which returns the full
-    // result once `digest_status === "completed"`).
+    // Kicks off the Kowalski pipeline and waits for the completed/stopped
+    // digest markdown before returning, so manual run_digest calls print to
+    // the TUI without requiring a separate print_digest call.
     //
-    // Why non-blocking? OpenClaw serializes tool dispatch per plugin.
-    // A blocking run_digest means no other tool (including `stop_run`)
-    // can fire until the run ends on its own — turning "stop" in the
-    // TUI into a no-op until the 30-45 minute run is done. Returning
-    // immediately frees the dispatcher so `stop_run` takes effect
-    // within ~30s whenever the user wants to abort.
+    // Auto-start paths (start_session/login/submit_verification_code) still
+    // call startDigestForEntry without waitForCompletion so stop/status tools
+    // remain usable while those background runs are active.
     //
     // Input:  { session_id: string }
-    // Output: text block { status: "started" | "already_running", … }
+    // Output: display-ready markdown, or a failed/pending JSON payload.
     // -----------------------------------------------------------------------
     const runDigest: PluginTool = {
         name: 'run_digest',
         description:
-            'Manually kick off the Kowalski pipeline (stories + feed capture, extraction, digest generation) in the background. Normally start_session/login/submit_verification_code starts this automatically once Instagram auth is verified. Returns IMMEDIATELY with `{status: "started"}` — does NOT block. The actual run takes 10–30 min (worst case ~45 min); cost depends on the configured OpenClaw provider. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`. After a started response, tell the user the run is in flight and schedule the first silent print_digest check for 30 seconds from now; if pending, recheck every 30 seconds.',
+            'Manually run the Kowalski pipeline (stories + feed capture, extraction, digest generation), write the PDF/JSON artifacts, and return the display-ready markdown digest in this tool result. This call blocks until the run finishes (10–30 min typical, ~45 min worst case), so no separate print_digest call is needed for manual run_digest. Normally start_session/login/submit_verification_code starts the digest automatically in the background once Instagram auth is verified. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`.',
         parameters: {
             type: 'object',
             properties: {
@@ -1250,7 +1373,9 @@ export function register(api: PluginApi): () => void {
                     true
                 );
             }
-            return startDigestForEntry(sessionId, entry, 'run_digest');
+            return startDigestForEntry(sessionId, entry, 'run_digest', {}, {
+                waitForCompletion: true,
+            });
         },
     };
 
@@ -1315,7 +1440,7 @@ export function register(api: PluginApi): () => void {
     const printDigest: PluginTool = {
         name: 'print_digest',
         description:
-            'Poll for and print a Kowalski digest. Safe to call repeatedly: while the digest is still running/idle, this returns a small `{ status: "pending", silent: true }` JSON payload that should not be shown to the user. Once the digest is completed or stopped, this returns display-ready markdown with emoji and artifact paths; return that markdown to the user verbatim. This call auto-ends the session after a successful print.',
+            'Poll for and print a Kowalski digest. Safe to call repeatedly: while the digest is still running/idle, this returns a small `{ status: "pending", silent: true }` JSON payload that should not be shown to the user. Once the digest is completed or stopped, this returns display-ready markdown with emoji and artifact paths; return that markdown to the user verbatim. If no session_id or record_id is provided, prints the newest ready in-memory digest, or the newest saved analysis record. This call auto-ends the session after a successful print.',
         parameters: {
             type: 'object',
             properties: {
@@ -1342,6 +1467,44 @@ export function register(api: PluginApi): () => void {
 
             let text: string | undefined;
             let entryToEnd: SessionEntry | undefined;
+            if (!sessionId && !recordId) {
+                const latest = findLatestDigestSession();
+                if (latest?.activeDigest) {
+                    const ad = latest.activeDigest;
+                    if (ad.status === 'failed') {
+                        return jsonTextResult({
+                            status: 'failed',
+                            digest_status: 'failed',
+                            session_id: latest.sessionId,
+                            silent: false,
+                            digest_error: ad.errorMessage ?? 'Digest failed.',
+                            message: 'Digest failed. Tell the user this error instead of scheduling another print_digest poll.',
+                        }, true);
+                    }
+                    if (ad.status !== 'completed' && ad.status !== 'stopped') {
+                        return jsonTextResult({
+                            status: 'pending',
+                            digest_status: ad.status,
+                            session_id: latest.sessionId,
+                            digest_started_at: new Date(ad.startedAt).toISOString(),
+                            digest_elapsed_ms: Date.now() - ad.startedAt,
+                            silent: true,
+                            recommended_next_poll_ms: 30_000,
+                            message: 'Digest is still running. Stay silent and schedule another print_digest poll in 30 seconds.',
+                        });
+                    }
+                    text = ad.resultText;
+                    entryToEnd = latest;
+                }
+                if (!text) {
+                    const latestRecordId = await findLatestSavedRecordId();
+                    if (latestRecordId) {
+                        const saved = await readSavedDigest(latestRecordId);
+                        if (typeof saved === 'string') text = saved;
+                        else return saved.error;
+                    }
+                }
+            }
             if (sessionId) {
                 const entry = sessions.get(sessionId);
                 if (!entry) {
@@ -1461,42 +1624,19 @@ export function register(api: PluginApi): () => void {
             }
 
             if (!text && recordId) {
-                const recordPath = path.join(outputDir, 'analysis_records', `${recordId}.json`);
-                try {
-                    const raw = await fs.promises.readFile(recordPath, 'utf-8');
-                    const parsed = JSON.parse(raw) as {
-                        id?: unknown;
-                        data?: unknown;
-                        leadStoryPreview?: unknown;
-                    };
-                    if (typeof parsed.id !== 'string') {
-                        return textResult(`print_digest: record ${recordId} is missing a string id.`, true);
-                    }
-                    text = buildPrintableDigest({
-                        record: {
-                            id: parsed.id,
-                            data: parsed.data,
-                            leadStoryPreview:
-                                typeof parsed.leadStoryPreview === 'string'
-                                    ? parsed.leadStoryPreview
-                                    : undefined,
-                        },
-                        recordPath,
-                    });
-                } catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    return textResult(`print_digest: failed to read record ${recordId}: ${msg}`, true);
-                }
+                const saved = await readSavedDigest(recordId);
+                if (typeof saved === 'string') text = saved;
+                else return saved.error;
             }
 
             if (!text) {
                 return textResult(
-                    'print_digest: provide session_id for the active completed digest, or record_id for a saved analysis record.',
+                    'print_digest: no active completed digest or saved analysis record was found. Provide session_id for an active completed digest, or record_id for a saved analysis record.',
                     true
                 );
             }
 
-            if (entryToEnd && sessionId) {
+            if (entryToEnd) {
                 if (entryToEnd.activeDigest) entryToEnd.activeDigest.resultDelivered = true;
                 try { entryToEnd.controller.abort(); } catch { /* ignore */ }
                 try {
@@ -1505,7 +1645,7 @@ export function register(api: PluginApi): () => void {
                 } catch (err) {
                     log.warn('print_digest: auto-end browser close failed', err);
                 }
-                sessions.delete(sessionId);
+                sessions.delete(entryToEnd.sessionId);
             }
 
             return textResult(text);

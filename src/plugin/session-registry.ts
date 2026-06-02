@@ -45,6 +45,8 @@ export interface ActiveDigest {
     errorMessage?: string;
     /** True once the digest result has been delivered to the agent at least once. */
     resultDelivered?: boolean;
+    /** Background pipeline promise. Awaited by blocking run_digest calls. */
+    completionPromise?: Promise<void>;
     /** Teardown handle for the status ticker. Set/cleared by run_digest. */
     tickerHandle?: NodeJS.Timeout | null;
     /** Teardown for the 'run-phase' listener. */

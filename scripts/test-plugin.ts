@@ -251,6 +251,15 @@ function main(): void {
             assert(!printText.trim().startsWith('{'), 'print_digest should return plain text, not JSON');
             console.log('✅ print_digest returns display-ready markdown with emoji preserved');
 
+            const latestPrintResult = await printDigest.tool.execute('smoke-call-print-latest', {});
+            const latestPrintText = latestPrintResult.content[0]?.text;
+            assert(typeof latestPrintText === 'string', 'latest print_digest result missing text');
+            assert(latestPrintText.includes('## 🏀 Top Story'),
+                'print_digest without arguments should return the latest saved digest');
+            assert(!latestPrintText.trim().startsWith('{'),
+                'latest print_digest should return plain text, not JSON');
+            console.log('✅ print_digest without args returns latest saved digest');
+
             // Teardown — and also clean up the tmp dirs so repeat runs stay clean.
             teardown?.();
             if (oldIgUsername !== undefined) process.env.IG_USERNAME = oldIgUsername;

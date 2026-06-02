@@ -31,7 +31,7 @@ The plugin registers **ten tools** on the OpenClaw agent surface. A [SKILL.md](s
 | `start_session` | Create a Kowalski session and automatically continue: valid cookie starts `run_digest`; missing/unknown cookie starts the headless login flow and returns the relevant pending state if user input is needed. |
 | `login` | Continue the automatic headless login flow. If credentials are missing, returns `pending_credentials`; if Instagram asks for 2FA/device approval, returns `pending_2fa` / `pending_device_approval`; when login is verified, starts `run_digest` automatically. |
 | `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts `run_digest` automatically. |
-| `run_digest` | Manually start the non-blocking stories + feed capture, extraction, and digest generation run. Normally `start_session` or successful login starts this for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
+| `run_digest` | Manually run stories + feed capture, extraction, digest generation, PDF export, and return the display-ready markdown in the tool result. Normally `start_session` or successful login starts the digest in the background for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
 | `get_session_status` | Latest run phase + the last ~20 pipeline events. When the digest is ready, tells the agent to call `print_digest`. |
 | `print_digest` | Polls for the completed/stopped digest. While still running, returns a silent pending payload; once ready, returns display-ready markdown, preserving emoji, and auto-ends the session after printing. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
@@ -39,7 +39,7 @@ The plugin registers **ten tools** on the OpenClaw agent surface. A [SKILL.md](s
 | `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
-The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-second silent print_digest check → print_digest every 30 seconds until ready`. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
+The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-second silent print_digest check → print_digest every 30 seconds until ready`. Manual `run_digest` calls instead block until completion and return the display-ready digest directly. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
 
 ---
 
