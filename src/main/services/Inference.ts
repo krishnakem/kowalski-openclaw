@@ -153,6 +153,7 @@ export class OpenClawInferenceClient implements InferenceClient {
 
         const result = await complete({
             messages: textMessagesFromRequest(request, prompt),
+            model: request.model,
             maxTokens: request.maxTokens,
             signal: request.signal,
             purpose: request.purpose,
