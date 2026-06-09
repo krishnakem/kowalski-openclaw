@@ -56,6 +56,7 @@ export class DigestGeneration {
 
         const maxRetries = 4;
         let markdown = '';
+        let lastError: unknown;
 
         for (let attempt = 0; attempt < maxRetries; attempt++) {
             // Bound each request at 60s — the digest can be large, but undici's
@@ -82,6 +83,7 @@ export class DigestGeneration {
                 markdown = result.text.trim();
                 break;
             } catch (err) {
+                lastError = err;
                 const status = (err as { status?: number }).status;
                 if ((status === 529 || status === 429) && attempt < maxRetries - 1) {
                     const baseDelay = status === 429 ? 10000 : 5000;
@@ -94,13 +96,14 @@ export class DigestGeneration {
                 }
 
                 console.error('❌ Digest generation API error:', err);
-                throw new Error('DIGEST_GENERATION_FAILED');
+                break;
             }
         }
 
         if (!markdown) {
-            console.error('❌ Digest generation: all retries exhausted');
-            throw new Error('DIGEST_GENERATION_FAILED');
+            const reason = lastError instanceof Error ? lastError.message : String(lastError ?? 'unknown error');
+            console.warn(`⚠️ Digest generation LLM unavailable; using extractive fallback (${reason})`);
+            markdown = this.buildFallbackMarkdown(usable, captures.length - usable.length);
         }
 
         if (!markdown) {
@@ -333,9 +336,144 @@ Now write the editorial column. Begin immediately with "# " followed by your gen
         const fenceMatch = text.match(/^```(?:markdown|md)?\s*\n([\s\S]*?)\n```\s*$/);
         return fenceMatch ? fenceMatch[1] : text;
     }
+
+    private buildFallbackMarkdown(captures: CapturedPost[], skippedCount: number): string {
+        const storyCount = captures.filter(c => c.source === 'story').length;
+        const feedCount = captures.filter(c => c.source === 'feed').length;
+        const byHandle = new Map<string, CapturedPost[]>();
+
+        for (const capture of captures) {
+            const handle = normalizeHandle(capture.extraction?.handle);
+            const key = handle || '@unknown';
+            if (!byHandle.has(key)) byHandle.set(key, []);
+            byHandle.get(key)!.push(capture);
+        }
+
+        const ranked = [...byHandle.entries()]
+            .sort((a, b) => b[1].length - a[1].length)
+            .slice(0, 8);
+        const topCapture = captures.find(c => c.extraction?.usefulness === 'high') ?? captures[0];
+        const topHeadline = headlineFromCapture(topCapture) || 'Captured Highlights';
+        const lines = [
+            '# Today',
+            '',
+            `## 📰 Top Story: ${topHeadline}`,
+            fallbackParagraph(topCapture),
+        ];
+
+        for (const [handle, items] of ranked) {
+            if (handle === '@unknown') continue;
+            const summary = summarizeHandle(items);
+            if (!summary) continue;
+            lines.push('', `## 📌 ${handle}`, summary);
+        }
+
+        lines.push(
+            '',
+            '---',
+            `*${storyCount} story frames and ${feedCount} posts reviewed across ${byHandle.size} accounts.${skippedCount > 0 ? ` ${skippedCount} captures were skipped.` : ''}*`,
+            '',
+            '_Note: The editorial model call failed, so this digest was assembled directly from extractor summaries._'
+        );
+        return lines.join('\n');
+    }
 }
 
 function truncate(s: string, max: number): string {
     if (s.length <= max) return s;
     return s.slice(0, max - 1) + '…';
+}
+
+function normalizeHandle(handle?: string | null): string | null {
+    if (!handle) return null;
+    const trimmed = handle.trim();
+    if (!trimmed || trimmed === '?' || trimmed === '@unknown') return null;
+    return trimmed.startsWith('@') ? trimmed.toLowerCase() : `@${trimmed.toLowerCase()}`;
+}
+
+function headlineFromCapture(capture?: CapturedPost): string | null {
+    const extraction = capture?.extraction;
+    if (!extraction) return null;
+    const candidates = [
+        extraction.overlayText.find(Boolean),
+        extraction.narrative,
+        extraction.caption,
+    ].filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
+    const candidate = candidates[0]?.replace(/\s+/g, ' ').trim();
+    if (!candidate) return null;
+    return titleCase(truncate(candidate, 80).replace(/[.!?]+$/, ''));
+}
+
+function fallbackParagraph(capture?: CapturedPost): string {
+    const extraction = capture?.extraction;
+    if (!extraction) return 'The run captured usable Instagram content, but no single extraction was available for the lead item.';
+    const facts = collectFacts(extraction);
+    const handle = normalizeHandle(extraction.handle);
+    const prefix = handle ? `${handle} led the captured run` : 'The captured run opened';
+    return `${prefix} with ${sentenceFromExtraction(extraction)}${facts ? ` Key details: **${facts}**.` : ''}`;
+}
+
+function summarizeHandle(items: CapturedPost[]): string {
+    const extractions = items
+        .map(item => item.extraction)
+        .filter((e): e is ExtractionBlock => Boolean(e));
+    if (!extractions.length) return '';
+
+    const narratives = uniqueStrings(extractions.map(sentenceFromExtraction)).slice(0, 3);
+    const facts = uniqueStrings(extractions.flatMap(collectFactParts)).slice(0, 5);
+    const body = narratives.join(' ');
+    return facts.length ? `${body} Notable details: **${facts.join(' | ')}**.` : body;
+}
+
+function sentenceFromExtraction(extraction: ExtractionBlock): string {
+    const narrative = extraction.narrative?.replace(/\s+/g, ' ').trim();
+    if (narrative && narrative !== '(no narrative produced)') {
+        return ensureSentence(truncate(narrative, 220));
+    }
+    const overlay = extraction.overlayText.find(Boolean);
+    if (overlay) return ensureSentence(truncate(overlay, 180));
+    if (extraction.caption) return ensureSentence(truncate(extraction.caption, 180));
+    return 'a captured item that the extractor marked usable.';
+}
+
+function collectFacts(extraction: ExtractionBlock): string {
+    return collectFactParts(extraction).slice(0, 4).join(' | ');
+}
+
+function collectFactParts(extraction: ExtractionBlock): string[] {
+    return uniqueStrings([
+        ...extraction.entities.people,
+        ...extraction.entities.teams,
+        ...extraction.numbers,
+        ...extraction.dates,
+    ]);
+}
+
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const value of values) {
+        const cleaned = value?.replace(/\s+/g, ' ').trim();
+        if (!cleaned) continue;
+        const key = cleaned.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(cleaned);
+    }
+    return out;
+}
+
+function ensureSentence(text: string): string {
+    const trimmed = text.trim();
+    if (!trimmed) return '';
+    return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function titleCase(text: string): string {
+    return text
+        .split(/\s+/)
+        .map(word => word.length <= 3 && word === word.toUpperCase()
+            ? word
+            : `${word.charAt(0).toUpperCase()}${word.slice(1)}`)
+        .join(' ');
 }

@@ -40,7 +40,7 @@ await openClawNoKey.complete({
     maxTokens: 123,
     purpose: 'unit test',
 });
-assert(forwardedModel === 'provider/test-digest-model', 'text completions should forward request.model');
+assert(forwardedModel === undefined, 'text completions should not forward request.model; OpenClaw owns plugin LLM model selection');
 assert(forwardedMaxTokens === 123, 'text completions should forward maxTokens');
 assert(forwardedPurpose === 'unit test', 'text completions should forward purpose');
 

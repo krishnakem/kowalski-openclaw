@@ -1,11 +1,94 @@
-/**
- * Digest prompt harness.
- *
- * Direct provider fallback has been removed. Real digest generation now
- * requires the OpenClaw plugin runtime because text completion is provided by
- * api.runtime.llm.complete.
- */
+import { DigestGeneration } from '../src/main/services/DigestGeneration.js';
+import type { CapturedPost, ExtractionBlock } from '../src/types/instagram.js';
+import type { InferenceClient } from '../src/main/services/Inference.js';
 
-console.log(
-    'Skipped: standalone digest testing requires direct provider access, which has been removed. Run digest generation through the OpenClaw plugin runtime instead.'
-);
+function assert(cond: unknown, message: string): asserts cond {
+    if (!cond) throw new Error(message);
+}
+
+const failingInference: InferenceClient = {
+    backend: 'openclaw',
+    complete: async () => {
+        throw new Error('simulated OpenClaw text transport failure');
+    },
+};
+
+function extraction(overrides: Partial<ExtractionBlock>): ExtractionBlock {
+    return {
+        handle: '@nba',
+        contentType: 'story',
+        caption: null,
+        overlayText: [],
+        entities: {
+            people: [],
+            teams: ['Knicks', 'Spurs'],
+            products: [],
+            places: ['Madison Square Garden'],
+        },
+        numbers: ['Spurs 116', 'Knicks 111'],
+        dates: ['Game 3'],
+        narrative: 'Victor Wembanyama scored 32 points as the Spurs beat the Knicks in Game 3.',
+        usefulness: 'high',
+        skipReason: null,
+        ...overrides,
+    };
+}
+
+const captures: CapturedPost[] = [
+    {
+        id: 1,
+        screenshot: Buffer.from('fake'),
+        source: 'story',
+        timestamp: Date.now(),
+        scrollPosition: 0,
+        extraction: extraction({}),
+    },
+    {
+        id: 2,
+        screenshot: Buffer.from('fake'),
+        source: 'feed',
+        timestamp: Date.now(),
+        scrollPosition: 10,
+        extraction: extraction({
+            handle: '@uofmichigan',
+            contentType: 'feed_post',
+            entities: {
+                people: [],
+                teams: [],
+                products: [],
+                places: ['Ann Arbor'],
+            },
+            numbers: [],
+            dates: [],
+            narrative: 'Michigan welcomed campers to campus under cloudy skies.',
+        }),
+    },
+    {
+        id: 3,
+        screenshot: Buffer.from('fake'),
+        source: 'story',
+        timestamp: Date.now(),
+        scrollPosition: 20,
+        extraction: extraction({
+            usefulness: 'skip',
+            skipReason: 'ad',
+            narrative: 'Advertisement.',
+        }),
+    },
+];
+
+const generator = new DigestGeneration(failingInference);
+const result = await generator.generateDigest(captures, {
+    userName: 'Smoke Tester',
+    location: 'Localhost',
+    scheduledTime: 'now',
+});
+
+assert(result.markdown.startsWith('# '), 'fallback digest should be markdown with a title');
+assert(result.markdown.includes('Top Story'), 'fallback digest should include a top story');
+assert(result.markdown.includes('@nba'), 'fallback digest should include grouped handles');
+assert(result.markdown.includes('Spurs 116'), 'fallback digest should preserve extracted facts');
+assert(result.markdown.includes('editorial model call failed'), 'fallback digest should disclose fallback mode');
+assert(result.subtitle.includes('1 skipped'), 'analysis subtitle should count skipped captures');
+
+console.log('✅ digest fallback test passed');
