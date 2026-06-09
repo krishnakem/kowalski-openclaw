@@ -89,6 +89,12 @@ export interface PluginConfig {
      * expanded here — set an absolute path if you want anything else.
      */
     downloadsDir?: string;
+    /**
+     * Deprecated compatibility escape hatch. Scheduled follow-up turns require
+     * a configured OpenClaw delivery channel in newer gateway versions, so the
+     * default workflow avoids asking the host agent to create cron jobs.
+     */
+    enableScheduledPolling?: boolean;
 }
 
 interface PendingLogin {
@@ -223,6 +229,7 @@ function buildPrintableDigest(args: {
             `- captures: extracted=${args.counts.extracted}, skipped=${args.counts.skipped}, failed=${args.counts.failed}`
         );
     }
+
     if (args.timeoutSummary) artifactLines.push(args.timeoutSummary.trim());
 
     return `${markdown.trim()}\n${artifactLines.join('\n')}\n`;
@@ -266,6 +273,17 @@ export function register(api: PluginApi): () => void {
         warn: (...a: unknown[]) => console.warn('[kowalski]', ...a),
         error: (...a: unknown[]) => console.error('[kowalski]', ...a),
     };
+
+    function shouldEnableScheduledPolling(): boolean {
+        return config.enableScheduledPolling === true;
+    }
+
+    function pendingDigestMessage(prefix = 'Digest is still running.'): string {
+        if (shouldEnableScheduledPolling()) {
+            return `${prefix} Stay silent and schedule another print_digest check in 30 seconds.`;
+        }
+        return `${prefix} Do not create a scheduled/cron follow-up unless the user has configured an OpenClaw delivery channel; wait for an explicit status/print request instead.`;
+    }
 
     // -----------------------------------------------------------------------
     // Stage 6 — agentic login wiring.
@@ -783,13 +801,15 @@ export function register(api: PluginApi): () => void {
             started_at: new Date(runStartedAt).toISOString(),
             stories_cap_ms: STORIES_CAP_MS,
             feed_cap_ms: FEED_CAP_MS,
+            automatic_scheduled_polling: shouldEnableScheduledPolling(),
             recommended_initial_print_poll_ms: 30_000,
             recommended_repeat_print_poll_ms: 30_000,
             vision_model_warning: entry.session.inferenceClient.backend === 'openclaw'
                 ? 'Kowalski requires a vision-capable OpenClaw image model. If screenshots cannot be understood, configure agents.defaults.imageModel to a vision-capable model.'
                 : undefined,
-            message:
-                'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. Schedule the first silent print_digest check for 30 seconds from now; if it returns pending, schedule another silent print_digest check every 30 seconds until it returns the display-ready markdown.',
+            message: shouldEnableScheduledPolling()
+                ? 'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. A configured-channel client may schedule silent print_digest checks every 30 seconds until the display-ready markdown is returned.'
+                : 'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. Do not create OpenClaw cron/scheduled follow-up turns by default; when the user asks for status or results, call get_session_status or print_digest with this session_id.',
             ...extraPayload,
         });
     }
@@ -1490,7 +1510,7 @@ export function register(api: PluginApi): () => void {
                             digest_elapsed_ms: Date.now() - ad.startedAt,
                             silent: true,
                             recommended_next_poll_ms: 30_000,
-                            message: 'Digest is still running. Stay silent and schedule another print_digest poll in 30 seconds.',
+                            message: pendingDigestMessage(),
                         });
                     }
                     text = ad.resultText;
@@ -1535,7 +1555,7 @@ export function register(api: PluginApi): () => void {
                                 digest_elapsed_ms: Date.now() - ad.startedAt,
                                 silent: true,
                                 recommended_next_poll_ms: 30_000,
-                                message: 'The requested session has no active digest, but this session is still running. Use this session_id for the next silent print_digest poll in 30 seconds.',
+                                message: pendingDigestMessage('The requested session has no active digest, but this session is still running. Use this session_id for the next explicit print/status check.'),
                             });
                         }
                         text = ad.resultText;
@@ -1571,7 +1591,7 @@ export function register(api: PluginApi): () => void {
                                     digest_elapsed_ms: Date.now() - fallbackAd.startedAt,
                                     silent: true,
                                     recommended_next_poll_ms: 30_000,
-                                    message: 'The requested session has no active digest, but this session is still running. Use this session_id for the next silent print_digest poll in 30 seconds.',
+                                    message: pendingDigestMessage('The requested session has no active digest, but this session is still running. Use this session_id for the next explicit print/status check.'),
                                 });
                             }
                             text = fallbackAd.resultText;
@@ -1608,7 +1628,7 @@ export function register(api: PluginApi): () => void {
                                 digest_elapsed_ms: Date.now() - ad.startedAt,
                                 silent: true,
                                 recommended_next_poll_ms: 30_000,
-                                message: 'Digest is still running. Stay silent and schedule another print_digest poll in 30 seconds.',
+                                message: pendingDigestMessage(),
                             });
                         }
                         if (recordId && ad.recordId && recordId !== ad.recordId) {
@@ -1891,7 +1911,9 @@ export function register(api: PluginApi): () => void {
                         ? ' No session_id was provided, so I used the global stop marker.'
                         : '';
             return textResult(
-                `Stop requested.${fallbackLine} The run will finalize within ~30 seconds and produce a partial digest/PDF if captures exist. Do not cancel any queued print_digest watcher; stopping only stops further collection, not delivery. If a print watcher was removed, re-add a one-shot print_digest check for 30 seconds from now. Keep polling print_digest/get_session_status until the stopped or completed digest is ready, then print the returned markdown in the TUI without requiring the user to ask again.`
+                shouldEnableScheduledPolling()
+                    ? `Stop requested.${fallbackLine} The run will finalize within ~30 seconds and produce a partial digest/PDF if captures exist. Keep polling print_digest/get_session_status until the stopped or completed digest is ready, then print the returned markdown in the TUI.`
+                    : `Stop requested.${fallbackLine} The run will finalize within ~30 seconds and produce a partial digest/PDF if captures exist. Do not create OpenClaw cron/scheduled follow-up turns by default; call print_digest or get_session_status explicitly when the user asks for the stopped/partial digest.`
             );
         },
     };

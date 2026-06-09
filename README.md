@@ -11,6 +11,7 @@ The heavy lifting is all local — real Playwright-controlled Chromium against a
 ## Table of contents
 
 - [What the plugin exposes](#what-the-plugin-exposes)
+- [Artifacts and TUI output](#artifacts-and-tui-output)
 - [Architecture](#architecture)
 - [Agentic login (Stage 6)](#agentic-login-stage-6)
 - [Installation into OpenClaw](#installation-into-openclaw)
@@ -28,18 +29,43 @@ The plugin registers **ten tools** on the OpenClaw agent surface. A [SKILL.md](s
 
 | Tool | Purpose |
 | --- | --- |
-| `start_session` | Create a Kowalski session and automatically continue: valid cookie starts `run_digest`; missing/unknown cookie starts the headless login flow and returns the relevant pending state if user input is needed. |
-| `login` | Continue the automatic headless login flow. If credentials are missing, returns `pending_credentials`; if Instagram asks for 2FA/device approval, returns `pending_2fa` / `pending_device_approval`; when login is verified, starts `run_digest` automatically. |
-| `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts `run_digest` automatically. |
+| `start_session` | Create a Kowalski session and automatically continue: valid cookie starts the digest in the background; missing/unknown cookie starts the headless login flow and returns the relevant pending state if user input is needed. |
+| `login` | Continue the automatic headless login flow. If credentials are missing, returns `pending_credentials`; if Instagram asks for 2FA/device approval, returns `pending_2fa` / `pending_device_approval`; when login is verified, starts the digest in the background. |
+| `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts the digest in the background. |
 | `run_digest` | Manually run stories + feed capture, extraction, digest generation, PDF export, and return the display-ready markdown in the tool result. Normally `start_session` or successful login starts the digest in the background for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
 | `get_session_status` | Latest run phase + the last ~20 pipeline events. When the digest is ready, tells the agent to call `print_digest`. |
-| `print_digest` | Polls for the completed/stopped digest. While still running, returns a silent pending payload; once ready, returns display-ready markdown, preserving emoji, and auto-ends the session after printing. |
+| `print_digest` | Polls for the completed/stopped digest. While still running, returns a silent pending payload; once ready, returns display-ready markdown, preserving emoji, and auto-ends the session after printing. With no args, prints the newest ready in-memory digest or newest saved analysis record. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
 | `reset_all` | Dry-run-first factory reset for browser profile, scratch data, and output records. Requires `confirm: true` to actually wipe. |
-| `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes at the next phase checkpoint and produces a partial digest tagged `abortReason: user-stop`. |
+| `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes with a partial digest/PDF tagged `abortReason: user-stop` when captures exist; queued print watchers should stay active so the partial digest still appears in the TUI. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
-The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-second silent print_digest check → print_digest every 30 seconds until ready`. Manual `run_digest` calls instead block until completion and return the display-ready digest directly. If login needs credentials, 2FA, or device approval, the pending response tells the agent which one user input is needed before the workflow resumes.
+The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-second silent print_digest check → print_digest every 30 seconds until ready`. Manual `run_digest` calls instead block until completion and return the display-ready digest directly. If login needs credentials, 2FA, or device approval, the pending response tells the agent which user input is needed before the workflow resumes.
+
+---
+
+## Artifacts and TUI output
+
+Every completed, stopped, or best-effort partial run attempts to produce:
+
+- A JSON analysis record under `~/.kowalski/output/analysis_records/<id>.json`.
+- Per-record image artifacts under `~/.kowalski/output/analysis_records/<id>/images/`.
+- A text-only PDF in `downloadsDir`, defaulting to `~/Downloads/kowalski-digest-<timestamp>.pdf`.
+- Display-ready markdown for the TUI.
+
+Manual `run_digest` returns that markdown directly in the tool result after
+writing the JSON/PDF artifacts. The normal `start_session` and login/2FA flows
+start the digest in the background, so the agent uses a silent 30-second
+`print_digest` watcher to post the markdown when the analysis is ready.
+
+`stop_run` stops collecting more Instagram content but does not discard the
+run. If captures exist, Kowalski finalizes a partial digest/PDF tagged
+`abortReason: user-stop`; queued print watchers should stay active so the
+partial digest appears in the TUI without another user prompt.
+
+`print_digest` can be called with a `session_id`, with a `record_id`, or with no
+arguments. With no arguments, it prints the newest ready in-memory digest or the
+newest saved analysis record.
 
 ---
 
@@ -78,7 +104,7 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
         │  DigestGeneration (Phase 3 — OpenClaw text model)                │
         │      │                                                           │
         │      ▼                                                           │
-        │  AnalysisGenerator → analysis_records/<id>.json                  │
+        │  RunManager writes analysis_records/<id>.json + PDF artifact     │
         └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -88,7 +114,7 @@ Pieces worth calling out:
 - **[elementLabeler](src/utils/elementLabeler.ts)** — draws numbered badges over interactive elements on the screenshot server-side (Jimp). No DOM injection, so it doesn't trip Instagram's bot checks.
 - **[BrowserManager](src/main/services/BrowserManager.ts)** — singleton, always headless, launches the plugin-local Playwright Chromium with an explicit `executablePath`, and applies stealth init scripts on every context. It does not fall back to system Chrome or a user-level Playwright cache.
 - **[GhostMouse](src/main/services/GhostMouse.ts)** + **[HumanScroll](src/main/services/HumanScroll.ts)** — human-rhythm input. Direct `page.mouse` calls; CDP for scroll-position reads so state queries don't show up as `page.evaluate` injections.
-- **[RunManager](src/main/services/RunManager.ts)** — run lifecycle. Offline watchdog (3-strike), per-phase hard timeouts, cooperative stop via `STOP_REQUESTED` marker file, partial-record writes on abort.
+- **[RunManager](src/main/services/RunManager.ts)** — run lifecycle. Multi-probe offline watchdog, per-phase hard timeouts, cooperative stop via `STOP_REQUESTED` marker file, partial-record writes on abort, and digest record persistence.
 - **[SessionMemory](src/main/services/SessionMemory.ts)** — cross-session digest of which accounts / phases / recoveries worked. Read into the next run's navigator context.
 - **[cookie-probe](src/plugin/cookie-probe.ts)** — reads the Instagram `sessionid` cookie directly out of the Chromium profile's SQLite `Cookies` DB. No auth flow needed to check "am I logged in?".
 
@@ -168,6 +194,7 @@ The `--dangerously-force-unsafe-install` flag is required because OpenClaw's sta
 | `browserProfileDir` | no | `~/.kowalski/browser` |
 | `scratchDir` | no | `~/.kowalski/scratch` |
 | `outputDir` | no | `~/.kowalski/output` |
+| `downloadsDir` | no | `~/Downloads` |
 | `userName` | no | — |
 | `location` | no | — |
 
@@ -182,7 +209,10 @@ support.
 | --- | --- |
 | `IG_USERNAME`, `IG_PASSWORD` | Enable the headless agentic login path ([LoginAgent](src/main/services/LoginAgent.ts)). If either is unset, the `login` tool returns `pending_credentials`. Credentials are never logged, accepted as tool params, or passed through any LLM payload. |
 | `IG_SESSIONID`, `INSTAGRAM_SESSIONID` | Optional existing Instagram `sessionid` cookie. If present, Kowalski injects it into the Playwright browser context from env instead of reading plaintext cookie JSON from disk. |
-| `KOWALSKI_CONNECTIVITY_PROBE_URL` | Optional URL for the generic offline watchdog probe. Defaults to `https://www.gstatic.com/generate_204`. |
+| `KOWALSKI_CONNECTIVITY_PROBE_URLS` | Optional comma-separated connectivity probes for the offline watchdog. Defaults to `https://www.gstatic.com/generate_204`, `https://www.cloudflare.com/cdn-cgi/generate_204`, and `https://www.instagram.com/`. |
+| `KOWALSKI_CONNECTIVITY_PROBE_URL` | Back-compat single probe URL. Ignored when `KOWALSKI_CONNECTIVITY_PROBE_URLS` is set. |
+| `KOWALSKI_CONNECTIVITY_PROBE_TIMEOUT_MS` | Per-probe timeout. Defaults to `4000`. |
+| `KOWALSKI_OFFLINE_WATCHDOG_FAILURES` | Consecutive failed multi-probe rounds before a run is considered offline. Defaults to `6`. |
 
 Model selection is handled by OpenClaw. Configure the default text and image
 models in OpenClaw, including `agents.defaults.imageModel` for screenshots.
@@ -278,9 +308,9 @@ Costs depend on your provider, selected models, and how many screenshots/agent
 turns a run needs. The plugin records provider/model/usage when the runtime
 returns them.
 
-Duration is bounded by the pipeline timeouts: stories cap at 15 minutes, feed
-caps at 30 minutes, so a full run can take up to about 45 minutes before it
-finalizes with a partial digest.
+Duration is bounded by the pipeline timeouts: stories cap at 15 minutes and feed
+caps at 30 minutes. If a phase hits its cap, Kowalski finalizes with a partial
+digest tagged with the timeout reason.
 
 ## Bundled Browser
 

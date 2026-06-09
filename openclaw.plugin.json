@@ -45,6 +45,11 @@
             "location": {
                 "type": "string",
                 "description": "User's location (city / region) — surfaced to the agents as context."
+            },
+            "enableScheduledPolling": {
+                "type": "boolean",
+                "description": "Deprecated compatibility switch. Defaults to false so Kowalski does not ask OpenClaw to create cron/scheduled follow-up turns, which require a configured delivery channel in newer gateways.",
+                "default": false
             }
         },
         "additionalProperties": false
