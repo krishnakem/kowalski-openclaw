@@ -3,13 +3,12 @@
  *
  * Composes a single markdown editorial column from per-image extractions written by
  * the Extractor agent. Does NOT re-send screenshots to the vision API — every visual
- * fact has already been extracted upstream into the sidecar JSON. This is what makes
- * the Haiku-default model viable.
+ * fact has already been extracted upstream into the sidecar JSON. The OpenClaw
+ * gateway owns text model selection for this final synthesis call.
  */
 
 import { CapturedPost, DigestConfig, ExtractionBlock } from '../../types/instagram.js';
 import { AnalysisObject } from '../../types/analysis.js';
-import { ModelConfig } from '../../shared/modelConfig.js';
 import { UsageService } from './UsageService.js';
 import type { InferenceClient } from './Inference.js';
 import { inferenceUsageToTokenUsage } from './Inference.js';
@@ -63,7 +62,6 @@ export class DigestGeneration {
             // 5-minute default is far too long when connectivity drops.
             try {
                 const result = await this.inferenceClient.complete({
-                    model: ModelConfig.digest,
                     systemPrompt,
                     prompt: userPrompt,
                     maxTokens: 16384,
