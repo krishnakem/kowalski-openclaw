@@ -11,7 +11,7 @@ import { CapturedPost, DigestConfig, ExtractionBlock } from '../../types/instagr
 import { AnalysisObject } from '../../types/analysis.js';
 import { UsageService } from './UsageService.js';
 import type { InferenceClient } from './Inference.js';
-import { inferenceUsageToTokenUsage } from './Inference.js';
+import { formatInferenceSource, inferenceUsageToTokenUsage } from './Inference.js';
 
 export class DigestGeneration {
     private inferenceClient: InferenceClient;
@@ -48,8 +48,7 @@ export class DigestGeneration {
             year: 'numeric'
         });
 
-        const systemPrompt = this.buildSystemPrompt();
-        const userPrompt = this.buildUserPrompt(usable, dayName, dateStr);
+        const digestPrompt = this.buildDigestPrompt(usable, dayName, dateStr);
 
         console.log(`🤖 Generating digest from ${usable.length} extractions (${captures.length - usable.length} skipped)...`);
 
@@ -62,8 +61,7 @@ export class DigestGeneration {
             // 5-minute default is far too long when connectivity drops.
             try {
                 const result = await this.inferenceClient.complete({
-                    systemPrompt,
-                    prompt: userPrompt,
+                    prompt: digestPrompt,
                     maxTokens: 16384,
                     signal: runSignal
                         ? AbortSignal.any([runSignal, AbortSignal.timeout(60_000)])
@@ -79,6 +77,11 @@ export class DigestGeneration {
                 }
 
                 markdown = result.text.trim();
+                if (!markdown) {
+                    lastError = new Error(
+                        `empty response from ${formatInferenceSource(result.provider, result.model)}`
+                    );
+                }
                 break;
             } catch (err) {
                 lastError = err;
@@ -111,7 +114,15 @@ export class DigestGeneration {
         return this.buildAnalysisObject(markdown, config, dayName, dateStr, captures, usable);
     }
 
-    private buildSystemPrompt(): string {
+    private buildDigestPrompt(
+        captures: CapturedPost[],
+        dayName: string,
+        dateStr: string
+    ): string {
+        return `${this.buildInstructionPrompt()}\n\n${this.buildUserPrompt(captures, dayName, dateStr)}`;
+    }
+
+    private buildInstructionPrompt(): string {
         return `You are the Kowalski digest writer. You compose a single short markdown editorial column summarizing what happened on the Instagram accounts a reader follows. You write like a beat reporter filing a morning column — not a log parser, not a UI describer.
 
 You receive STRUCTURED EXTRACTIONS, one per captured screenshot. Each extraction was written by an upstream vision agent and contains the handle, content type, caption, overlay text, named entities, verbatim numbers/scores, dates, and a literal narrative. Treat the extractions as ground truth. You do NOT see the images. Do not invent details that are not in the extractions.

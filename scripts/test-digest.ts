@@ -1,6 +1,6 @@
 import { DigestGeneration } from '../src/main/services/DigestGeneration.js';
 import type { CapturedPost, ExtractionBlock } from '../src/types/instagram.js';
-import type { InferenceClient } from '../src/main/services/Inference.js';
+import type { InferenceClient, InferenceRequest } from '../src/main/services/Inference.js';
 
 function assert(cond: unknown, message: string): asserts cond {
     if (!cond) throw new Error(message);
@@ -92,3 +92,35 @@ assert(result.markdown.includes('editorial model call failed'), 'fallback digest
 assert(result.subtitle.includes('1 skipped'), 'analysis subtitle should count skipped captures');
 
 console.log('✅ digest fallback test passed');
+
+let capturedRequest: InferenceRequest | null = null;
+const successfulInference: InferenceClient = {
+    backend: 'openclaw',
+    complete: async (request) => {
+        capturedRequest = request;
+        return {
+            text: '# Model Digest\n\n## 📰 Top Story: Host Model Worked\nThe host model produced markdown.',
+            provider: 'openclaw-host',
+            model: 'host-selected',
+            usage: { inputTokens: 10, outputTokens: 5 },
+        };
+    },
+};
+
+const successfulGenerator = new DigestGeneration(successfulInference);
+const successfulResult = await successfulGenerator.generateDigest(captures, {
+    userName: 'Smoke Tester',
+    location: 'Localhost',
+    scheduledTime: 'now',
+});
+
+assert(successfulResult.title === 'Model Digest', 'successful digest should use host model markdown');
+assert(capturedRequest !== null, 'successful digest should call inference');
+assert(capturedRequest.model === undefined, 'digest generation must not choose a model');
+assert(capturedRequest.systemPrompt === undefined, 'digest generation should not use a separate systemPrompt');
+assert(
+    typeof capturedRequest.prompt === 'string' && capturedRequest.prompt.includes('You are the Kowalski digest writer.'),
+    'digest instructions should be included in the user prompt'
+);
+
+console.log('✅ digest host-model request-shape test passed');
