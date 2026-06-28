@@ -279,7 +279,6 @@ function textMessagesFromRequest(
         }));
     }
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [];
-    if (request.systemPrompt) messages.push({ role: 'system', content: request.systemPrompt });
     messages.push({ role: 'user', content: request.prompt ?? fallbackPrompt });
     return messages;
 }

@@ -117,10 +117,14 @@ const successfulResult = await successfulGenerator.generateDigest(captures, {
 assert(successfulResult.title === 'Model Digest', 'successful digest should use host model markdown');
 assert(capturedRequest !== null, 'successful digest should call inference');
 assert(capturedRequest.model === undefined, 'digest generation must not choose a model');
-assert(capturedRequest.systemPrompt === undefined, 'digest generation should not use a separate systemPrompt');
 assert(
-    typeof capturedRequest.prompt === 'string' && capturedRequest.prompt.includes('You are the Kowalski digest writer.'),
-    'digest instructions should be included in the user prompt'
+    typeof capturedRequest.systemPrompt === 'string' &&
+        capturedRequest.systemPrompt.includes('You are the Kowalski digest writer.'),
+    'digest instructions should be sent as the system prompt'
+);
+assert(
+    typeof capturedRequest.prompt === 'string' && capturedRequest.prompt.includes('STORY FRAMES'),
+    'digest extraction payload should be sent as the user prompt'
 );
 
 console.log('✅ digest host-model request-shape test passed');

@@ -48,7 +48,8 @@ export class DigestGeneration {
             year: 'numeric'
         });
 
-        const digestPrompt = this.buildDigestPrompt(usable, dayName, dateStr);
+        const instructionPrompt = this.buildInstructionPrompt();
+        const userPrompt = this.buildUserPrompt(usable, dayName, dateStr);
 
         console.log(`🤖 Generating digest from ${usable.length} extractions (${captures.length - usable.length} skipped)...`);
 
@@ -61,8 +62,9 @@ export class DigestGeneration {
             // 5-minute default is far too long when connectivity drops.
             try {
                 const result = await this.inferenceClient.complete({
-                    prompt: digestPrompt,
-                    maxTokens: 16384,
+                    systemPrompt: instructionPrompt,
+                    prompt: userPrompt,
+                    maxTokens: 4096,
                     signal: runSignal
                         ? AbortSignal.any([runSignal, AbortSignal.timeout(60_000)])
                         : AbortSignal.timeout(60_000),
@@ -118,14 +120,6 @@ export class DigestGeneration {
         }
 
         return this.buildAnalysisObject(markdown, config, dayName, dateStr, captures, usable);
-    }
-
-    private buildDigestPrompt(
-        captures: CapturedPost[],
-        dayName: string,
-        dateStr: string
-    ): string {
-        return `${this.buildInstructionPrompt()}\n\n${this.buildUserPrompt(captures, dayName, dateStr)}`;
     }
 
     private buildInstructionPrompt(): string {
