@@ -16,6 +16,7 @@ The heavy lifting is all local — real Playwright-controlled Chromium against a
 - [Agentic login (Stage 6)](#agentic-login-stage-6)
 - [Installation into OpenClaw](#installation-into-openclaw)
 - [Configuration](#configuration)
+- [Bundled browser](#bundled-browser)
 - [Project layout](#project-layout)
 - [Models and costs](#models-and-costs)
 - [Development](#development)
@@ -25,7 +26,7 @@ The heavy lifting is all local — real Playwright-controlled Chromium against a
 
 ## What the plugin exposes
 
-The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
+The plugin registers **eleven tools** on the OpenClaw agent surface. The [skills](skills/) playbooks tell the agent how to run digests, adjust timers, and answer remaining-time questions.
 
 | Tool | Purpose |
 | --- | --- |
@@ -38,10 +39,10 @@ The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md
 | `print_digest` | Polls for the completed/stopped digest. While still running, returns a silent pending payload; once ready, returns display-ready markdown, preserving emoji, and auto-ends the session after printing. With no args, prints the newest ready in-memory digest or newest saved analysis record. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
 | `reset_all` | Dry-run-first factory reset for browser profile, scratch data, and output records. Requires `confirm: true` to actually wipe. |
-| `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes with a partial digest/PDF tagged `abortReason: user-stop` when captures exist; queued print watchers should stay active so the partial digest still appears in the TUI. |
+| `stop_run` | Global stop switch. With a session id it targets that session; with a missing/stale id it still writes the plugin-level stop marker that `RunManager` polls every ~3s. The run finalizes with a partial digest/PDF tagged `abortReason: user-stop` when captures exist; call `get_session_status` or `print_digest` after finalization to show it. |
 | `end_session` | Abort the in-flight run, close the Playwright context, drop the `session_id`. |
 
-The canonical happy-path call chain for a digest ask is now `start_session → schedule a 30-second silent print_digest check → print_digest every 30 seconds until ready`. Manual `run_digest` calls instead block until completion and return the display-ready digest directly. If login needs credentials, 2FA, or device approval, the pending response tells the agent which user input is needed before the workflow resumes.
+The canonical happy-path call chain for a digest ask is now `start_session → wait for an explicit status/result request → get_session_status or print_digest`. Manual `run_digest` calls instead block until completion and return the display-ready digest directly. If login needs credentials, 2FA, or device approval, the pending response tells the agent which user input is needed before the workflow resumes. Scheduled 30-second `print_digest` checks are disabled by default unless `enableScheduledPolling` is configured and the OpenClaw gateway has a delivery channel.
 
 ---
 
@@ -51,18 +52,21 @@ Every completed, stopped, or best-effort partial run attempts to produce:
 
 - A JSON analysis record under `~/.kowalski/output/analysis_records/<id>.json`.
 - Per-record image artifacts under `~/.kowalski/output/analysis_records/<id>/images/`.
-- A text-only PDF in `downloadsDir`, defaulting to `~/Downloads/kowalski-digest-<timestamp>.pdf`.
+- A text-only PDF, defaulting to `~/Downloads/kowalski-digest-<timestamp>.pdf`.
 - Display-ready markdown for the TUI.
 
 Manual `run_digest` returns that markdown directly in the tool result after
 writing the JSON/PDF artifacts. The normal `start_session` and login/2FA flows
-start the digest in the background, so the agent uses a silent 30-second
-`print_digest` watcher to post the markdown when the analysis is ready.
+start the digest in the background, so the agent should call
+`get_session_status` or `print_digest` when the user asks for progress or the
+result. A configured-channel client may opt into silent scheduled
+`print_digest` checks with `enableScheduledPolling`, but that is not the
+default workflow.
 
 `stop_run` stops collecting more Instagram content but does not discard the
 run. If captures exist, Kowalski finalizes a partial digest/PDF tagged
-`abortReason: user-stop`; queued print watchers should stay active so the
-partial digest appears in the TUI without another user prompt.
+`abortReason: user-stop`; call `get_session_status` or `print_digest` after
+the stop finalizes to show the partial digest.
 
 `print_digest` can be called with a `session_id`, with a `record_id`, or with no
 arguments. With no arguments, it prints the newest ready in-memory digest or the
@@ -195,14 +199,18 @@ The `--dangerously-force-unsafe-install` flag is required because OpenClaw's sta
 | `browserProfileDir` | no | `~/.kowalski/browser` |
 | `scratchDir` | no | `~/.kowalski/scratch` |
 | `outputDir` | no | `~/.kowalski/output` |
-| `downloadsDir` | no | `~/Downloads` |
 | `userName` | no | — |
 | `location` | no | — |
+| `enableScheduledPolling` | no | `false` |
 
 All model calls use OpenClaw's configured provider through `api.runtime`.
 Kowalski requires a vision-capable image model. If screenshots cannot be
 understood, configure `agents.defaults.imageModel` to a model with image input
 support.
+
+PDF export writes to `~/Downloads` by default. The PDF writer also honors a
+host-provided `downloadsDir` plugin config value, but the current plugin
+manifest does not expose that key in its public config schema.
 
 ### Environment variables
 
@@ -280,15 +288,22 @@ src/
 scripts/                            # npm run test:* harnesses
 ├── test-digest.ts                  # Digest generation test
 ├── test-extract.ts                 # Extractor test
+├── test-inference-factory.ts       # OpenClaw runtime inference adapter smoke
 ├── test-run.ts                     # Full pipeline test (headless)
 ├── test-plugin.ts                  # Plugin surface smoke (npm run test:plugin)
 ├── test-login-agent.ts             # LoginAgent smoke against a fake IG fixture (npm run test:login)
+├── test-bundled-browser-resolver.ts # Browser executable resolver test
+├── test-pdf.ts                     # PDF export smoke helper
 └── fixtures/
     └── fake-ig-login.html          # Static IG-login-alike for test:login
 
 skills/
-└── instagram-digest/
-    └── SKILL.md                    # OpenClaw skill playbook (what to call, when)
+├── instagram-digest/
+│   └── SKILL.md                    # Main digest playbook (what to call, when)
+├── kowalski-timer/
+│   └── SKILL.md                    # Timer-change playbook
+└── kowalski-time-remaining/
+    └── SKILL.md                    # Remaining-time status playbook
 ```
 
 ---
@@ -351,9 +366,11 @@ npm run test:browser-resolver
 npm run test:plugin     # Plugin surface — asserts 11 tools registered in order
 npm run test:login      # LoginAgent against a local fake-IG fixture
                         # (scripted callLLM — no provider calls)
+npm run test:inference  # OpenClaw runtime inference adapter smoke
 npm run test:extract    # Skips: extraction requires OpenClaw plugin runtime
 npm run test:digest     # Skips: digest generation requires OpenClaw plugin runtime
 npm run test:run        # Skips: full run requires OpenClaw plugin runtime
+npm run lint
 ```
 
 The plugin loads TypeScript directly — the OpenClaw loader consumes `src/plugin/index.ts` with no build step and no `dist/` output. Edits to any file in this tree are picked up on the next `openclaw gateway run` boot (provided the plugin was installed with `--link`).
