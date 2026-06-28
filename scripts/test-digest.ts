@@ -88,7 +88,7 @@ assert(result.markdown.startsWith('# '), 'fallback digest should be markdown wit
 assert(result.markdown.includes('Top Story'), 'fallback digest should include a top story');
 assert(result.markdown.includes('@nba'), 'fallback digest should include grouped handles');
 assert(result.markdown.includes('Spurs 116'), 'fallback digest should preserve extracted facts');
-assert(result.markdown.includes('editorial model call failed'), 'fallback digest should disclose fallback mode');
+assert(result.markdown.includes('digest writer LLM call failed'), 'fallback digest should disclose fallback mode');
 assert(result.subtitle.includes('1 skipped'), 'analysis subtitle should count skipped captures');
 
 console.log('✅ digest fallback test passed');
@@ -124,3 +124,37 @@ assert(
 );
 
 console.log('✅ digest host-model request-shape test passed');
+
+let emptyThenSuccessCalls = 0;
+const emptyThenSuccessInference: InferenceClient = {
+    backend: 'openclaw',
+    complete: async () => {
+        emptyThenSuccessCalls += 1;
+        if (emptyThenSuccessCalls === 1) {
+            return {
+                text: '',
+                provider: 'openclaw-host',
+                model: 'host-selected',
+                usage: { inputTokens: 10, outputTokens: 0 },
+            };
+        }
+        return {
+            text: '# Retry Worked\n\n## 📰 Top Story: Second Call\nThe retry produced markdown.',
+            provider: 'openclaw-host',
+            model: 'host-selected',
+            usage: { inputTokens: 10, outputTokens: 5 },
+        };
+    },
+};
+
+const retryGenerator = new DigestGeneration(emptyThenSuccessInference);
+const retryResult = await retryGenerator.generateDigest(captures, {
+    userName: 'Smoke Tester',
+    location: 'Localhost',
+    scheduledTime: 'now',
+});
+
+assert(emptyThenSuccessCalls === 2, `empty digest response should retry once, got ${emptyThenSuccessCalls} calls`);
+assert(retryResult.title === 'Retry Worked', 'retry digest should use second successful markdown');
+
+console.log('✅ digest empty-response retry test passed');

@@ -81,17 +81,23 @@ export class DigestGeneration {
                     lastError = new Error(
                         `empty response from ${formatInferenceSource(result.provider, result.model)}`
                     );
+                    if (attempt < maxRetries - 1) {
+                        const delay = retryDelayMs(attempt, 3000, 15000);
+                        console.warn(
+                            `  ⏳ Digest LLM returned empty text (attempt ${attempt + 1}/${maxRetries}). Retrying in ${(delay / 1000).toFixed(1)}s...`
+                        );
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
                 }
                 break;
             } catch (err) {
                 lastError = err;
                 const status = (err as { status?: number }).status;
-                if ((status === 529 || status === 429) && attempt < maxRetries - 1) {
+                if (isRetryableDigestError(err) && attempt < maxRetries - 1) {
                     const baseDelay = status === 429 ? 10000 : 5000;
-                    const backoff = Math.min(baseDelay * Math.pow(2, attempt), 60000);
-                    const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
-                    const delay = Math.round(backoff + jitter);
-                    console.warn(`  ⏳ Digest LLM ${status} (attempt ${attempt + 1}/${maxRetries - 1}). Retrying in ${(delay / 1000).toFixed(1)}s...`);
+                    const delay = retryDelayMs(attempt, baseDelay, 60000);
+                    console.warn(`  ⏳ Digest LLM retryable error (attempt ${attempt + 1}/${maxRetries}): ${errorSummary(err)}. Retrying in ${(delay / 1000).toFixed(1)}s...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
                     continue;
                 }
@@ -391,6 +397,36 @@ Now write the editorial column. Begin immediately with "# " followed by your gen
 function truncate(s: string, max: number): string {
     if (s.length <= max) return s;
     return s.slice(0, max - 1) + '…';
+}
+
+function retryDelayMs(attempt: number, baseDelay: number, maxDelay: number): number {
+    const backoff = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+    const jitter = backoff * 0.25 * (Math.random() * 2 - 1);
+    return Math.max(250, Math.round(backoff + jitter));
+}
+
+function isRetryableDigestError(err: unknown): boolean {
+    const status = (err as { status?: number } | null)?.status;
+    if (status === 429 || status === 529 || (typeof status === 'number' && status >= 500)) {
+        return true;
+    }
+
+    const summary = errorSummary(err).toLowerCase();
+    return (
+        summary.includes('connection error') ||
+        summary.includes('invalid_provider_content_type') ||
+        summary.includes('fetch failed') ||
+        summary.includes('network') ||
+        summary.includes('timeout')
+    );
+}
+
+function errorSummary(err: unknown): string {
+    if (err instanceof Error) {
+        const cause = (err as Error & { cause?: unknown }).cause;
+        return cause ? `${err.message} (${String(cause)})` : err.message;
+    }
+    return String(err);
 }
 
 function normalizeHandle(handle?: string | null): string | null {
