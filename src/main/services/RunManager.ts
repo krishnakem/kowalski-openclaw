@@ -421,7 +421,7 @@ export class RunManager {
                 throw new Error(OFFLINE_ERROR);
             }
             console.log('🚀 Generating digest...');
-            const digestGenerator = new DigestGeneration(inferenceClient);
+            const digestGenerator = new DigestGeneration();
             const analysis = await digestGenerator.generateDigest(bestCaptures, {
                 userName: settings.userName || 'User',
                 location: settings.location || ''
@@ -701,7 +701,7 @@ export class RunManager {
         if (bestCaptures.length === 0) return null;
 
         const counts = this.countCaptureQuality(bestCaptures);
-        const digestGenerator = new DigestGeneration(session.inferenceClient);
+        const digestGenerator = new DigestGeneration();
         const digestController = new AbortController();
         const digestSignal = AbortSignal.any([
             digestController.signal,

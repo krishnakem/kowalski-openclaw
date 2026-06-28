@@ -7,6 +7,7 @@ function assert(cond: unknown, message: string): asserts cond {
 let forwardedModel: string | undefined;
 let forwardedMaxTokens: number | undefined;
 let forwardedPurpose: string | undefined;
+let forwardedSystemPrompt: string | undefined;
 
 const runtime: OpenClawRuntimeLike = {
     config: { current: () => ({}) },
@@ -15,6 +16,7 @@ const runtime: OpenClawRuntimeLike = {
             forwardedModel = params.model;
             forwardedMaxTokens = params.maxTokens;
             forwardedPurpose = params.purpose;
+            forwardedSystemPrompt = params.systemPrompt;
             return {
                 text: 'ok',
                 provider: 'test',
@@ -38,10 +40,12 @@ await openClawNoKey.complete({
     model: 'provider/test-digest-model',
     prompt: 'hello',
     maxTokens: 123,
+    systemPrompt: 'system hello',
     purpose: 'unit test',
 });
 assert(forwardedModel === undefined, 'text completions should not forward request.model; OpenClaw owns plugin LLM model selection');
 assert(forwardedMaxTokens === 123, 'text completions should forward maxTokens');
+assert(forwardedSystemPrompt === 'system hello', 'text completions should forward systemPrompt');
 assert(forwardedPurpose === 'unit test', 'text completions should forward purpose');
 
 let threw = false;

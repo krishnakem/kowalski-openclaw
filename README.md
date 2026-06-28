@@ -2,7 +2,7 @@
 
 Kowalski is an [OpenClaw](https://openclaw.ai) plugin that captures your Instagram stories + feed and returns a markdown digest. You ask your OpenClaw agent _"what's happening on my feed today?"_, it triggers this plugin, the plugin drives Chromium + OpenClaw's configured model provider through your home page, and you get back a readable summary instead of having to scroll.
 
-The heavy lifting is all local — real Playwright-controlled Chromium against a real session cookie, vision-agent loops at every step (login, stories, feed), structured extraction per capture, and finally a text-only digest writer. No scraping, no undocumented APIs, just a browser driven by a model.
+The heavy lifting is all local — real Playwright-controlled Chromium against a real session cookie, vision-agent loops at every browsing step (login, stories, feed), structured extraction per capture, and finally a deterministic text-only digest writer over those extractions. No scraping, no undocumented APIs, just a browser driven by a model.
 
 > **Status — OpenClaw-native.** Kowalski is now a pure OpenClaw plugin: Playwright browser automation plus model calls routed through `api.runtime`, wired to an OpenClaw `register(api)` entrypoint. See [REFACTOR_NOTES.md](REFACTOR_NOTES.md) for the full refactor history, architectural trade-offs, and known risks.
 
@@ -102,7 +102,7 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
         │                   merges structured extraction into sidecars)    │
         │      │                                                           │
         │      ▼  reads sidecars as text only                              │
-        │  DigestGeneration (Phase 3 — OpenClaw text model)                │
+        │  DigestGeneration (Phase 3 — local extractive writer)            │
         │      │                                                           │
         │      ▼                                                           │
         │  RunManager writes analysis_records/<id>.json + PDF artifact     │
@@ -214,7 +214,6 @@ support.
 | `KOWALSKI_CONNECTIVITY_PROBE_URL` | Back-compat single probe URL. Ignored when `KOWALSKI_CONNECTIVITY_PROBE_URLS` is set. |
 | `KOWALSKI_CONNECTIVITY_PROBE_TIMEOUT_MS` | Per-probe timeout. Defaults to `4000`. |
 | `KOWALSKI_OFFLINE_WATCHDOG_FAILURES` | Consecutive failed multi-probe rounds before a run is considered offline. Defaults to `6`. |
-
 Model selection is handled by OpenClaw. Configure the default text and image
 models in OpenClaw, including `agents.defaults.imageModel` for screenshots.
 
@@ -255,7 +254,7 @@ src/
 │       ├── StoriesAgent.ts         # Phase 1 — stories viewer
 │       ├── FeedAgent.ts            # Phase 2 — feed + post modals + carousels
 │       ├── Extractor.ts            # Phase 2.5 — per-image structured extraction
-│       ├── DigestGeneration.ts     # Phase 3 — text-only editorial
+│       ├── DigestGeneration.ts     # Phase 3 — local extractive digest
 │       ├── AnalysisGenerator.ts    # Insights pass over a digest
 │       ├── ContentVision.ts        # Shared vision-call helpers
 │       ├── ImageTagger.ts          # Per-image tagging utilities
@@ -298,12 +297,14 @@ skills/
 
 OpenClaw's configured runtime chooses the models:
 
-- Screenshot understanding goes through `api.runtime.mediaUnderstanding`.
-- Text-only generation goes through `api.runtime.llm.complete`.
+- Screenshot understanding and structured extraction go through
+  `api.runtime.mediaUnderstanding`.
+- Digest assembly is local and deterministic over extractor sidecars; it does
+  not call a final text model.
 
 Kowalski does not currently force specific model IDs from inside the plugin.
-Configure the text and image models in OpenClaw; screenshot understanding
-requires a vision-capable image model such as `agents.defaults.imageModel`.
+Configure the image model in OpenClaw; screenshot understanding requires a
+vision-capable image model such as `agents.defaults.imageModel`.
 
 Costs depend on your provider, selected models, and how many screenshots/agent
 turns a run needs. The plugin records provider/model/usage when the runtime
