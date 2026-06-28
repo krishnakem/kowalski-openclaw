@@ -70,6 +70,8 @@ export class RunManager {
     // empty file at `${scratchDir}/STOP_REQUESTED` and we pick it up at the
     // next poll, fire a cooperative stop, and finalize with a partial digest.
     private stopMarkerPoller: NodeJS.Timeout | null = null;
+    private totalTimerPoller: NodeJS.Timeout | null = null;
+    private activePhase: 'stories' | 'feed' | null = null;
 
     private constructor() {}
 
@@ -189,6 +191,7 @@ export class RunManager {
         this.status = 'running';
         this.offlineDetected = false;
         this.abortReason = null;
+        this.activePhase = null;
         this.runAbortController = new AbortController();
         const phases = options?.phases ?? session.runConfig.phases ?? ['stories', 'feed'];
         console.log(`🚀 Run started (phases: ${phases.join(', ')})`);
@@ -215,14 +218,29 @@ export class RunManager {
             }
         }, 3000);
 
+        const runStartedAt = Date.now();
         const MAX_DURATION_MS = session.runConfig.maxDurationMs ?? 90 * 60 * 1000;
+        this.totalTimerPoller = setInterval(() => {
+            if (this.status !== 'running') return;
+            const currentMaxDurationMs = session.runConfig.maxDurationMs ?? MAX_DURATION_MS;
+            const elapsedMs = Date.now() - runStartedAt;
+            if (elapsedMs < currentMaxDurationMs) return;
+
+            const reason: RunAbortReason =
+                this.activePhase === 'stories' ? 'timeout-stories' : 'timeout-feed';
+            console.log(
+                `⏱️  Total run timer elapsed — elapsed=${Math.round(elapsedMs / 1000)}s cap=${Math.round(currentMaxDurationMs / 1000)}s reason=${reason}`
+            );
+            this.stopRun(reason);
+        }, 1000);
+
         const browserManager = BrowserManager.getInstance();
         browserManager.bindSession(session);
         let context = null;
 
         this.emit('run-started', {
             durationMs: MAX_DURATION_MS,
-            startTime: Date.now()
+            startTime: runStartedAt
         });
 
         // Hoisted so the catch path can load partial captures off disk and
@@ -294,7 +312,9 @@ export class RunManager {
                     phases,
                     storiesTimeoutMs: session.runConfig.storiesTimeoutMs,
                     feedTimeoutMs: session.runConfig.feedTimeoutMs,
+                    maxDurationMsProvider: () => session.runConfig.maxDurationMs ?? MAX_DURATION_MS,
                     onPhaseChange: (phase, info) => {
+                        this.activePhase = phase;
                         this.emit('run-phase', { phase, ...(info ?? {}) });
                     }
                 }
@@ -368,7 +388,8 @@ export class RunManager {
             console.log(`🚀 Loaded ${bestCaptures.length} raw screenshots with extractions`);
 
             // 11. Generate digest — re-check the network first. Browsing can take
-            // up to 90 min and connectivity may have dropped in that window.
+            // up to the configured run budget and connectivity may have
+            // dropped in that window.
             if (!(await isOnline())) {
                 throw new Error(OFFLINE_ERROR);
             }
@@ -888,6 +909,11 @@ export class RunManager {
     private finishRun() {
         this.status = 'idle';
         this.activeExtractors = [];
+        this.activePhase = null;
+        if (this.totalTimerPoller) {
+            clearInterval(this.totalTimerPoller);
+            this.totalTimerPoller = null;
+        }
         if (this.stopOfflineWatchdog) {
             this.stopOfflineWatchdog();
             this.stopOfflineWatchdog = null;

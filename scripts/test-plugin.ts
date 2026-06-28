@@ -8,8 +8,8 @@
  *      on both the named export and the default export.
  *   2. `register` accepts a minimal PluginApi with pluginConfig + a mock
  *      registerTool collector, and does not throw.
- *   3. All ten expected tools are registered in the expected order
- *      (start_session, login, submit_verification_code, run_digest,
+ *   3. All eleven expected tools are registered in the expected order
+ *      (start_session, login, submit_verification_code, update_timer, run_digest,
  *      get_session_status, print_digest, reset_memory, reset_all, stop_run,
  *      end_session) with the expected `optional` flag (undefined for all of them).
  *   4. Each tool's `parameters` schema is a well-formed JSON-Schema-ish
@@ -117,11 +117,12 @@ function main(): void {
     }
     console.log('✅ register(api) completed');
 
-    // (3) All ten tools got registered, in order, with the right `optional` flag.
+    // (3) All eleven tools got registered, in order, with the right `optional` flag.
     const expected = [
         { name: 'start_session', optional: undefined },
         { name: 'login', optional: undefined },
         { name: 'submit_verification_code', optional: undefined },
+        { name: 'update_timer', optional: undefined },
         { name: 'run_digest', optional: undefined },
         { name: 'get_session_status', optional: undefined },
         { name: 'print_digest', optional: undefined },
@@ -194,7 +195,9 @@ function main(): void {
             // (6) Invoke start_session and check the return shape.
             const startSession = registered.find((rr) => rr.tool.name === 'start_session');
             assert(startSession, 'start_session not registered');
-            const result = startSession.tool.execute('smoke-call-1', { phases: ['stories'] });
+            const result = startSession.tool.execute('smoke-call-1', {
+                duration_minutes: 10,
+            });
             assert(result instanceof Promise, 'start_session.execute must return a Promise');
             return result;
         })
@@ -211,6 +214,25 @@ function main(): void {
                 'start_session result missing session_id');
             assert(typeof parsed.message === 'string', 'start_session result missing message');
             console.log('✅ start_session without IG creds returns pending_credentials');
+
+            const updateTimer = registered.find((rr) => rr.tool.name === 'update_timer');
+            assert(updateTimer, 'update_timer not registered');
+            const timerResult = await updateTimer.tool.execute('smoke-call-update-timer', {
+                session_id: parsed.session_id,
+                duration_minutes: 20,
+            });
+            const timerText = timerResult.content[0]?.text;
+            assert(typeof timerText === 'string', 'update_timer result missing text');
+            const timerParsed = JSON.parse(timerText);
+            assert(timerParsed.status === 'timer_updated',
+                `update_timer status mismatch: ${timerParsed.status}`);
+            assert(timerParsed.total_cap_ms === 20 * 60 * 1000,
+                `update_timer total cap mismatch: ${timerParsed.total_cap_ms}`);
+            assert(timerParsed.stories_cap_ms === 6 * 60 * 1000,
+                `update_timer stories cap mismatch: ${timerParsed.stories_cap_ms}`);
+            assert(timerParsed.feed_cap_ms === 14 * 60 * 1000,
+                `update_timer feed cap mismatch: ${timerParsed.feed_cap_ms}`);
+            console.log('✅ update_timer recomputes pending session duration');
 
             // (7) Invoke print_digest against a saved record and ensure the
             // markdown/emoji come back as plain text, not nested JSON.

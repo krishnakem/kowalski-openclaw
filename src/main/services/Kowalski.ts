@@ -99,6 +99,7 @@ export class Kowalski {
     ): Promise<BrowsingSession> {
         const startTime = Date.now();
         const targetDurationMs = targetMinutes * 60 * 1000;
+        const getTotalDurationMs = config?.maxDurationMsProvider ?? (() => targetDurationMs);
 
         // Reuse the existing page if it's already on Instagram
         const existingPages = this.context.pages();
@@ -190,10 +191,10 @@ export class Kowalski {
             // Phase 1: Stories (Haiku — bounded, cheap)
             // ═══════════════════════════════════════════
             if (phases.includes('stories') && !this.stopped) {
-                // Hard cap: default 15 min. Agent's internal loop already
-                // reads maxDurationMs, so passing the same number is enough —
-                // the setTimeout is belt-and-braces in case the LLM gets
-                // wedged in a single long decision.
+                // Hard cap: supplied by start_session from the user's
+                // requested duration. The agent's internal loop already reads
+                // maxDurationMs, and the setTimeout covers a single wedged
+                // decision.
                 const STORIES_PHASE_MAX_MS = config?.storiesTimeoutMs ?? 15 * 60 * 1000;
                 console.log(`\n📖 Phase 1: Stories (hard cap: ${(STORIES_PHASE_MAX_MS / 60000).toFixed(1)} min, model: OpenClaw configured image model)`);
                 this.screenshotCollector.appendLogRaw(`\n## Phase 1: Stories\n`);
@@ -242,13 +243,12 @@ export class Kowalski {
             // Phase 2: Feed (Sonnet — remaining budget)
             // ═══════════════════════════════════════════
             if (phases.includes('feed') && !this.stopped) {
-                // Hard cap on the feed phase — once it elapses the FeedAgent
-                // exits cooperatively and the run proceeds to digest. Belt
-                // and braces: both agent.maxDurationMs and a setTimeout fire
-                // agent.stop(), so a wedged LLM call can't run past the cap.
-                const FEED_PHASE_MAX_MS = config?.feedTimeoutMs ?? 30 * 60 * 1000;
-                const remainingMs = targetDurationMs - (Date.now() - startTime);
-                const feedMaxMs = Math.min(remainingMs, FEED_PHASE_MAX_MS);
+                // Feed owns whatever remains after the immutable stories
+                // allocation. If the total timer is changed mid-run, this
+                // provider reflects the new value and the extra/removed time
+                // lands in feed rather than changing the stories cap.
+                const getFeedMaxMs = () => Math.max(0, getTotalDurationMs() - storiesElapsed);
+                const feedMaxMs = getFeedMaxMs();
 
                 if (feedMaxMs > 30000) { // Only run feed if >30s remaining
                     console.log(`\n📰 Phase 2: Feed (hard cap: ${(feedMaxMs / 60000).toFixed(1)} min, model: OpenClaw configured image model)`);
@@ -260,6 +260,7 @@ export class Kowalski {
                         {
                             inferenceClient: this.inferenceClient,
                             maxDurationMs: feedMaxMs,
+                            maxDurationMsProvider: getFeedMaxMs,
                             debugMode: this.debugMode,
                             sessionMemoryDigest,
                             rawDir: feedRawDir,
@@ -267,23 +268,28 @@ export class Kowalski {
                     );
                     this.activeAgent = feedAgent;
 
-                    // Phase-scoped timer. Tracks `feedMaxMs` (which may be
-                    // smaller than FEED_PHASE_MAX_MS when stories consumed
-                    // part of the overall run budget).
-                    const feedTimer = setTimeout(() => {
+                    const feedAgentStart = Date.now();
+
+                    // Dynamic phase timer. It checks the mutable total
+                    // duration, but subtracts the immutable stories elapsed
+                    // time, so mid-run timer changes only affect feed.
+                    const feedTimer = setInterval(() => {
                         if (this.activeAgent === feedAgent) {
+                            const elapsed = Date.now() - feedAgentStart;
+                            const currentFeedMaxMs = getFeedMaxMs();
+                            if (elapsed < currentFeedMaxMs) return;
                             this.timedOutPhases.add('feed');
-                            console.log(`⏱️  FeedAgent: stopped (timeout ${(feedMaxMs / 60000).toFixed(1)} min)`);
+                            console.log(`⏱️  FeedAgent: stopped (timeout ${(currentFeedMaxMs / 60000).toFixed(1)} min)`);
                             this.screenshotCollector.appendLogRaw(`\n> FeedAgent: stopped (timeout)\n`);
                             feedAgent.stop();
                         }
-                    }, feedMaxMs);
+                    }, 1000);
 
                     let feedResult;
                     try {
                         feedResult = await feedAgent.run();
                     } finally {
-                        clearTimeout(feedTimer);
+                        clearInterval(feedTimer);
                     }
 
                     totalRawScreenshots += feedResult.rawScreenshotCount;

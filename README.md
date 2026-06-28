@@ -25,14 +25,15 @@ The heavy lifting is all local — real Playwright-controlled Chromium against a
 
 ## What the plugin exposes
 
-The plugin registers **ten tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
+The plugin registers **eleven tools** on the OpenClaw agent surface. A [SKILL.md](skills/instagram-digest/SKILL.md) playbook tells the agent how to handle the few states that still need user input.
 
 | Tool | Purpose |
 | --- | --- |
-| `start_session` | Create a Kowalski session and automatically continue: valid cookie starts the digest in the background; missing/unknown cookie starts the headless login flow and returns the relevant pending state if user input is needed. |
+| `start_session` | Create a Kowalski session for the requested duration and automatically continue: valid cookie starts the digest in the background; missing/unknown cookie starts the headless login flow and returns the relevant pending state if user input is needed. |
 | `login` | Continue the automatic headless login flow. If credentials are missing, returns `pending_credentials`; if Instagram asks for 2FA/device approval, returns `pending_2fa` / `pending_device_approval`; when login is verified, starts the digest in the background. |
 | `submit_verification_code` | Second leg of the login round-trip. Accepts a 2FA code or polls for device approval when `code: null`; when verification succeeds, starts the digest in the background. |
-| `run_digest` | Manually run stories + feed capture, extraction, digest generation, PDF export, and return the display-ready markdown in the tool result. Normally `start_session` or successful login starts the digest in the background for you. Bounded by hard per-phase timeouts (15 min stories, 30 min feed). |
+| `update_timer` | Change a session's requested duration. Before capture starts, recomputes the 30/70 stories/feed-posts split. During a live run, stories keeps its original cap and changed time goes to feed/posts; if elapsed time already meets the new timer, the run stops and finalizes a partial digest if captures exist. |
+| `run_digest` | Manually run stories + feed capture, extraction, digest generation, PDF export, and return the display-ready markdown in the tool result. Normally `start_session` or successful login starts the digest in the background for you. Bounded by the user-requested duration: 30% stories, 70% feed/posts when both phases run. |
 | `get_session_status` | Latest run phase + the last ~20 pipeline events. When the digest is ready, tells the agent to call `print_digest`. |
 | `print_digest` | Polls for the completed/stopped digest. While still running, returns a silent pending payload; once ready, returns display-ready markdown, preserving emoji, and auto-ends the session after printing. With no args, prints the newest ready in-memory digest or newest saved analysis record. |
 | `reset_memory` | Delete the cross-run session-memory JSON so the next run starts from a clean slate. |
@@ -77,7 +78,7 @@ Kowalski is structured as a **four-stage pipeline of vision agents**, all sharin
         ┌──────────────────────────────────────────────────────────────────┐
         │  OpenClaw agent (in chat)                                        │
         │    ↓ calls tools                                                 │
-        │  src/plugin/index.ts  ──────────  registers 10 tools             │
+        │  src/plugin/index.ts  ──────────  registers 11 tools             │
         └──────────────────────────┬───────────────────────────────────────┘
                                    │ (session_id + runConfig)
                                    ▼
@@ -222,9 +223,9 @@ models in OpenClaw, including `agents.defaults.imageModel` for screenshots.
 | Field | Default | Notes |
 | --- | --- | --- |
 | `phases` | `['stories', 'feed']` | Selectable via `start_session` params. `"just stories"` / `"just feed"` are supported one-word asks in [SKILL.md](skills/instagram-digest/SKILL.md). |
-| `storiesTimeoutMs` | `15 * 60 * 1000` | Hard cap on the stories phase. Phase installs a `setTimeout` on entry that cooperatively stops the agent. |
-| `feedTimeoutMs` | `30 * 60 * 1000` | Same, for feed. |
-| `maxDurationMs` | `90 * 60 * 1000` | Overall run budget. |
+| `maxDurationMs` | from `duration_minutes` | Overall user-requested capture budget. |
+| `storiesTimeoutMs` | `30%` of `maxDurationMs` | Hard cap on the stories phase when both phases run. If only stories run, stories get the full requested duration. |
+| `feedTimeoutMs` | `70%` of `maxDurationMs` | Hard cap on the feed/posts phase when both phases run. If only feed runs, feed gets the full requested duration. |
 | `igUsername`, `igPassword` | (from env) | Stage 6 credentials — see above. |
 
 ---
@@ -237,7 +238,7 @@ src/
 │   └── KowalskiSession.ts          # Host-supplied session handle
 │                                   # (paths, inference client, runConfig, events, abort signal)
 ├── plugin/                         # OpenClaw plugin surface
-│   ├── index.ts                    # register(api) — the 10 tools
+│   ├── index.ts                    # register(api) — the 11 tools
 │   ├── cookie-probe.ts             # Read Instagram sessionid out of Chromium cookies DB
 │   └── session-registry.ts         # Per-session event buffer for get_session_status
 ├── main/
@@ -308,8 +309,10 @@ Costs depend on your provider, selected models, and how many screenshots/agent
 turns a run needs. The plugin records provider/model/usage when the runtime
 returns them.
 
-Duration is bounded by the pipeline timeouts: stories cap at 15 minutes and feed
-caps at 30 minutes. If a phase hits its cap, Kowalski finalizes with a partial
+Duration is chosen at the start of the run. The OpenClaw skill asks how many
+minutes the user wants, then passes `duration_minutes` to `start_session`. When
+both phases run, Kowalski splits that budget 30/70: stories get 30%, and
+feed/posts get 70%. If a phase hits its cap, Kowalski finalizes with a partial
 digest tagged with the timeout reason.
 
 ## Bundled Browser
@@ -344,7 +347,7 @@ npm run check:browser   # Confirm plugin-local Chromium exists
 npx tsc --noEmit        # Typecheck
 
 npm run test:browser-resolver
-npm run test:plugin     # Plugin surface — asserts 10 tools registered in order
+npm run test:plugin     # Plugin surface — asserts 11 tools registered in order
 npm run test:login      # LoginAgent against a local fake-IG fixture
                         # (scripted callLLM — no provider calls)
 npm run test:extract    # Skips: extraction requires OpenClaw plugin runtime

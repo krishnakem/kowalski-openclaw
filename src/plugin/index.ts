@@ -1,7 +1,7 @@
 /**
  * OpenClaw plugin entrypoint for Kowalski.
  *
- * Exposes ten tools that drive the Kowalski pipeline. `start_session`
+ * Exposes eleven tools that drive the Kowalski pipeline. `start_session`
  * is the preferred entrypoint: it probes cookies, starts login if needed,
  * and starts the digest automatically once Instagram auth is verified.
  * See REFACTOR_NOTES.md for the stage-by-stage refactor history and why
@@ -178,6 +178,49 @@ function readInstagramSessionIdEnv(): { value?: string; source?: string } {
         if (value) return { value, source: name };
     }
     return {};
+}
+
+function readPositiveNumberField(obj: unknown, key: string): number | undefined {
+    if (!obj || typeof obj !== 'object') return undefined;
+    const value = (obj as Record<string, unknown>)[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+    if (typeof value === 'string' && value.trim()) {
+        const parsed = Number(value.trim());
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return undefined;
+}
+
+function formatMinutes(ms: number): string {
+    const minutes = ms / 60_000;
+    return Number.isInteger(minutes) ? `${minutes}` : minutes.toFixed(1);
+}
+
+function deriveRunDurations(
+    totalMinutes: number,
+    phases: Array<'stories' | 'feed'>
+): {
+    maxDurationMs: number;
+    storiesTimeoutMs?: number;
+    feedTimeoutMs?: number;
+} {
+    const maxDurationMs = Math.ceil(totalMinutes * 60_000);
+    const hasStories = phases.includes('stories');
+    const hasFeed = phases.includes('feed');
+
+    if (hasStories && hasFeed) {
+        return {
+            maxDurationMs,
+            storiesTimeoutMs: Math.max(1, Math.round(maxDurationMs * 0.3)),
+            feedTimeoutMs: Math.max(1, maxDurationMs - Math.round(maxDurationMs * 0.3)),
+        };
+    }
+
+    return {
+        maxDurationMs,
+        storiesTimeoutMs: hasStories ? maxDurationMs : undefined,
+        feedTimeoutMs: hasFeed ? maxDurationMs : undefined,
+    };
 }
 
 function markdownFromRecordData(data: unknown): string {
@@ -620,8 +663,13 @@ export function register(api: PluginApi): () => void {
         RunManager.getInstance().bindSession(entry.session);
         UsageService.getInstance().configure(entry.session.scratchDir);
 
-        const STORIES_CAP_MS = entry.session.runConfig.storiesTimeoutMs ?? 15 * 60_000;
-        const FEED_CAP_MS = entry.session.runConfig.feedTimeoutMs ?? 30 * 60_000;
+        const getStoriesCapMs = () => entry.session.runConfig.storiesTimeoutMs ?? 15 * 60_000;
+        const getFeedCapMs = () => entry.session.runConfig.feedTimeoutMs ?? 30 * 60_000;
+        const getTotalCapMs = () => entry.session.runConfig.maxDurationMs ?? getStoriesCapMs() + getFeedCapMs();
+        const STORIES_CAP_MS = getStoriesCapMs();
+        const FEED_CAP_MS = getFeedCapMs();
+        const TOTAL_CAP_MS = getTotalCapMs();
+        const activePhases = entry.session.runConfig.phases ?? ['stories', 'feed'];
         const runStartedAt = Date.now();
         let currentPhase: 'stories' | 'feed' | 'idle' = 'idle';
         let phaseStartedAt = runStartedAt;
@@ -633,10 +681,15 @@ export function register(api: PluginApi): () => void {
             const secs = s - m * 60;
             return `${m}m${secs.toString().padStart(2, '0')}s`;
         };
+        const phaseCapMessage = activePhases.includes('stories') && activePhases.includes('feed')
+            ? `The phase caps are stories=${formatMinutes(STORIES_CAP_MS)} min and feed/posts=${formatMinutes(FEED_CAP_MS)} min.`
+            : activePhases.includes('stories')
+                ? `The stories cap is ${formatMinutes(STORIES_CAP_MS)} min.`
+                : `The feed/posts cap is ${formatMinutes(FEED_CAP_MS)} min.`;
 
         const mode = options.waitForCompletion ? 'blocking' : 'non-blocking';
         log.info(
-            `run_digest started by ${triggeredBy} (${mode}) — phases=${JSON.stringify(entry.session.runConfig.phases)} storiesCap=${fmt(STORIES_CAP_MS)} feedCap=${fmt(FEED_CAP_MS)} · ticks every 5 min + on phase transitions. Say "stop" any time to abort.`
+            `run_digest started by ${triggeredBy} (${mode}) — phases=${JSON.stringify(activePhases)} totalCap=${fmt(TOTAL_CAP_MS)} storiesCap=${fmt(STORIES_CAP_MS)} feedCap=${fmt(FEED_CAP_MS)} · ticks every 5 min + on phase transitions. Say "stop" any time to abort.`
         );
 
         const onPhase = (payload: { phase?: 'stories' | 'feed' }): void => {
@@ -644,7 +697,7 @@ export function register(api: PluginApi): () => void {
                 const previous = currentPhase;
                 currentPhase = payload.phase;
                 phaseStartedAt = Date.now();
-                const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
+                const cap = currentPhase === 'stories' ? getStoriesCapMs() : getFeedCapMs();
                 if (previous === 'idle') {
                     log.info(`⏱ phase=${currentPhase} STARTED — cap=${fmt(cap)}`);
                 } else {
@@ -666,11 +719,11 @@ export function register(api: PluginApi): () => void {
                 );
                 return;
             }
-            const cap = currentPhase === 'stories' ? STORIES_CAP_MS : FEED_CAP_MS;
+            const cap = currentPhase === 'stories' ? getStoriesCapMs() : getFeedCapMs();
             const phaseElapsed = now - phaseStartedAt;
             const remaining = cap - phaseElapsed;
             log.info(
-                `⏱ phase=${currentPhase}  elapsed=${fmt(phaseElapsed)}/${fmt(cap)}  remaining=${fmt(remaining)}  totalElapsed=${fmt(totalElapsed)}`
+                `⏱ phase=${currentPhase}  elapsed=${fmt(phaseElapsed)}/${fmt(cap)}  remaining=${fmt(remaining)}  totalElapsed=${fmt(totalElapsed)}/${fmt(getTotalCapMs())}`
             );
         }, TICK_INTERVAL_MS);
 
@@ -713,8 +766,12 @@ export function register(api: PluginApi): () => void {
                     const storyCaps = result.record.data?.images?.filter((i: any) => i.source === 'story').length ?? 0;
                     const feedCaps = result.record.data?.images?.filter((i: any) => i.source === 'feed').length ?? 0;
                     const parts: string[] = [];
-                    if (timedOut.includes('stories')) parts.push('Stories phase timed out after 15 minutes');
-                    if (timedOut.includes('feed')) parts.push('Feed phase timed out after 30 minutes');
+                    if (timedOut.includes('stories')) {
+                        parts.push(`Stories phase timed out after ${formatMinutes(getStoriesCapMs())} minutes`);
+                    }
+                    if (timedOut.includes('feed')) {
+                        parts.push(`Feed phase timed out after ${formatMinutes(getFeedCapMs())} minutes`);
+                    }
                     if (timedOut.includes('stories') && !timedOut.includes('feed')) {
                         parts.push('feed phase ran to completion');
                     } else if (timedOut.includes('feed') && !timedOut.includes('stories')) {
@@ -799,8 +856,12 @@ export function register(api: PluginApi): () => void {
             inference_backend: entry.session.inferenceClient.backend,
             triggered_by: triggeredBy,
             started_at: new Date(runStartedAt).toISOString(),
+            total_cap_ms: TOTAL_CAP_MS,
             stories_cap_ms: STORIES_CAP_MS,
             feed_cap_ms: FEED_CAP_MS,
+            split: activePhases.includes('stories') && activePhases.includes('feed')
+                ? { stories_pct: 30, feed_pct: 70 }
+                : undefined,
             automatic_scheduled_polling: shouldEnableScheduledPolling(),
             recommended_initial_print_poll_ms: 30_000,
             recommended_repeat_print_poll_ms: 30_000,
@@ -808,8 +869,8 @@ export function register(api: PluginApi): () => void {
                 ? 'Kowalski requires a vision-capable OpenClaw image model. If screenshots cannot be understood, configure agents.defaults.imageModel to a vision-capable model.'
                 : undefined,
             message: shouldEnableScheduledPolling()
-                ? 'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. A configured-channel client may schedule silent print_digest checks every 30 seconds until the display-ready markdown is returned.'
-                : 'Digest started in the background. The run is in flight (10-30 min typical, ~45 min worst case) and the user can say "stop" any time. Do not create OpenClaw cron/scheduled follow-up turns by default; when the user asks for status or results, call get_session_status or print_digest with this session_id.',
+                ? `Digest started in the background for up to ${formatMinutes(TOTAL_CAP_MS)} minutes. ${phaseCapMessage} The user can say "stop" any time. A configured-channel client may schedule silent print_digest checks every 30 seconds until the display-ready markdown is returned.`
+                : `Digest started in the background for up to ${formatMinutes(TOTAL_CAP_MS)} minutes. ${phaseCapMessage} The user can say "stop" any time. Do not create OpenClaw cron/scheduled follow-up turns by default; when the user asks for status or results, call get_session_status or print_digest with this session_id.`,
             ...extraPayload,
         });
     }
@@ -822,16 +883,23 @@ export function register(api: PluginApi): () => void {
     // Instagram sessionid cookie, and immediately advances the workflow:
     // valid cookie -> start digest; missing/unknown cookie -> run login.
     //
-    // Input:  { phases?: Array<"stories" | "feed"> }
+    // Input:  { duration_minutes: number, phases?: Array<"stories" | "feed"> }
     // Output: JSON text block for digest-started or login-pending state.
     // -----------------------------------------------------------------------
     const startSession: PluginTool = {
         name: 'start_session',
         description:
-            'Create a Kowalski session and automatically continue the workflow. If the persistent browser profile has a valid Instagram cookie, this starts run_digest immediately. If not, this automatically starts the headless login flow; when credentials/2FA/device approval are needed it returns the relevant pending_* payload. Once login succeeds, the digest is started automatically.',
+            'Create a Kowalski session for a user-requested duration and automatically continue the workflow. Ask the user how many minutes they want before calling; pass that as duration_minutes. If both phases run, Kowalski splits time 30/70: stories 30%, feed/posts 70%. If the persistent browser profile has a valid Instagram cookie, this starts run_digest immediately. If not, this automatically starts the headless login flow; when credentials/2FA/device approval are needed it returns the relevant pending_* payload. Once login succeeds, the digest is started automatically.',
         parameters: {
             type: 'object',
             properties: {
+                duration_minutes: {
+                    type: 'number',
+                    minimum: 1,
+                    maximum: 180,
+                    description:
+                        'Total capture budget in minutes requested by the user. With both phases, Kowalski uses a 30/70 split: stories get 30%, feed/posts get 70%.',
+                },
                 phases: {
                     type: 'array',
                     items: { type: 'string', enum: ['stories', 'feed'] },
@@ -839,15 +907,27 @@ export function register(api: PluginApi): () => void {
                         'Which phases the eventual run_digest call should execute. Defaults to ["stories", "feed"].',
                 },
             },
+            required: ['duration_minutes'],
             additionalProperties: false,
         },
         execute: async (_callId, params) => {
+            const durationMinutes = readPositiveNumberField(params, 'duration_minutes');
+            if (!durationMinutes || durationMinutes > 180) {
+                return jsonTextResult({
+                    status: 'pending_duration',
+                    message:
+                        'Ask the user how many minutes they would like the Kowalski run to be, then call start_session with duration_minutes between 1 and 180.',
+                });
+            }
+
             const phasesRaw = params.phases;
             const phases = Array.isArray(phasesRaw)
                 ? (phasesRaw.filter(
                       (p) => p === 'stories' || p === 'feed'
                   ) as Array<'stories' | 'feed'>)
                 : (['stories', 'feed'] as Array<'stories' | 'feed'>);
+            const effectivePhases = phases.length > 0 ? phases : (['stories', 'feed'] as Array<'stories' | 'feed'>);
+            const durations = deriveRunDurations(durationMinutes, effectivePhases);
 
             let inferenceClient;
             try {
@@ -872,7 +952,10 @@ export function register(api: PluginApi): () => void {
                 runConfig: {
                     userName: config.userName,
                     location: config.location,
-                    phases,
+                    phases: effectivePhases,
+                    maxDurationMs: durations.maxDurationMs,
+                    storiesTimeoutMs: durations.storiesTimeoutMs,
+                    feedTimeoutMs: durations.feedTimeoutMs,
                     // Seed sensitive Instagram values only from env. These
                     // stay in process memory for the active session and are
                     // never accepted through tool params or emitted in
@@ -905,14 +988,14 @@ export function register(api: PluginApi): () => void {
             if (probe.logged_in === true) {
                 return startDigestForEntry(sessionId, entry, 'start_session', {
                     logged_in: true,
-                    phases,
+                    phases: effectivePhases,
                 });
             }
 
             if (envIgSessionId.value) {
                 return startDigestForEntry(sessionId, entry, 'start_session', {
                     logged_in: 'env_sessionid',
-                    phases,
+                    phases: effectivePhases,
                 });
             }
 
@@ -1353,6 +1436,136 @@ export function register(api: PluginApi): () => void {
     };
 
     // -----------------------------------------------------------------------
+    // Tool: update_timer
+    //
+    // Updates the user-requested capture budget. Before the run starts, the
+    // full 30/70 split is recomputed. During a live run, the stories cap is
+    // immutable for that run and the changed time lands in feed/posts.
+    //
+    // Input:  { session_id: string, duration_minutes: number }
+    // Output: JSON text block for updated state.
+    // -----------------------------------------------------------------------
+    const updateTimer: PluginTool = {
+        name: 'update_timer',
+        description:
+            'Change the requested Kowalski run duration. Use when the user says "change it to 20 minutes" after start_session has created a session. Before capture starts, this recomputes the 30/70 stories/feed-posts split. During a live run, the stories cap stays immutable for that run and the changed time is applied to feed/posts; if elapsed time already meets or exceeds the new duration, the run is stopped immediately.',
+        parameters: {
+            type: 'object',
+            properties: {
+                session_id: {
+                    type: 'string',
+                    description: 'The id returned by start_session.',
+                },
+                duration_minutes: {
+                    type: 'number',
+                    minimum: 1,
+                    maximum: 180,
+                    description: 'New total capture budget in minutes.',
+                },
+            },
+            required: ['session_id', 'duration_minutes'],
+            additionalProperties: false,
+        },
+        execute: async (_callId, params) => {
+            const sessionId =
+                typeof params.session_id === 'string' && params.session_id.trim()
+                    ? params.session_id.trim()
+                    : null;
+            if (!sessionId) {
+                return textResult('update_timer: session_id is required.', true);
+            }
+            const entry = sessions.get(sessionId);
+            if (!entry) {
+                return textResult(`update_timer: session_id ${sessionId} not found.`, true);
+            }
+
+            const durationMinutes = readPositiveNumberField(params, 'duration_minutes');
+            if (!durationMinutes || durationMinutes > 180) {
+                return jsonTextResult({
+                    status: 'pending_duration',
+                    session_id: sessionId,
+                    message:
+                        'Ask the user for a new timer value in minutes, then call update_timer with duration_minutes between 1 and 180.',
+                });
+            }
+
+            const phases = entry.session.runConfig.phases ?? ['stories', 'feed'];
+            const digestRunning = entry.activeDigest?.status === 'running';
+            const newTotalMs = Math.ceil(durationMinutes * 60_000);
+            const durations = digestRunning
+                ? (() => {
+                    const storyCap =
+                        entry.session.runConfig.storiesTimeoutMs ??
+                        (phases.includes('stories') && phases.includes('feed')
+                            ? Math.max(1, Math.round(newTotalMs * 0.3))
+                            : phases.includes('stories')
+                                ? newTotalMs
+                                : undefined);
+                    return {
+                        maxDurationMs: newTotalMs,
+                        storiesTimeoutMs: storyCap,
+                        feedTimeoutMs: phases.includes('feed')
+                            ? Math.max(1, newTotalMs - (storyCap ?? 0))
+                            : undefined,
+                    };
+                })()
+                : deriveRunDurations(durationMinutes, phases);
+            entry.session.runConfig.maxDurationMs = durations.maxDurationMs;
+            entry.session.runConfig.storiesTimeoutMs = durations.storiesTimeoutMs;
+            entry.session.runConfig.feedTimeoutMs = durations.feedTimeoutMs;
+
+            const elapsedMs = entry.activeDigest
+                ? Math.max(0, Date.now() - entry.activeDigest.startedAt)
+                : 0;
+            let stopRequested = false;
+            if (digestRunning && elapsedMs >= durations.maxDurationMs) {
+                stopRequested = true;
+                try {
+                    const reason = entry.lastPhase === 'stories' ? 'timeout-stories' : 'timeout-feed';
+                    RunManager.getInstance().stopRun(reason);
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    log.warn('[kowalski] update_timer: immediate stop after timer reduction failed', { msg });
+                }
+            }
+
+            log.info('update_timer', {
+                sessionId,
+                durationMinutes,
+                phases,
+                digestRunning,
+                elapsedMs,
+                stopRequested,
+                maxDurationMs: durations.maxDurationMs,
+                storiesTimeoutMs: durations.storiesTimeoutMs,
+                feedTimeoutMs: durations.feedTimeoutMs,
+            });
+
+            return jsonTextResult({
+                status: 'timer_updated',
+                session_id: sessionId,
+                digest_status: entry.activeDigest?.status,
+                duration_minutes: durationMinutes,
+                elapsed_ms: elapsedMs,
+                stop_requested: stopRequested,
+                total_cap_ms: durations.maxDurationMs,
+                stories_cap_ms: durations.storiesTimeoutMs,
+                feed_cap_ms: durations.feedTimeoutMs,
+                split: phases.includes('stories') && phases.includes('feed')
+                    ? { stories_pct: 30, feed_pct: 70 }
+                    : undefined,
+                message: phases.includes('stories') && phases.includes('feed')
+                    ? digestRunning
+                        ? `Timer updated to ${durationMinutes} minutes: stories remains ${formatMinutes(durations.storiesTimeoutMs ?? 0)} min for this run, feed/posts is now ${formatMinutes(durations.feedTimeoutMs ?? 0)} min.${stopRequested ? ' Elapsed time already meets the new timer, so the run is stopping now.' : ''}`
+                        : `Timer updated to ${durationMinutes} minutes: stories=${formatMinutes(durations.storiesTimeoutMs ?? 0)} min, feed/posts=${formatMinutes(durations.feedTimeoutMs ?? 0)} min.`
+                    : phases.includes('stories')
+                        ? `Timer updated to ${durationMinutes} minutes for stories.${stopRequested ? ' Elapsed time already meets the new timer, so the run is stopping now.' : ''}`
+                        : `Timer updated to ${durationMinutes} minutes for feed/posts.${stopRequested ? ' Elapsed time already meets the new timer, so the run is stopping now.' : ''}`,
+            });
+        },
+    };
+
+    // -----------------------------------------------------------------------
     // Tool: run_digest
     //
     // Kicks off the Kowalski pipeline and waits for the completed/stopped
@@ -1369,7 +1582,7 @@ export function register(api: PluginApi): () => void {
     const runDigest: PluginTool = {
         name: 'run_digest',
         description:
-            'Manually run the Kowalski pipeline (stories + feed capture, extraction, digest generation), write the PDF/JSON artifacts, and return the display-ready markdown digest in this tool result. This call blocks until the run finishes (10–30 min typical, ~45 min worst case), so no separate print_digest call is needed for manual run_digest. Normally start_session/login/submit_verification_code starts the digest automatically in the background once Instagram auth is verified. HARD TIMEOUTS: stories 15 min, feed 30 min; on timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`.',
+            'Manually run the Kowalski pipeline (stories + feed capture, extraction, digest generation), write the PDF/JSON artifacts, and return the display-ready markdown digest in this tool result. This call blocks until the run finishes, so no separate print_digest call is needed for manual run_digest. Normally start_session/login/submit_verification_code starts the digest automatically in the background once Instagram auth is verified. HARD TIMEOUTS: derived from start_session duration_minutes; with both phases, stories get 30% and feed/posts get 70%. On timeout the digest finalizes with `aborted: true, abortReason: "timeout-stories"|"timeout-feed"`.',
         parameters: {
             type: 'object',
             properties: {
@@ -1983,6 +2196,7 @@ export function register(api: PluginApi): () => void {
     api.registerTool(startSession);
     api.registerTool(loginTool);
     api.registerTool(submitVerificationCode);
+    api.registerTool(updateTimer);
     api.registerTool(runDigest);
     api.registerTool(getSessionStatus);
     api.registerTool(printDigest);
@@ -1995,7 +2209,7 @@ export function register(api: PluginApi): () => void {
         browserProfileDir,
         scratchDir,
         outputDir,
-        tools: 10,
+        tools: 11,
         envCredentialsPresent: Boolean(envIgUsername && envIgPassword),
         activeSessions: sessions.size,
         pendingLogins: pendingLogins.size,

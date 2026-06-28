@@ -28,8 +28,8 @@ export interface KowalskiSession {
         // Hard per-phase caps. Each phase installs a setTimeout at its start
         // that cooperatively stops the agent when it fires, letting the
         // extractor drain and the run fall through to the next phase /
-        // finalize. Defaults: 15 min stories, 30 min feed. Host-only knob
-        // for now — not surfaced as a tool parameter.
+        // finalize. start_session derives these from duration_minutes:
+        // 30% stories and 70% feed/posts when both phases run.
         storiesTimeoutMs?: number;
         feedTimeoutMs?: number;
         // Instagram credentials for the Stage 6 agentic LoginAgent. These

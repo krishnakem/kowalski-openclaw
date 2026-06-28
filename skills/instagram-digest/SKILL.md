@@ -7,17 +7,23 @@ description: Run the Kowalski Instagram digest pipeline — capture stories and 
 
 This skill orchestrates the Kowalski OpenClaw plugin to capture the user's
 Instagram home (stories + feed) and return a markdown digest. It is a
-blocking, multi-tool workflow that typically takes 10–30 minutes. The default
-backend is OpenClaw's configured provider, so cost depends on the user's
-gateway/provider configuration.
+blocking, multi-tool workflow whose capture length is chosen by the user at
+the start. The default backend is OpenClaw's configured provider, so cost
+depends on the user's gateway/provider configuration.
 
 Kowalski requires a vision-capable model. If screenshot understanding fails,
 tell the user to configure `agents.defaults.imageModel` to a model with image
 input.
 
-The plugin exposes ten tools: `start_session`, `login`,
-`submit_verification_code`, `run_digest`, `get_session_status`,
-`print_digest`, `reset_memory`, `reset_all`, `stop_run`, `end_session`.
+Before starting a digest, ask the user how many minutes they want the run to
+be unless they already specified a duration. Pass that value as
+`duration_minutes` to `start_session`. When both phases run, Kowalski splits
+the requested time 30/70: stories get 30%, and feed/posts get 70%.
+
+The plugin exposes eleven tools: `start_session`, `login`,
+`submit_verification_code`, `update_timer`, `run_digest`,
+`get_session_status`, `print_digest`, `reset_memory`, `reset_all`,
+`stop_run`, `end_session`.
 
 Manual `run_digest` calls block until completion and return the
 display-ready digest markdown directly in the TUI after writing the JSON/PDF
@@ -58,19 +64,20 @@ it creates the session, checks cookies, starts login if needed, and starts
 
 ### 1. `start_session`
 
-Before calling, tell the user something like:
+Before calling, ask how many minutes the user wants the run to be unless they
+already gave a duration. Then tell the user something like:
 
-_"Kicking off the digest now — this takes 10–30 minutes (hard caps:
-15 min stories + 30 min feed, so worst case ~45 minutes) and costs
-roughly $1–3 in API spend. The run goes in the background once login
-is verified. Say "stop" any time to abort, or ask me "is it done?"
-and I'll check."_
+_"Kicking off a 20-minute digest now — Kowalski will split that as
+6 minutes for stories and 14 minutes for feed/posts. Cost depends on
+your configured OpenClaw provider. The run goes in the background once
+login is verified. Say "stop" any time to abort, or ask me "is it
+done?" and I'll check."_
 
-Then call with no args unless the user specified phases (see Parameter
+Then call with the requested duration and optional phases (see Parameter
 notes).
 
 ```json
-{ "name": "start_session", "arguments": {} }
+{ "name": "start_session", "arguments": { "duration_minutes": 20 } }
 ```
 
 `start_session` can return any of these shapes:
@@ -201,6 +208,25 @@ The response includes `digest_status`:
   then present the returned partial markdown to the user verbatim.
 - `"failed"` — run errored out. `digest_error` explains why.
 - `"idle"` — no digest has been started on this session yet.
+
+### 2.a. Timer Changes
+
+If the user changes the timer before `start_session` has been called, do not
+call a tool yet. Use the newest duration when you call `start_session`.
+
+If `start_session` has returned a `session_id`, call:
+
+```json
+{ "name": "update_timer",
+  "arguments": { "session_id": "…", "duration_minutes": 25 } }
+```
+
+When `update_timer` returns `status: "timer_updated"`, tell the user the new
+split and keep using the same `session_id`. If the digest is already running,
+stories keeps its original cap for that run and the changed time is applied to
+feed/posts. If the response has `stop_requested: true`, elapsed time already
+met the new timer, so tell the user the run is stopping and will finalize a
+partial digest if captures exist.
 
 ### 3. Present The Result
 
@@ -346,10 +372,17 @@ Note: `end_session` does NOT interrupt a running digest — use
 
 ## Parameter notes
 
-- **`start_session`** takes optional `{ phases: ("stories" | "feed")[] }`.
-  Default is `["stories", "feed"]`.
+- **`start_session`** takes required `{ duration_minutes: number }` and optional
+  `{ phases: ("stories" | "feed")[] }`. Default phases are
+  `["stories", "feed"]`.
+  - With both phases, the duration is split 30/70:
+    stories get 30%, feed/posts get 70%.
+  - With only one phase, that phase gets the full requested duration.
   - "Just feed" / "skip stories" → `phases: ["feed"]`
   - "Just stories" / "only stories" → `phases: ["stories"]`
+- **`update_timer`** takes `{ session_id: string, duration_minutes: number }`.
+  Use it after a session exists. If capture is already running, stories keeps
+  its original cap and the changed time is applied to feed/posts.
 - **Most other tools** take `{ session_id: string }`.
   Exceptions: `stop_run` may take `{ session_id?: string }` or `{}` as
   a global stop switch, and `reset_all` takes optional `{ confirm: boolean }`.
@@ -361,12 +394,14 @@ Note: `end_session` does NOT interrupt a running digest — use
 
 ## Cost + duration expectations
 
-- **Typical full run:** 10–30 minutes. Cost depends on the configured OpenClaw provider.
-- **Hard caps:** stories phase 15 min, feed phase 30 min.
-- **Worst case:** ~45 min total, ~$3.
+- **Run length:** ask the user for the total minutes before calling
+  `start_session`.
+- **Default split:** stories phase 30%, feed/posts phase 70%.
+- **Cost:** depends on duration, captures, and the configured OpenClaw provider.
 
-Always mention the time range and provider-cost caveat before calling
-`start_session` so the user can abort upfront if the cost or time isn't acceptable.
+Always mention the requested duration, split, and provider-cost caveat before
+calling `start_session` so the user can abort upfront if the cost or time isn't
+acceptable.
 
 ---
 
@@ -385,7 +420,7 @@ Always mention the time range and provider-cost caveat before calling
 | `submit_verification_code` returns `context_destroyed` | The pending-login browser was closed before the code was submitted (stale entry, Chromium crash, or out-of-band close). | Re-run `login` from scratch. The earlier attempt may have persisted enough cookies that Instagram skips 2FA the second time. |
 | `run_digest` error contains `"OFFLINE"` | Offline watchdog or a real network-layer model/browser error tripped. | Suggest retrying. The partial record is still on disk under `analysis_records/<id>.json` with `aborted: true, abortReason: offline`. |
 | Tool error says `Bundled Chromium is missing` | The plugin-local Playwright browser was not installed or was deleted. | Tell the user to run `npm run setup:browser` in the kowalski-openclaw plugin directory, then retry. Do not suggest installing system Chrome. |
-| `run_digest` error mentions `"timed out"` / the header mentions `"Stories phase timed out after 15 minutes"` or `"Feed phase timed out after 30 minutes"` | A phase hit its hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
+| `run_digest` error mentions `"timed out"` / the header mentions a stories or feed/posts timeout | A phase hit its user-derived hard cap. The digest still runs with partial captures; the record has `aborted: true` and `abortReason: timeout-stories` or `timeout-feed`. | Offer to show the partial digest — it's real, just cut short on that phase. |
 | `run_digest` returns "another run already in progress" | The previous run is still holding the RunManager singleton. | Call `get_session_status` to see what's happening; if stale or no reliable session id exists, call `stop_run` with `{}` and wait briefly before retrying. |
 | `stop_run` says it used the global stop marker because session_id was missing/stale | The session registry entry was gone, but the singleton runner may still be active. | Treat this as a successful stop request. Check status or print explicitly when the user asks for the partial digest. |
 | `stop_run` returns successfully but the digest takes longer than 30 s to arrive | Normal — the stop marker is polled every ~3 s, and the agent needs to finish its current step. | Let it finalize; use `get_session_status` or `print_digest` on explicit user request. |
@@ -425,10 +460,14 @@ Always mention the time range and provider-cost caveat before calling
 ```
 user: what's happening on my feed today?
 
-agent: Starting the Kowalski digest — takes 10–30 min, costs $1–3.
-  I'll kick it off in the background; say "stop" any time to abort,
-  or ask "is it done?" and I'll check.
-  → start_session()
+agent: How many minutes would you like the run to be?
+
+user: 20 minutes
+
+agent: Starting a 20-minute Kowalski digest — 6 minutes for stories,
+  14 minutes for feed/posts. Cost depends on your configured provider.
+  I'll kick it off in the background; say "stop" any time to abort.
+  → start_session({ duration_minutes: 20 })
   ← { status: "started", session_id: "abc…", triggered_by: "start_session", … }
 
 agent: Digest running in the background. You'll see ⏱ progress ticks

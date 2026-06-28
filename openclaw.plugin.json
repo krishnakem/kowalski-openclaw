@@ -10,6 +10,7 @@
             "start_session",
             "login",
             "submit_verification_code",
+            "update_timer",
             "run_digest",
             "get_session_status",
             "print_digest",

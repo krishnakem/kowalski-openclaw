@@ -14,6 +14,7 @@ export type BrowsingPhase = 'stories' | 'feed' | 'complete';
  */
 export interface NavigationLoopConfig {
     maxDurationMs: number;
+    maxDurationMsProvider?: () => number;
     actionDelayMs?: [number, number];
     rawDir?: string;  // Directory for raw screenshot dumps (three-agent pipeline)
     phases?: ('stories' | 'feed')[];  // Which phases to run (default: both)

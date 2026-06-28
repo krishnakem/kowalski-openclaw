@@ -60,6 +60,7 @@ export interface ActionHistoryEntry {
 export interface BaseAgentConfig {
     inferenceClient: InferenceClient;
     maxDurationMs: number;
+    maxDurationMsProvider?: () => number;
     debugMode?: boolean;
     sessionMemoryDigest?: string;
     rawDir?: string;
@@ -203,6 +204,10 @@ export abstract class BaseVisionAgent {
     // Public API
     // -----------------------------------------------------------------------
 
+    protected getMaxDurationMs(): number {
+        return this.config.maxDurationMsProvider?.() ?? this.config.maxDurationMs;
+    }
+
     /** Stop the agent externally (e.g. Cmd+Shift+K). */
     stop(): void {
         this.stopped = true;
@@ -240,8 +245,9 @@ export abstract class BaseVisionAgent {
         while (!decision) {
             if (this.stopped) break;
             const elapsed = Date.now() - this.startTime;
-            if (this.config.maxDurationMs - elapsed <= 0) break;
-            decision = await this.captureAndDecide(this.config.maxDurationMs - elapsed);
+            const maxDurationMs = this.getMaxDurationMs();
+            if (maxDurationMs - elapsed <= 0) break;
+            decision = await this.captureAndDecide(maxDurationMs - elapsed);
             if (!decision) await this.delay(500); // screenshot failed, retry
         }
 
@@ -295,7 +301,7 @@ export abstract class BaseVisionAgent {
 
                 // Check time
                 const elapsed = Date.now() - this.startTime;
-                const remaining = this.config.maxDurationMs - elapsed;
+                const remaining = this.getMaxDurationMs() - elapsed;
                 if (remaining <= 0) {
                     console.log(`⏱️  ${this.getAgentName()}: time limit reached`);
                     this.collector.appendLog(`⏱️ ${this.getAgentName()}: time limit reached`);
@@ -1116,7 +1122,7 @@ export abstract class BaseVisionAgent {
                 agent: this.getAgentName(),
                 timestamp: new Date().toISOString(),
                 elapsed_ms: Date.now() - this.startTime,
-                remaining_ms: this.config.maxDurationMs - (Date.now() - this.startTime),
+                remaining_ms: this.getMaxDurationMs() - (Date.now() - this.startTime),
 
                 decision: {
                     thinking: decision.thinking,
