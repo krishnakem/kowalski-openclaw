@@ -382,7 +382,7 @@ Now write the editorial column. Begin immediately with "# " followed by your gen
             '---',
             `*${storyCount} story frames and ${feedCount} posts reviewed across ${byHandle.size} accounts.${skippedCount > 0 ? ` ${skippedCount} captures were skipped.` : ''}*`,
             '',
-            '_Note: The editorial model call failed, so this digest was assembled directly from extractor summaries._'
+            '_Note: The digest writer LLM call failed, so this digest was assembled directly from extractor summaries._'
         );
         return lines.join('\n');
     }

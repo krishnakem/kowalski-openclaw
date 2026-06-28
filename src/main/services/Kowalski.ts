@@ -281,6 +281,7 @@ export class Kowalski {
                             this.timedOutPhases.add('feed');
                             console.log(`⏱️  FeedAgent: stopped (timeout ${(currentFeedMaxMs / 60000).toFixed(1)} min)`);
                             this.screenshotCollector.appendLogRaw(`\n> FeedAgent: stopped (timeout)\n`);
+                            clearInterval(feedTimer);
                             feedAgent.stop();
                         }
                     }, 1000);

@@ -158,11 +158,15 @@ export class RunManager {
         this.clearStopMarker();
         console.log(`🛑 Stopping active run (reason=${this.abortReason})...`);
 
-        // User-initiated stops during browsing mirror the desktop app: stop
-        // the active agent cooperatively and let the run unwind into digest
-        // generation with the captures already on disk. Non-user stops still
-        // hard-abort in-flight run-level LLM work so teardown cannot hang.
-        const shouldHardAbort = this.abortReason !== 'user-stop';
+        // User stops and timer stops are graceful: stop browsing, let
+        // extractors drain, then generate a digest from captures already on
+        // disk. External stops still hard-abort in-flight run-level LLM work
+        // so teardown cannot hang. Offline uses notifyOffline(), which aborts
+        // directly before reaching this method.
+        const shouldHardAbort =
+            this.abortReason !== 'user-stop' &&
+            this.abortReason !== 'timeout-stories' &&
+            this.abortReason !== 'timeout-feed';
         if (shouldHardAbort) {
             try {
                 this.runAbortController?.abort();
@@ -250,6 +254,10 @@ export class RunManager {
             console.log(
                 `⏱️  Total run timer elapsed — elapsed=${formatDuration(elapsedMs)} timer=${formatDuration(currentMaxDurationMs)} reason=${reason}`
             );
+            if (this.totalTimerPoller) {
+                clearInterval(this.totalTimerPoller);
+                this.totalTimerPoller = null;
+            }
             this.stopRun(reason);
         }, 1000);
 
