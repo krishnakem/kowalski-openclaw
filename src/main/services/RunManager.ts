@@ -12,6 +12,14 @@ import type { KowalskiSession } from '../../core/KowalskiSession.js';
 type RunStatus = 'idle' | 'running';
 type RunAbortReason = 'offline' | 'timeout-stories' | 'timeout-feed' | 'external' | 'user-stop';
 
+function formatDuration(ms: number): string {
+    if (ms < 0) ms = 0;
+    const seconds = Math.floor(ms / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const remainder = seconds - minutes * 60;
+    return `${minutes}m${remainder.toString().padStart(2, '0')}s`;
+}
+
 // RunManager is kept as a singleton (minimum-diff with Stage 1 call sites);
 // bindSession is called once before startRun. The host is responsible for
 // durable storage of the returned AnalysisRecord — nothing is persisted to a
@@ -220,16 +228,27 @@ export class RunManager {
 
         const runStartedAt = Date.now();
         const MAX_DURATION_MS = session.runConfig.maxDurationMs ?? 90 * 60 * 1000;
+        console.log(
+            `⏱️  Timer set — elapsed=${formatDuration(0)} timer=${formatDuration(MAX_DURATION_MS)} stories=${formatDuration(session.runConfig.storiesTimeoutMs ?? 0)} feed/posts=${formatDuration(session.runConfig.feedTimeoutMs ?? 0)}`
+        );
+        let lastTimerLogAt = runStartedAt;
         this.totalTimerPoller = setInterval(() => {
             if (this.status !== 'running') return;
             const currentMaxDurationMs = session.runConfig.maxDurationMs ?? MAX_DURATION_MS;
             const elapsedMs = Date.now() - runStartedAt;
+            const now = Date.now();
+            if (now - lastTimerLogAt >= 30_000) {
+                lastTimerLogAt = now;
+                console.log(
+                    `⏱️  Timer check — elapsed=${formatDuration(elapsedMs)} timer=${formatDuration(currentMaxDurationMs)} phase=${this.activePhase ?? 'starting'} stories=${formatDuration(session.runConfig.storiesTimeoutMs ?? 0)} feed/posts=${formatDuration(session.runConfig.feedTimeoutMs ?? 0)}`
+                );
+            }
             if (elapsedMs < currentMaxDurationMs) return;
 
             const reason: RunAbortReason =
                 this.activePhase === 'stories' ? 'timeout-stories' : 'timeout-feed';
             console.log(
-                `⏱️  Total run timer elapsed — elapsed=${Math.round(elapsedMs / 1000)}s cap=${Math.round(currentMaxDurationMs / 1000)}s reason=${reason}`
+                `⏱️  Total run timer elapsed — elapsed=${formatDuration(elapsedMs)} timer=${formatDuration(currentMaxDurationMs)} reason=${reason}`
             );
             this.stopRun(reason);
         }, 1000);

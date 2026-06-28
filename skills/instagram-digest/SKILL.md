@@ -184,10 +184,10 @@ JSON with `status: "pending"` and `silent: true`, tell the user the digest is
 still running only if they directly asked; otherwise stay silent and wait for
 the next explicit user request.
 
-**Answering "how much time is left?" mid-run.** Read the most recent
-progress line from the TUI log pane scrollback and report the numbers
-verbatim. You can also call `get_session_status` to read
-`digest_elapsed_ms`.
+**Answering "how much time is left?" mid-run.** Call
+`get_session_status` and use `timer_remaining_ms`. If that field is missing,
+compute `max(0, timer_total_ms - timer_elapsed_ms)`. Tell the user the
+remaining time in minutes and seconds; optionally include elapsed vs total.
 
 **Answering "is it done?" / "how's the run going?".** Call:
 

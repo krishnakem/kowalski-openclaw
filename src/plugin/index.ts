@@ -488,8 +488,15 @@ export function register(api: PluginApi): () => void {
         }
         if (ad) {
             payload.digest_started_at = new Date(ad.startedAt).toISOString();
+            const timerTotalMs = entry.session.runConfig.maxDurationMs;
+            const timerElapsedMs = Math.max(0, Date.now() - ad.startedAt);
+            if (typeof timerTotalMs === 'number' && Number.isFinite(timerTotalMs)) {
+                payload.timer_total_ms = timerTotalMs;
+                payload.timer_elapsed_ms = timerElapsedMs;
+                payload.timer_remaining_ms = Math.max(0, timerTotalMs - timerElapsedMs);
+            }
             if (ad.status === 'running') {
-                payload.digest_elapsed_ms = Date.now() - ad.startedAt;
+                payload.digest_elapsed_ms = timerElapsedMs;
             }
             if (ad.status === 'failed' && ad.errorMessage) {
                 payload.digest_error = ad.errorMessage;
@@ -928,6 +935,19 @@ export function register(api: PluginApi): () => void {
                 : (['stories', 'feed'] as Array<'stories' | 'feed'>);
             const effectivePhases = phases.length > 0 ? phases : (['stories', 'feed'] as Array<'stories' | 'feed'>);
             const durations = deriveRunDurations(durationMinutes, effectivePhases);
+            log.info('timer set', {
+                durationMinutes,
+                phases: effectivePhases,
+                totalCapMs: durations.maxDurationMs,
+                storiesCapMs: durations.storiesTimeoutMs,
+                feedCapMs: durations.feedTimeoutMs,
+                split: effectivePhases.includes('stories') && effectivePhases.includes('feed')
+                    ? '30/70 stories/feed-posts'
+                    : 'single-phase',
+            });
+            log.info(
+                `[kowalski] timer set: total=${formatMinutes(durations.maxDurationMs)}m stories=${formatMinutes(durations.storiesTimeoutMs ?? 0)}m feed/posts=${formatMinutes(durations.feedTimeoutMs ?? 0)}m`
+            );
 
             let inferenceClient;
             try {
@@ -1540,6 +1560,18 @@ export function register(api: PluginApi): () => void {
                 storiesTimeoutMs: durations.storiesTimeoutMs,
                 feedTimeoutMs: durations.feedTimeoutMs,
             });
+            log.info('timer updated', {
+                sessionId,
+                durationMinutes,
+                elapsedMs,
+                totalCapMs: durations.maxDurationMs,
+                storiesCapMs: durations.storiesTimeoutMs,
+                feedCapMs: durations.feedTimeoutMs,
+                stopRequested,
+            });
+            log.info(
+                `[kowalski] timer updated: total=${formatMinutes(durations.maxDurationMs)}m elapsed=${formatMinutes(elapsedMs)}m stories=${formatMinutes(durations.storiesTimeoutMs ?? 0)}m feed/posts=${formatMinutes(durations.feedTimeoutMs ?? 0)}m stopRequested=${stopRequested}`
+            );
 
             return jsonTextResult({
                 status: 'timer_updated',
